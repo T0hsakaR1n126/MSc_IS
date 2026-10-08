@@ -1,0 +1,24 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/* This file should not be included in any file outside of the monetdb5 library */
+
+#ifndef LIBMONETDB5
+#error this file should not be included outside its source directory
+#endif
+
+void setqptimeout(lng usecs)
+		__attribute__((__visibility__("hidden")));
+
+extern size_t qsize;
+
+extern MT_Lock mal_profileLock;
+extern MT_Lock mal_copyLock;
+extern MT_Lock mal_delayLock;

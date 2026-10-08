@@ -1,0 +1,22 @@
+statement ok
+set optimizer = 'sequential_pipe'
+
+skipif knownfail
+query T python .plan.filter
+explain show details select count(*) from fk
+----
+project (
+|  [ "sys"."cnt"(varchar "sys", varchar "fk") NOT NULL as "%1"."%1" ]
+) [ "%1"."%1" NOT NULL ]
+
+skipif knownfail
+query T python .plan.filter
+explain show details select id from fk order by id
+----
+project (
+| table("sys"."fk") [ "fk"."id" NOT NULL UNIQUE HASHCOL  ]
+) [ "fk"."id" NOT NULL UNIQUE HASHCOL  ] [ "fk"."id" ASC NOT NULL UNIQUE HASHCOL  ]
+
+statement ok
+set optimizer = 'default_pipe'
+

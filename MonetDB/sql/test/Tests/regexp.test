@@ -1,0 +1,89 @@
+# for the regex options look into `man 3 pcre2api`
+
+# basic
+query T rowsort
+select regexp_replace('foobarbaz', 'b(..)', 'XY')
+----
+fooXYXY
+
+# regex options - capture groups
+query T rowsort
+select regexp_replace('foobarbaz', 'b(..)', 'X$1Y')
+----
+fooXarYXazY
+
+# regex options - case sensitive
+query T rowsort
+select regexp_replace('fooBarBaz', 'b(..)', 'XY')
+----
+fooBarBaz
+
+# regex options - case insensitive
+query T rowsort
+select regexp_replace('fooBarBaz', 'b(..)', 'XY', 'i')
+----
+fooXYXY
+
+# regex options - no dotall
+query T rowsort
+select regexp_replace(E'foo\nbar', 'foo.+', 'XYZ')
+----
+foo@bar
+
+# regex options - dotall
+query T rowsort
+select regexp_replace(E'foo\nbar', 'foo.+', 'XYZ', 's')
+----
+XYZ
+
+# regex options - no multiline
+query T rowsort
+select regexp_replace(E'foo\nbar', '^(foo).*$', 'XYZ')
+----
+foo@bar
+
+# regex options - multiline
+query T rowsort
+select regexp_replace(E'foo\nbar', '^(foo).*$', 'XYZ', 'm')
+----
+XYZ@bar
+
+# regex option - not extended
+query T rowsort
+select regexp_replace('foo', 'f o o', 'XYZ')
+----
+foo
+
+# regex option - extended
+query T rowsort
+select regexp_replace('foo', 'f o o', 'XYZ', 'x')
+----
+XYZ
+
+# regex option - not emtpy match
+query T rowsort
+select regexp_replace('foobar', 'k?', 'XY')
+----
+foobar
+
+# regex option - emtpy match
+query T rowsort
+select regexp_replace('foobar', 'k?', '-', 'e')
+----
+-f-o-o-b-a-r-
+
+# regex option - empty match w alternative v1
+query T rowsort
+select regexp_replace('abc', 'b|k?', '-', 'e')
+----
+-a--c-
+
+# regex option - empty match w alternative v2
+# even though you would expect -a--c- the pcre lib instead returns
+# both the empty string between a and b, and the string b (and the
+# empty string between what was b and c)
+query T rowsort
+select regexp_replace('abc', 'k?|b', '-', 'e')
+----
+-a---c-
+

@@ -1,0 +1,100 @@
+statement ok
+create table x (n int, s varchar(10))
+
+statement ok
+insert into x (n,s) values (1, 'one')
+
+statement ok
+insert into x (n,s) values (2, 'two')
+
+statement ok
+insert into x (n,s) values (3, 'three')
+
+query TIIIIIIIT nosort
+select name, schema_id, type, system, commit_action, access, temporary, n, s from tables, x where name in ('schemas', 'tables', 'columns') and schema_id = 2000 order by name, n limit 9
+----
+columns
+2000
+11
+1
+0
+0
+0
+1
+one
+columns
+2000
+11
+1
+0
+0
+0
+2
+two
+columns
+2000
+11
+1
+0
+0
+0
+3
+three
+schemas
+2000
+10
+1
+0
+0
+0
+1
+one
+schemas
+2000
+10
+1
+0
+0
+0
+2
+two
+schemas
+2000
+10
+1
+0
+0
+0
+3
+three
+tables
+2000
+11
+1
+0
+0
+0
+1
+one
+tables
+2000
+11
+1
+0
+0
+0
+2
+two
+tables
+2000
+11
+1
+0
+0
+0
+3
+three
+
+statement ok
+drop table x cascade
+

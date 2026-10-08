@@ -1,0 +1,9 @@
+optimizers
+
+#simpleSQL
+limithack
+shutdown
+
+HAVE_HGE?int_notation_1e5
+
+!NOWAL?persist_unlogged

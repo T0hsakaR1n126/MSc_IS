@@ -1,0 +1,22 @@
+query TII rowsort
+select s.name,char_length(s.name), count(*) from schemas s, tables t
+	where t.name IN ('args', 'columns', 'functions', 'idxs',
+		'objects', 'keys', 'modules', 'sequences')
+	group by s.name having count(*) > char_length(s.name)
+----
+json
+4
+12
+logging
+7
+12
+profiler
+8
+12
+sys
+3
+12
+tmp
+3
+12
+

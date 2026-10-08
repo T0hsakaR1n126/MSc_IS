@@ -1,0 +1,20 @@
+statement ok
+create table i as select * from (VALUES (1),(2),(3)) as x(n)
+
+query T rowsort
+trace
+with
+t as (select 1 as r, * from sys.functions where name in ('sum', 'prod'))
+select distinct name from t where r in (select n from i)
+----
+prod
+sum
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '%cross%'
+----
+0
+
+statement ok
+drop table i
+

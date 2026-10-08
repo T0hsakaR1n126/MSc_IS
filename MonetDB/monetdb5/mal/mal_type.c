@@ -1,0 +1,220 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/*
+ * (c) M. Kersten
+ * MAL Type System
+ * The MAL type module overloads the atom structure managed in the GDK library.
+ * For the time being, we assume GDK to support at most 127 different atomic types.
+ * Type composition is limited to the  builtin scalar type and a column type.
+ * Furthermore, the polymorphic MAL type :any can be qualified
+ * with a type variable index :any_I, where I is a digit (1-9).
+ * BEWARE, the TYPE_any is a speudo type known within MAL only.
+ *
+ * Within the MAL layer types are encoded in 32-bit integers using
+ * bit stuffing to save some space.
+ * The integer contains the following fields:
+ * anyHeadIndex (bit 25-22), anyTypeIndex (bit 21-18),
+ * batType (bit 17) headType (16-9) and tailType(8-0)
+ * This encoding scheme permits a limited number of different bat types.
+ * The headless case assumes all head types are TYPE_void/TYPE_oid
+ */
+#include "monetdb_config.h"
+#include "mal_type.h"
+
+/*
+ * At any point we should be able to construct an ascii representation of
+ * the type descriptor. Including the variable references.
+ */
+str
+getTypeName(allocator *ma, malType tpe)
+{
+	char buf[IDLENGTH + 6];
+	int k;
+
+	if (tpe == TYPE_any)
+		return "any";
+	if (isaBatType(tpe)) {
+		k = getTypeIndex(tpe);
+		if (k)
+			snprintf(buf, sizeof(buf), "bat[:any_%d]", k);
+		else if (getBatType(tpe) == TYPE_any)
+			snprintf(buf, sizeof(buf), "bat[:any]");
+		else
+			snprintf(buf, sizeof(buf), "bat[:%s]", ATOMname(getBatType(tpe)));
+		return ma_strdup(ma, buf);
+	}
+	if (isAnyExpression(tpe)) {
+		snprintf(buf, sizeof(buf), "any_%d", getTypeIndex(tpe));
+		return ma_strdup(ma, buf);
+	}
+	return ma_strdup(ma, ATOMname(tpe));
+}
+
+/*
+ * It might be handy to encode the type information in an identifier
+ * string for ease of comparison later.
+ */
+str
+getTypeIdentifier(allocator *ma, malType tpe)
+{
+	str s, t, v;
+	s = getTypeName(ma, tpe);
+	if (s == NULL)
+		return NULL;
+	for (t = s; *t; t++)
+		if (!isalnum((unsigned char) *t))
+			*t = '_';
+	t--;
+	if (*t == '_')
+		*t = 0;
+	for (v = s, t = s + 1; *t; t++) {
+		if (!(*t == '_' && *v == '_'))
+			*++v = *t;
+	}
+	*++v = 0;
+	return s;
+}
+
+
+/*
+ * In many places we need a confirmed type identifier.
+ * GDK returns the next available index when it can not find the type.
+ * This is not sufficient here, an error message may have to be generated.
+ * It is assumed that the type table does not change in the mean time.
+ * Use the information that identifiers are at least one character
+ * and are terminated by a null to speedup comparison
+ */
+
+/*
+ * The ATOMindex routine is pretty slow, because it performs a
+ * linear search through the type table. This code should actually
+ * be integrated with the kernel.
+ */
+#define qt(x) (nme[1]==x[1] && nme[2]==x[2] )
+
+int
+getAtomIndex(const char *nme, size_t len, int deftype)
+{
+	int i;
+
+	if (len >= IDLENGTH) {
+		/* name too long: cannot match any atom name */
+		return deftype;
+	}
+	/* this switch should cover all builtin GDK types */
+	switch (len) {
+	case 3:
+		switch (*nme) {
+		case 'a':
+			if (qt("any"))
+				return TYPE_any;
+			break;
+		case 'b':
+			if (qt("bit"))
+				return TYPE_bit;
+			if (qt("bte"))
+				return TYPE_bte;
+			break;
+		case 'd':
+			if (qt("dbl"))
+				return TYPE_dbl;
+			break;
+		case 'i':
+			if (qt("int"))
+				return TYPE_int;
+			break;
+		case 'f':
+			if (qt("flt"))
+				return TYPE_flt;
+			break;
+#ifdef HAVE_HGE
+		case 'h':
+			if (qt("hge"))
+				return TYPE_hge;
+			break;
+#endif
+		case 'l':
+			if (qt("lng"))
+				return TYPE_lng;
+			break;
+		case 'm':
+			if (qt("msk"))
+				return TYPE_msk;
+			break;
+		case 'o':
+			if (qt("oid"))
+				return TYPE_oid;
+			break;
+		case 'p':
+			if (qt("ptr"))
+				return TYPE_ptr;
+			break;
+		case 's':
+			if (qt("str"))
+				return TYPE_str;
+			if (qt("sht"))
+				return TYPE_sht;
+			break;
+		}
+		break;
+	case 4:
+		if (strncmp(nme, "void", len) == 0)
+			return TYPE_void;
+		if (strncmp(nme, "date", len) == 0)
+			return TYPE_date;
+		if (strncmp(nme, "uuid", len) == 0)
+			return TYPE_uuid;
+		if (strncmp(nme, "blob", len) == 0)
+			return TYPE_blob;
+		break;
+	case 5:
+		if (strncmp(nme, "inet4", len) == 0)
+			return TYPE_inet4;
+		if (strncmp(nme, "inet6", len) == 0)
+			return TYPE_inet6;
+		break;
+	case 7:
+		if (strncmp(nme, "daytime", len) == 0)
+			return TYPE_daytime;
+		break;
+	case 9:
+		if (strncmp(nme, "timestamp", len) == 0)
+			return TYPE_timestamp;
+		break;
+	default:
+		break;
+	}
+	for (i = TYPE_str; i < GDKatomcnt; i++)
+		if (BATatoms[i].name[0] == nme[0] &&
+			strncmp(nme, BATatoms[i].name, len) == 0 &&
+			BATatoms[i].name[len] == 0)
+			return i;
+	return deftype;
+}
+
+inline int
+findGDKtype(int type)
+{
+	if (type == TYPE_any || type == TYPE_void)
+		return TYPE_void;
+	return ATOMtype(type);
+}
+
+int
+isIdentifier(str s)
+{
+	if (!isalpha((unsigned char) *s))
+		return -1;
+	for (; s && *s; s++)
+		if (!isalnum((unsigned char) *s) && *s != '_')
+			return -1;
+	return 0;
+}

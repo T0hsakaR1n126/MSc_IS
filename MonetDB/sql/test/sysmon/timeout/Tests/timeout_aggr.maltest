@@ -1,0 +1,8 @@
+statement error
+a := generate.series(0:lng, 1000000:lng);
+qto:= 1000:lng;
+clients.setQryTimeoutMicro(qto);
+X_sum:hge := aggr.sum(a);
+qto:= 0:lng;
+clients.setQryTimeoutMicro(qto);
+

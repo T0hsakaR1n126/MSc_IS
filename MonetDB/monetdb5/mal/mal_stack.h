@@ -1,0 +1,28 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#ifndef _MAL_STACK_H_
+#define _MAL_STACK_H_
+#include "mal.h"
+
+#define stackSize(CNT) (sizeof(ValRecord)*(CNT) + offsetof(MalStack, stk))
+
+mal_export MalStkPtr newGlobalStack(allocator *ma, int size);
+mal_export MalStkPtr reallocGlobalStack(allocator *ma, MalStkPtr s, int cnt);
+mal_export void clearStack(MalStkPtr s);
+mal_export void freeStack(MalStkPtr stk);
+
+#define getStkRecord(S,P,I) &(S)->stk[(P)->argv[I]]
+#define getStkValue(S,P,I)  ( getStkType(S,P,I)== TYPE_str? \
+					getStkRecord(S,P,I)->val.sval :\
+					getStkRecord(S,P,I)->val.pval )
+#define getStkType(S,P,I)   (S)->stk[(P)->argv[I]].vtype
+#define setStkType(S,P,I,T) (S)->stk[(P)->argv[I]].vtype = T
+#endif /* _MAL_STACK_H_ */

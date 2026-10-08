@@ -1,0 +1,26 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include <stdbool.h>
+
+typedef struct DotMonetdb {
+	char *user;
+	char *passwd;
+	char *dbname;
+	char *language;
+	char *host;
+	bool save_history;
+	char *output;
+	int pagewidth;
+	int port;
+} DotMonetdb;
+
+extern void parse_dotmonetdb(DotMonetdb *dotfile);
+extern void destroy_dotmonetdb(DotMonetdb *dotfile);

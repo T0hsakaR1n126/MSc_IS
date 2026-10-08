@@ -1,0 +1,20 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#ifndef _STREAMS_H_
+#define _STREAMS_H_
+
+#include "mal.h"
+#include "stream_socket.h"
+
+typedef ptr Stream;
+typedef ptr Bstream;
+
+#endif /*_STREAMS_H_*/

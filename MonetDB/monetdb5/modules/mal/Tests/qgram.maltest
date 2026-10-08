@@ -1,0 +1,62 @@
+statement ok
+b := txtsim.str2qgrams("hello world")
+
+query IT rowsort
+io.print(b)
+----
+0
+##he
+1
+#hel
+10
+rld$
+11
+ld$$
+2
+hell
+3
+ello
+4
+llo 
+5
+lo w
+6
+o wo
+7
+ wor
+8
+worl
+9
+orld
+
+statement ok
+b := txtsim.str2qgrams("hällö wørłð")
+
+query IT rowsort
+io.print(b)
+----
+0
+##hä
+1
+#häl
+10
+rłð$
+11
+łð$$
+2
+häll
+3
+ällö
+4
+llö 
+5
+lö w
+6
+ö wø
+7
+ wør
+8
+wørł
+9
+ørłð
+

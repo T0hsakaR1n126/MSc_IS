@@ -1,0 +1,44 @@
+.. SPDX-License-Identifier: MPL-2.0
+..
+.. This Source Code Form is subject to the terms of the Mozilla Public
+.. License, v. 2.0.  If a copy of the MPL was not distributed with this
+.. file, You can obtain one at https://mozilla.org/MPL/2.0/.
+..
+.. For copyright information, see the file debian/copyright.
+
+===============
+Build on Fedora
+===============
+
+The following packages (RPMs) are or can be used by MonetDB.
+
+These packages are required.
+
+| cmake			# version >= 3.12
+| bison
+| gcc
+| libxml2-devel
+| mercurial
+
+These packages are optional, but they are required to build RPMs using
+the command make rpm.
+
+| bzip2-devel		# optional: read and write .bz2 compressed files
+| bzip2			# optional, required to create a tar ball (make dist)
+| checkpolicy		# optional, required to create RPMs (make rpm)
+| geos-devel		# optional: required for geom module
+| libcurl-devel		# optional: read remote files with sys.getcontent(url)
+| pcre2-devel		# optional: use PCRE2 library, enable some functions
+| readline-devel	# optional, enable editing in mclient
+| rpm-build		# optional, required to create RPMs (make rpm)
+| selinux-policy-devel	# optional, required to create RPMs (make rpm)
+| unixODBC-devel	# optional, needed for ODBC driver
+
+These packages are optional.
+
+| cfitsio-devel		# optional: read FITS files
+| libasan		# optional: --enable-sanitizer configuration (debug)
+| lz4-devel		# optional: read and write .lz4 compressed files
+| netcdf-devel		# optional: read NetCDF files
+| proj-devel		# optional, only optionally used in geom module
+| valgrind-devel	# optional: --with-valgrind configuration (debug)

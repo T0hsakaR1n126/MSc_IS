@@ -1,0 +1,14 @@
+query I rowsort
+select count(*) from ( select privilege_code_name,privilege_code_name from sys.privilege_codes group by privilege_code_name ) as c
+----
+33
+
+query I rowsort
+select count(*) from ( select privilege_code_name, privilege_code_name from sys.privilege_codes group by privilege_code_name,privilege_code_name ) as c
+----
+33
+
+query I rowsort
+select count(*) from ( select f.privilege_code_name, f.privilege_code_name from sys.privilege_codes AS f group by privilege_code_name,privilege_code_name ) as c 
+----
+33

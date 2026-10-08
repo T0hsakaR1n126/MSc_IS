@@ -1,0 +1,32 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#ifndef _MAL_SESSION_H
+#define _MAL_SESSION_H
+
+#include "mal_client.h"
+#include "mal_resolve.h"
+
+mal_export str malBootstrap(const char *const *modules, bool embedded,
+							const char *initpasswd);
+mal_export str MSinitClientPrg(Client cntxt, const char *mod, const char *nme);
+
+mal_export str MALinitClient(Client c, const char *, const char *, const char *);
+mal_export str MALexitClient(Client c);
+mal_export str MALparser(Client c);
+mal_export void MALengine(Client c);
+mal_export void MSresetInstructions(MalBlkPtr mb, int start);
+mal_export void MSresetVariables(MalBlkPtr mb);
+mal_export void MSresetStack(Client cntxt, MalBlkPtr mb, MalStkPtr glb);
+mal_export int MALcommentsOnly(MalBlkPtr mb);
+
+mal_export str optimizeMALBlock(Client cntxt, MalBlkPtr mb);
+
+#endif /*  _MAL_SESSION_H */

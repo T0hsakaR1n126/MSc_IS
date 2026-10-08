@@ -1,0 +1,211 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+#include "sql_catalog.h"
+#include "sql_relation.h"
+#include "rel_prop.h"
+#include "sql_string.h"
+
+prop *
+prop_create( allocator *sa, prop_kind kind, prop *pre )
+{
+	prop *p = SA_NEW(sa, prop);
+
+	*p = (prop) {
+		.kind = kind,
+		.p = pre,
+	};
+	if (kind == PROP_NUNIQUES)
+		p->value.dval = 0.0; /* floating point compatibility */
+	return p;
+}
+
+prop *
+prop_copy( allocator *sa, prop *p )
+{
+	prop *np = NULL;
+
+	for(; p; p = p->p) {
+		np = prop_create(sa, p->kind, np);
+		np->id = p->id;
+		switch (p->kind) {
+		case PROP_COUNT:
+			np->value.lval = p->value.lval;
+			break;
+		case PROP_NUNIQUES:
+			np->value.dval = p->value.dval;
+			break;
+		default:
+			np->value.pval = p->value.pval;
+		}
+	}
+	return np;
+}
+
+prop *
+prop_remove(allocator *sa, prop *plist, prop *p)
+{
+	prop *op = plist;
+	(void) sa;
+
+	if (plist == p) {
+		plist = p->p;
+		return plist;
+	}
+	for(; op; op = op->p) {
+		if (op->p == p) {
+			op->p = p->p;
+			break;
+		}
+	}
+	return plist;
+}
+
+prop *
+find_prop(prop *p, prop_kind kind)
+{
+	while(p) {
+		if (p->kind == kind)
+			return p;
+		p = p->p;
+	}
+	return p;
+}
+
+void *
+find_prop_and_get(prop *p, prop_kind kind)
+{
+	prop *found = find_prop(p, kind);
+
+	/* this doesn't work with numbers yet */
+	assert(kind != PROP_COUNT && kind != PROP_NUNIQUES);
+	return found ? found->value.pval : NULL;
+}
+
+#ifdef MIN
+#undef MIN
+#endif
+
+#ifdef MAX
+#undef MAX
+#endif
+
+const char *
+propkind2string( prop *p)
+{
+	switch(p->kind) {
+#define PT(TYPE) case PROP_##TYPE : return #TYPE
+		PT(COUNT);
+		PT(NUNIQUES);
+		PT(UKEY);
+		PT(JOINIDX);
+		PT(HASHIDX);
+		PT(HASHCOL);
+		PT(REMOTE);
+		PT(USED);
+		PT(GROUPINGS);
+		PT(MIN);
+		PT(MAX);
+		PT(UNNESTING);
+		PT(SELECTIVITY);
+		PT(HASH);
+	}
+	return "UNKNOWN";
+}
+
+char *
+propvalue2string(allocator *sa, prop *p)
+{
+	char buf [BUFSIZ];
+
+	switch(p->kind) {
+	case PROP_HASH:
+	case PROP_COUNT: {
+		snprintf(buf, sizeof(buf), BUNFMT, p->value.lval);
+		return ma_strdup(sa, buf);
+	}
+	case PROP_NUNIQUES: {
+		snprintf(buf, sizeof(buf), "%f", p->value.dval);
+		return ma_strdup(sa, buf);
+	}
+	case PROP_UKEY: {
+		list *exps = p->value.pval;
+		size_t offset = 0;
+
+		offset += snprintf(buf + offset, BUFSIZ, "[ ");
+		for(node *n = exps->h; n; n = n->next) {
+			sql_exp *e = n->data;
+			offset += snprintf(buf + offset, BUFSIZ, "%s.%s ", e->alias.rname, e->alias.name);
+		}
+		offset += snprintf(buf + offset, BUFSIZ, "]");
+		return ma_strdup(sa, buf);
+	} break;
+	case PROP_JOINIDX: {
+		sql_idx *i = p->value.pval;
+
+		if (i) {
+			snprintf(buf, sizeof(buf), "\"%s\".\"%s\".\"%s\"", sql_escape_ident(sa, i->t->s->base.name),
+					 sql_escape_ident(sa, i->t->base.name), sql_escape_ident(sa, i->base.name));
+			return ma_strdup(sa, buf);
+		}
+	} break;
+	case PROP_REMOTE: {
+		list *tids_uris = p->value.pval;
+		if (!list_empty(tids_uris)) {
+			size_t offset = 0;
+			for (node *n = ((list*)p->value.pval)->h; n; n = n->next) {
+				tid_uri *tu = n->data;
+				if (tu->uri)
+					offset += snprintf(buf + offset, BUFSIZ, "%s%s",
+					                   sql_escape_ident(sa, offset?" ":""),
+					                   sql_escape_ident(sa, tu->uri));
+			}
+			return ma_strdup(sa, buf);
+		}
+	} break;
+	case PROP_SELECTIVITY: {
+		snprintf(buf, sizeof(buf), "%f", p->value.dval);
+		return ma_strdup(sa, buf);
+	}
+	case PROP_MIN:
+	case PROP_MAX: {
+		atom *a = p->value.pval;
+		char *res = NULL;
+
+		if (a->isnull) {
+			res = "\"NULL\"";
+		} else {
+			char *s = ATOMformat(sa, a->data.vtype, VALptr(&a->data));
+			if (s && *s == '"') {
+				res = ma_strdup(sa, s);
+			} else if (s) {
+				res = ma_alloc(sa, strlen(s) + 3);
+				stpcpy(stpcpy(stpcpy(res, "\""), s), "\"");
+			}
+		}
+		return res;
+	}
+	default:
+		break;
+	}
+	return "";
+}
+
+
+void
+free_props( allocator *sa, prop *p )
+{
+	while(p) {
+		prop* tmp = p;
+		p = p->p;
+		ma_free(sa, tmp);
+	}
+}

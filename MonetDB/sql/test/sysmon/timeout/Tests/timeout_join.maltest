@@ -1,0 +1,18 @@
+statement error
+a:=generate.series(0:lng,1000000:lng);
+b:=generate.series(0:lng,1000000:lng);
+qto:= 1000:lng;
+clients.setQryTimeoutMicro(qto);
+(vg_a,xg_b):=algebra.join(a,b,nil:bat,nil:bat,false,nil:lng);
+qto:= 0:lng;
+clients.setQryTimeoutMicro(qto);
+
+statement error
+int_a:=generate.series(0:int,1000000:int);
+int_b:=generate.series(0:int,1000000:int);
+qto:= 1000:lng;
+clients.setQryTimeoutMicro(qto);
+(vg_a,xg_b):=algebra.join(int_a,int_b,nil:bat,nil:bat,false,nil:lng);
+qto:= 0:lng;
+clients.setQryTimeoutMicro(qto);
+

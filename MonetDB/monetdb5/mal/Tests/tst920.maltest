@@ -1,0 +1,12 @@
+statement ok
+function foo();
+base:= "hello  ";
+s:= str.insert(base,6,6,"world");
+io.print(s);
+end;
+
+query T rowsort
+user.foo();
+----
+"hello world"
+

@@ -1,0 +1,10 @@
+statement ok
+t:= bat.new(:str)
+
+statement ok
+u:= bat.new(:str)
+
+query ITT rowsort
+io.print(t,u)
+----
+

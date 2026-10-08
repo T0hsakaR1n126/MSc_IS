@@ -1,0 +1,127 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#ifndef LIBGEOM_H
+#define LIBGEOM_H
+
+#include "gdk.h"
+
+/*
+ * @+ Geos
+ * The geom library is based on the geos (Geometry Engine Open Source) library.
+ */
+
+#define GEOS_USE_ONLY_R_API 1
+#include <geos_c.h>
+#ifdef HAVE_PROJ
+#include <proj.h>
+#endif
+
+
+/* geos does not support 3d envelope */
+typedef struct mbr {
+	float xmin;
+	float ymin;
+//	float zmin;
+//	float mmin;
+
+	float xmax;
+	float ymax;
+//	float zmax;
+//	float mmax;
+
+} mbr;
+
+/*
+ * @+
+ * Geometry objects have 4 attributes: type, bbox, SRID and data. This
+ * implementation uses a varized atom for the data, which stores the WKB format
+ * as defined by OpenGIS.
+ */
+
+/* 'WKB'
+
+   http://edndoc.esri.com/arcsde/9.0/general_topics/wkb_representation.htm
+
+==Geometry Type byte==
+
+
+All serialized geometries start with a single byte
+encoding geometry type (lower nibble) and flags
+(higher nibble).
+
+First Byte is for the order (little (1) or big endian)
+
+Geometry Type Byte:
+
+     [BSZM] [TTTT]
+
+Flags values:
+
+      B = 16 byte BOX2DFLOAT4 follows (probably not aligned) [before SRID]
+      S = 4 byte SRID attached (0= not attached (-1), 1= attached)
+      ZM = dimensionality (hasZ, hasM)
+
+Type values:
+
+0 = GEOMETRY
+1 = POINT
+2 = CURVE
+3 = LINESTRING
+4 = SURFACE
+5 = POLYGON
+6 = COLLECTION
+7 = MULTIPOINT
+8 = MULTICURVE
+9 = MULTILINESTRING
+10 = MULTISURFACE
+11 = MULTIPOLYGON
+
+*/
+
+extern GEOSContextHandle_t libgeom_tls(void);
+#define geoshandle (libgeom_tls())
+
+typedef enum wkb_type {
+	// TODO: deprecated	type REMOVE
+	//wkbGeometry_mbd = 0,
+	wkbPoint_mdb = 1,
+	wkbLineString_mdb = 2,
+	wkbLinearRing_mdb = 3,
+	wkbPolygon_mdb = 4,
+	wkbMultiPoint_mdb = 5,
+	wkbMultiLineString_mdb = 6,
+	wkbMultiPolygon_mdb = 7,
+	wkbGeometryCollection_mdb = 8
+} wkb_type;
+
+extern const char *geom_type2str(int t, int flag);
+
+typedef struct wkb {
+	int len;
+	int srid;
+	char data[] __attribute__((__counted_by__(len)));
+} wkb;
+
+typedef struct {
+	unsigned char type;
+	mbr bbox;
+	int SRID;
+	wkb wkb;
+} geom_geometry;
+
+extern gdk_return libgeom_init(void);
+
+#define mbr_nil mbrFromGeos(NULL, NULL);
+
+extern bool is_wkb_nil(const wkb *wkbp);
+extern GEOSGeom wkb2geos(const wkb *geomWKB);
+
+#endif /* LIBGEOM_H */

@@ -1,0 +1,26 @@
+#[[
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0.  If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# For copyright information, see the file debian/copyright.
+#]]
+
+set(sqlinclude_public_headers
+  sql_catalog.h
+  sql_hash.h
+  sql_keyword.h
+  sql_list.h
+  sql_mem.h
+  sql_relation.h
+  sql_stack.h)
+
+add_library(sqlinclude INTERFACE)
+
+target_include_directories(sqlinclude
+  INTERFACE
+  $<TARGET_PROPERTY:mapi,INTERFACE_INCLUDE_DIRECTORIES>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  $<INSTALL_INTERFACE:${INCLUDEDIR}/monetdb>)

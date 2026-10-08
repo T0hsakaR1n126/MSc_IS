@@ -1,0 +1,3034 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+#include "gdk.h"
+#include "gdk_analytic.h"
+#include "gdk_calc_private.h"
+#include "gdk_private.h"
+
+Heap *
+GDKinitialize_segment_tree(void)
+{
+	Heap *h = GDKmalloc(sizeof(Heap));
+	if (h == NULL)
+		return NULL;
+	*h = (Heap) {
+		.farmid = BBPselectfarm(TRANSIENT, TYPE_bte, dataheap),
+		.dirty = true,
+		.refs = ATOMIC_VAR_INIT(1),
+	};
+	snprintf(h->filename, sizeof(h->filename), "st%zu.tmp",
+		 (size_t) MT_getpid());
+	if (h->farmid < 0 || HEAPalloc(h, 1024, 1) != GDK_SUCCEED) {
+		GDKfree(h);
+		return NULL;
+	}
+	return h;
+}
+
+gdk_return
+GDKrebuild_segment_tree(oid ncount, oid data_size, Heap *st, void **segment_tree, oid **levels_offset, oid *nlevels)
+{
+	oid total_size, next_tree_size = ncount, counter = ncount, next_levels = 1; /* there will be at least one level */
+
+	assert(ncount > 0);
+	do { /* compute the next number of levels */
+		counter = (counter+(SEGMENT_TREE_FANOUT-1)) / SEGMENT_TREE_FANOUT;
+		next_tree_size += counter;
+		next_levels++;
+	} while (counter > 1);
+
+	*nlevels = next_levels; /* set the logical size of levels before the physical one */
+	next_tree_size *= data_size;
+	/* round up to multiple of sizeof(oid) */
+	next_tree_size = ((next_tree_size + SIZEOF_OID - 1) / SIZEOF_OID) * SIZEOF_OID;
+	total_size = next_tree_size + next_levels * sizeof(oid);
+
+	if (total_size > st->size) {
+		total_size = (((total_size) + 1023) & ~1023); /* align to a multiple of 1024 bytes */
+		st->free = st->size;
+		if (HEAPextend(st, total_size, true) != GDK_SUCCEED)
+			return GDK_FAIL;
+		*segment_tree = st->base;
+		*levels_offset = (oid*)(st->base + next_tree_size); /* levels offset will be next to the segment tree */
+	} else {
+		*segment_tree = st->base;
+		*levels_offset = (oid*)(*(bte**)segment_tree + next_tree_size); /* no reallocation, just update location of levels offset */
+	}
+	return GDK_SUCCEED;
+}
+
+#define NTILE_CALC(TPE, NEXT_VALUE, LNG_HGE, UPCAST, VALIDATION)	\
+	do {								\
+		UPCAST j = 0, ncnt = (UPCAST) (i - k);			\
+		for (; k < i; k++, j++) {				\
+			TPE val = NEXT_VALUE;				\
+			if (is_##TPE##_nil(val)) {			\
+				has_nils = true;			\
+				rb[k] = TPE##_nil;			\
+			} else {					\
+				UPCAST nval = (UPCAST) (LNG_HGE);	\
+				VALIDATION /* validation must come after null check */ \
+				if (nval >= ncnt) {			\
+					rb[k] = (TPE)(j + 1);		\
+				} else {				\
+					UPCAST bsize = ncnt / nval;	\
+					UPCAST top = ncnt - nval * bsize; \
+					UPCAST small = top * (bsize + 1); \
+					if ((UPCAST) j < small)		\
+						rb[k] = (TPE)(1 + j / (bsize + 1)); \
+					else				\
+						rb[k] = (TPE)(1 + top + (j - small) / bsize); \
+				}					\
+			}						\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_NTILE(IMP, TPE, NEXT_VALUE, LNG_HGE, UPCAST, VALIDATION) \
+	do {								\
+		TPE *rb = (TPE*)Tloc(r, 0);				\
+		if (p) {						\
+			while (i < cnt) {				\
+				if (np[i]) {				\
+ntile##IMP##TPE:							\
+					NTILE_CALC(TPE, NEXT_VALUE, LNG_HGE, UPCAST, VALIDATION); \
+				}					\
+				if (!last)				\
+					i++;				\
+			}						\
+		}							\
+		if (!last) {						\
+			last = true;					\
+			i = cnt;					\
+			goto ntile##IMP##TPE;				\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_NTILE_SINGLE_IMP(TPE, LNG_HGE, UPCAST)		\
+	do {								\
+		TPE ntl = *(TPE*) ntile;				\
+		if (!is_##TPE##_nil(ntl) && ntl <= 0) goto invalidntile; \
+		ANALYTICAL_NTILE(SINGLE, TPE, ntl, LNG_HGE, UPCAST, ;); \
+	} while (0)
+
+#define ANALYTICAL_NTILE_MULTI_IMP(TPE, LNG_HGE, UPCAST)		\
+	do {								\
+		const TPE *restrict nn = (TPE*)ni.base;			\
+		ANALYTICAL_NTILE(MULTI, TPE, nn[k], LNG_HGE, UPCAST, if (val <= 0) goto invalidntile;); \
+	} while (0)
+
+BAT *
+GDKanalyticalntile(BAT *b, BAT *p, BAT *n, int tpe, const void *restrict ntile)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BATiter bi = bat_iterator(b);
+	BATiter pi = bat_iterator(p);
+	BATiter ni = bat_iterator(n);
+	lng i = 0, k = 0, cnt = (lng) BATcount(b);
+	const bit *restrict np = pi.base;
+	bool has_nils = false, last = false;
+	BAT *r = COLnew(b->hseqbase, tpe, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+
+	assert((n && !ntile) || (!n && ntile));
+
+	if (ntile) {
+		switch (tpe) {
+		case TYPE_bte:
+			ANALYTICAL_NTILE_SINGLE_IMP(bte, val, BUN);
+			break;
+		case TYPE_sht:
+			ANALYTICAL_NTILE_SINGLE_IMP(sht, val, BUN);
+			break;
+		case TYPE_int:
+			ANALYTICAL_NTILE_SINGLE_IMP(int, val, BUN);
+			break;
+		case TYPE_lng:
+#if SIZEOF_OID == SIZEOF_INT
+			ANALYTICAL_NTILE_SINGLE_IMP(lng, val, lng);
+#else
+			ANALYTICAL_NTILE_SINGLE_IMP(lng, val, BUN);
+#endif
+			break;
+#ifdef HAVE_HGE
+		case TYPE_hge:
+#if SIZEOF_OID == SIZEOF_INT
+			ANALYTICAL_NTILE_SINGLE_IMP(hge, (val > (hge) GDK_int_max) ? GDK_int_max : (lng) val, lng);
+#else
+			ANALYTICAL_NTILE_SINGLE_IMP(hge, (val > (hge) GDK_lng_max) ? GDK_lng_max : (lng) val, BUN);
+#endif
+			break;
+#endif
+		default:
+			goto nosupport;
+		}
+	} else {
+		switch (tpe) {
+		case TYPE_bte:
+			ANALYTICAL_NTILE_MULTI_IMP(bte, val, BUN);
+			break;
+		case TYPE_sht:
+			ANALYTICAL_NTILE_MULTI_IMP(sht, val, BUN);
+			break;
+		case TYPE_int:
+			ANALYTICAL_NTILE_MULTI_IMP(int, val, BUN);
+			break;
+		case TYPE_lng:
+#if SIZEOF_OID == SIZEOF_INT
+			ANALYTICAL_NTILE_MULTI_IMP(lng, val, lng);
+#else
+			ANALYTICAL_NTILE_MULTI_IMP(lng, val, BUN);
+#endif
+			break;
+#ifdef HAVE_HGE
+		case TYPE_hge:
+#if SIZEOF_OID == SIZEOF_INT
+			ANALYTICAL_NTILE_MULTI_IMP(hge, val > (hge) GDK_int_max ? GDK_int_max : (lng) val, lng);
+#else
+			ANALYTICAL_NTILE_MULTI_IMP(hge, val > (hge) GDK_lng_max ? GDK_lng_max : (lng) val, BUN);
+#endif
+			break;
+#endif
+		default:
+			goto nosupport;
+		}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&pi);
+	bat_iterator_end(&ni);
+	BATsetcount(r, BATcount(b));
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",p=" ALGOOPTBATFMT ",n=" ALGOOPTBATFMT
+		  ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(p), ALGOOPTBATPAR(n),
+		  ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+nosupport:
+	BBPreclaim(r);
+	bat_iterator_end(&bi);
+	bat_iterator_end(&pi);
+	bat_iterator_end(&ni);
+	GDKerror("42000!type %s not supported for the ntile type.\n", ATOMname(tpe));
+	return NULL;
+invalidntile:
+	BBPreclaim(r);
+	bat_iterator_end(&bi);
+	bat_iterator_end(&pi);
+	bat_iterator_end(&ni);
+	GDKerror("42000!ntile must be greater than zero.\n");
+	return NULL;
+}
+
+#define ANALYTICAL_FIRST_FIXED(TPE)					\
+	do {								\
+		const TPE *bp = (TPE*)bi.base;				\
+		TPE *rb = (TPE*)Tloc(r, 0);				\
+		for (; k < cnt; k++) {					\
+			const TPE *bs = bp + start[k], *be = bp + end[k]; \
+			TPE curval = (be > bs) ? *bs : TPE##_nil;	\
+			rb[k] = curval;					\
+			has_nils |= is_##TPE##_nil(curval);		\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticalfirst(BAT *b, BAT *s, BAT *e, int tpe)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BAT *r = COLnew(b->hseqbase, b->ttype, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	bool has_nils = false;
+	oid k = 0, cnt = BATcount(b);
+	const oid *restrict start = si.base, *restrict end = ei.base;
+	const void *nil = ATOMnilptr(tpe);
+	bool (*atomeq)(const void *, const void *) = ATOMequal(tpe);
+
+	switch (ATOMbasetype(tpe)) {
+	case TYPE_bte:
+		ANALYTICAL_FIRST_FIXED(bte);
+		break;
+	case TYPE_sht:
+		ANALYTICAL_FIRST_FIXED(sht);
+		break;
+	case TYPE_int:
+		ANALYTICAL_FIRST_FIXED(int);
+		break;
+	case TYPE_lng:
+		ANALYTICAL_FIRST_FIXED(lng);
+		break;
+#ifdef HAVE_HGE
+	case TYPE_hge:
+		ANALYTICAL_FIRST_FIXED(hge);
+		break;
+#endif
+	case TYPE_flt:
+		ANALYTICAL_FIRST_FIXED(flt);
+		break;
+	case TYPE_dbl:
+		ANALYTICAL_FIRST_FIXED(dbl);
+		break;
+	default:{
+		if (ATOMvarsized(tpe)) {
+			for (; k < cnt; k++) {
+				const void *curval = (end[k] > start[k]) ? BUNtvar(&bi, start[k]) : nil;
+				if (tfastins_nocheckVAR(r, k, curval) != GDK_SUCCEED) {
+					BBPreclaim(r);
+					bat_iterator_end(&bi);
+					bat_iterator_end(&si);
+					bat_iterator_end(&ei);
+					return NULL;
+				}
+				has_nils |= atomeq(curval, nil);
+			}
+		} else {
+			uint16_t width = r->twidth;
+			uint8_t *restrict rcast = (uint8_t *) Tloc(r, 0);
+			for (; k < cnt; k++) {
+				const void *curval = (end[k] > start[k]) ? BUNtloc(&bi, start[k]) : nil;
+				memcpy(rcast, curval, width);
+				rcast += width;
+				has_nils |= atomeq(curval, nil);
+			}
+		}
+	}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",s=" ALGOOPTBATFMT ",e=" ALGOOPTBATFMT
+		  ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(s), ALGOOPTBATPAR(e),
+		  ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+}
+
+#define ANALYTICAL_LAST_FIXED(TPE)					\
+	do {								\
+		const TPE *bp = (TPE*)bi.base;				\
+		TPE *rb = (TPE*)Tloc(r, 0);				\
+		for (; k < cnt; k++) {					\
+			const TPE *bs = bp + start[k], *be = bp + end[k]; \
+			TPE curval = (be > bs) ? be[-1] : TPE##_nil;	\
+			rb[k] = curval;					\
+			has_nils |= is_##TPE##_nil(curval);		\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticallast(BAT *b, BAT *s, BAT *e, int tpe)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BAT *r = COLnew(b->hseqbase, b->ttype, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	bool has_nils = false;
+	oid k = 0, cnt = BATcount(b);
+	const oid *restrict start = si.base, *restrict end = ei.base;
+	const void *nil = ATOMnilptr(tpe);
+	bool (*atomeq)(const void *, const void *) = ATOMequal(tpe);
+
+	switch (ATOMbasetype(tpe)) {
+	case TYPE_bte:
+		ANALYTICAL_LAST_FIXED(bte);
+		break;
+	case TYPE_sht:
+		ANALYTICAL_LAST_FIXED(sht);
+		break;
+	case TYPE_int:
+		ANALYTICAL_LAST_FIXED(int);
+		break;
+	case TYPE_lng:
+		ANALYTICAL_LAST_FIXED(lng);
+		break;
+#ifdef HAVE_HGE
+	case TYPE_hge:
+		ANALYTICAL_LAST_FIXED(hge);
+		break;
+#endif
+	case TYPE_flt:
+		ANALYTICAL_LAST_FIXED(flt);
+		break;
+	case TYPE_dbl:
+		ANALYTICAL_LAST_FIXED(dbl);
+		break;
+	default:{
+		if (ATOMvarsized(tpe)) {
+			for (; k < cnt; k++) {
+				const void *curval = (end[k] > start[k]) ? BUNtvar(&bi, end[k] - 1) : nil;
+				if (tfastins_nocheckVAR(r, k, curval) != GDK_SUCCEED) {
+					BBPreclaim(r);
+					bat_iterator_end(&bi);
+					bat_iterator_end(&si);
+					bat_iterator_end(&ei);
+					return NULL;
+				}
+				has_nils |= atomeq(curval, nil);
+			}
+		} else {
+			uint16_t width = r->twidth;
+			uint8_t *restrict rcast = (uint8_t *) Tloc(r, 0);
+			for (; k < cnt; k++) {
+				const void *curval = (end[k] > start[k]) ? BUNtloc(&bi, end[k] - 1) : nil;
+				memcpy(rcast, curval, width);
+				rcast += width;
+				has_nils |= atomeq(curval, nil);
+			}
+		}
+	}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",s=" ALGOOPTBATFMT ",e=" ALGOOPTBATFMT
+		  ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(s), ALGOOPTBATPAR(e),
+		  ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+}
+
+#define ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(TPE)			\
+	do {								\
+		const TPE *bp = (TPE*)bi.base;				\
+		TPE *rb = (TPE*)Tloc(r, 0);				\
+		if (is_lng_nil(nth)) {					\
+			has_nils = true;				\
+			for (; k < cnt; k++)				\
+				rb[k] = TPE##_nil;			\
+		} else {						\
+			nth--;						\
+			for (; k < cnt; k++) {				\
+				const TPE *bs = bp + start[k];		\
+				const TPE *be = bp + end[k];		\
+				TPE curval = (be > bs && nth < (lng)(end[k] - start[k])) ? bs[nth] : TPE##_nil; \
+				rb[k] = curval;				\
+				has_nils |= is_##TPE##_nil(curval);	\
+			}						\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(TPE)			\
+	do {								\
+		const TPE *bp = (TPE*)bi.base;				\
+		TPE curval, *rb = (TPE*)Tloc(r, 0);			\
+		for (; k < cnt; k++) {					\
+			lng lnth = tp[k];				\
+			const TPE *bs = bp + start[k];			\
+			const TPE *be = bp + end[k];			\
+			if (!is_lng_nil(lnth) && lnth <= 0) goto invalidnth; \
+			if (is_lng_nil(lnth) || be <= bs || lnth - 1 > (lng)(end[k] - start[k])) { \
+				curval = TPE##_nil;			\
+				has_nils = true;			\
+			} else {					\
+				curval = bs[lnth - 1];			\
+				has_nils |= is_##TPE##_nil(curval);	\
+			}						\
+			rb[k] = curval;					\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticalnthvalue(BAT *b, BAT *s, BAT *e, BAT *t, lng nth, int tpe)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BAT *r = COLnew(b->hseqbase, tpe, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	BATiter ti = bat_iterator(t);
+	bool has_nils = false;
+	oid k = 0, cnt = bi.count;
+	const oid *restrict start = si.base, *restrict end = ei.base;
+	const lng *restrict tp = ti.base;
+	const void *nil = ATOMnilptr(tpe);
+	bool (*atomeq)(const void *, const void *) = ATOMequal(tpe);
+
+	if (t && t->ttype != TYPE_lng)
+		goto nosupport;
+
+	if (t) {
+		switch (ATOMbasetype(tpe)) {
+		case TYPE_bte:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(bte);
+			break;
+		case TYPE_sht:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(sht);
+			break;
+		case TYPE_int:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(int);
+			break;
+		case TYPE_lng:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(lng);
+			break;
+#ifdef HAVE_HGE
+		case TYPE_hge:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(hge);
+			break;
+#endif
+		case TYPE_flt:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(flt);
+			break;
+		case TYPE_dbl:
+			ANALYTICAL_NTHVALUE_IMP_MULTI_FIXED(dbl);
+			break;
+		default:{
+			const void *curval = nil;
+			if (ATOMvarsized(tpe)) {
+				for (; k < cnt; k++) {
+					lng lnth = tp[k];
+					if (!is_lng_nil(nth) && nth <= 0) goto invalidnth;
+					if (is_lng_nil(lnth) || end[k] <= start[k] || lnth - 1 > (lng)(end[k] - start[k])) {
+						curval = (void *) nil;
+						has_nils = true;
+					} else {
+						curval = BUNtvar(&bi, start[k] + (oid)(lnth - 1));
+						has_nils |= atomeq(curval, nil);
+					}
+					if (tfastins_nocheckVAR(r, k, curval) != GDK_SUCCEED) {
+						bat_iterator_end(&bi);
+						bat_iterator_end(&si);
+						bat_iterator_end(&ei);
+						bat_iterator_end(&ti);
+						BBPreclaim(r);
+						return NULL;
+					}
+				}
+			} else {
+				uint8_t *restrict rcast = (uint8_t *) Tloc(r, 0);
+				uint16_t width = r->twidth;
+				for (; k < cnt; k++) {
+					lng lnth = tp[k];
+					if (!is_lng_nil(nth) && nth <= 0) goto invalidnth;
+					if (is_lng_nil(lnth) || end[k] <= start[k] || lnth - 1 > (lng)(end[k] - start[k])) {
+						curval = (void *) nil;
+						has_nils = true;
+					} else {
+						curval = BUNtloc(&bi, start[k] + (oid)(lnth - 1));
+						has_nils |= atomeq(curval, nil);
+					}
+					memcpy(rcast, curval, width);
+					rcast += width;
+				}
+			}
+		}
+		}
+	} else {
+		if (!is_lng_nil(nth) && nth <= 0) {
+			goto invalidnth;
+		}
+		switch (ATOMbasetype(tpe)) {
+		case TYPE_bte:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(bte);
+			break;
+		case TYPE_sht:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(sht);
+			break;
+		case TYPE_int:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(int);
+			break;
+		case TYPE_lng:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(lng);
+			break;
+#ifdef HAVE_HGE
+		case TYPE_hge:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(hge);
+			break;
+#endif
+		case TYPE_flt:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(flt);
+			break;
+		case TYPE_dbl:
+			ANALYTICAL_NTHVALUE_IMP_SINGLE_FIXED(dbl);
+			break;
+		default:{
+			if (ATOMvarsized(tpe)) {
+				if (is_lng_nil(nth)) {
+					has_nils = true;
+					for (; k < cnt; k++)
+						if (tfastins_nocheckVAR(r, k, nil) != GDK_SUCCEED) {
+							bat_iterator_end(&bi);
+							bat_iterator_end(&si);
+							bat_iterator_end(&ei);
+							bat_iterator_end(&ti);
+							BBPreclaim(r);
+							return NULL;
+						}
+				} else {
+					nth--;
+					for (; k < cnt; k++) {
+						const void *curval = (end[k] > start[k] && nth < (lng)(end[k] - start[k])) ? BUNtvar(&bi, start[k] + (oid) nth) : nil;
+						if (tfastins_nocheckVAR(r, k, curval) != GDK_SUCCEED) {
+							bat_iterator_end(&bi);
+							bat_iterator_end(&si);
+							bat_iterator_end(&ei);
+							bat_iterator_end(&ti);
+							BBPreclaim(r);
+							return NULL;
+						}
+						has_nils |= atomeq(curval, nil);
+					}
+				}
+			} else {
+				uint16_t width = r->twidth;
+				uint8_t *restrict rcast = (uint8_t *) Tloc(r, 0);
+				if (is_lng_nil(nth)) {
+					has_nils = true;
+					for (; k < cnt; k++) {
+						memcpy(rcast, nil, width);
+						rcast += width;
+					}
+				} else {
+					nth--;
+					for (; k < cnt; k++) {
+						const void *curval = (end[k] > start[k] && nth < (lng)(end[k] - start[k])) ? BUNtloc(&bi, start[k] + (oid) nth) : nil;
+						memcpy(rcast, curval, width);
+						rcast += width;
+						has_nils |= atomeq(curval, nil);
+					}
+				}
+			}
+		}
+		}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	bat_iterator_end(&ti);
+
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",s=" ALGOOPTBATFMT ",e=" ALGOOPTBATFMT
+		  ",t=" ALGOOPTBATFMT ",nth=" LLFMT ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(s), ALGOOPTBATPAR(e),
+		  ALGOOPTBATPAR(t), nth, ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+nosupport:
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	bat_iterator_end(&ti);
+	BBPreclaim(r);
+	GDKerror("42000!type %s not supported for the nth_value.\n", ATOMname(t->ttype));
+	return NULL;
+invalidnth:
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	bat_iterator_end(&ti);
+	BBPreclaim(r);
+	GDKerror("42000!nth_value must be greater than zero.\n");
+	return NULL;
+}
+
+#define ANALYTICAL_LAG_CALC(TPE)				\
+	do {							\
+		for (i = 0; i < lag && rb < rp; i++, rb++)	\
+			*rb = def;				\
+		has_nils |= (lag > 0 && is_##TPE##_nil(def));	\
+		for (; rb < rp; rb++, bp++) {			\
+			next = *bp;				\
+			*rb = next;				\
+			has_nils |= is_##TPE##_nil(next);	\
+		}						\
+	} while (0)
+
+#define ANALYTICAL_LAG_IMP(TPE)						\
+	do {								\
+		TPE *rp, *rb, *rend,					\
+			def = *((TPE *) default_value), next;		\
+		const TPE *bp, *nbp;					\
+		bp = (TPE*)bi.base;					\
+		rb = rp = (TPE*)Tloc(r, 0);				\
+		rend = rb + cnt;					\
+		if (lag == BUN_NONE) {					\
+			has_nils = true;				\
+			for (; rb < rend; rb++)				\
+				*rb = TPE##_nil;			\
+		} else if (p) {						\
+			pnp = np = (bit*)pi.base;			\
+			end = np + cnt;					\
+			for (; np < end; np++) {			\
+				if (*np) {				\
+					ncnt = (np - pnp);		\
+					rp += ncnt;			\
+					nbp = bp + ncnt;		\
+					ANALYTICAL_LAG_CALC(TPE);	\
+					bp = nbp;			\
+					pnp = np;			\
+				}					\
+			}						\
+			rp += (np - pnp);				\
+			ANALYTICAL_LAG_CALC(TPE);			\
+		} else {						\
+			rp += cnt;					\
+			ANALYTICAL_LAG_CALC(TPE);			\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_LAG_OTHERS						\
+	do {								\
+		for (i = 0; i < lag && k < j; i++, k++) {		\
+			if (BUNappend(r, default_value, false) != GDK_SUCCEED) { \
+				bat_iterator_end(&bi);			\
+				bat_iterator_end(&pi);			\
+				BBPreclaim(r);				\
+				return NULL;				\
+			}						\
+		}							\
+		has_nils |= (lag > 0 && atomeq(default_value, nil)); \
+		for (l = k - lag; k < j; k++, l++) {			\
+			curval = BUNtail(&bi, l);			\
+			if (BUNappend(r, curval, false) != GDK_SUCCEED)	{ \
+				bat_iterator_end(&bi);			\
+				bat_iterator_end(&pi);			\
+				BBPreclaim(r);				\
+				return NULL;				\
+			}						\
+			has_nils |= atomeq(curval, nil);		\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticallag(BAT *b, BAT *p, BUN lag, const void *restrict default_value, int tpe)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BATiter bi = bat_iterator(b);
+	BATiter pi = bat_iterator(p);
+	bool (*atomeq)(const void *, const void *);
+	const void *restrict nil;
+	BUN i = 0, j = 0, k = 0, l = 0, ncnt, cnt = BATcount(b);
+	bit *np, *pnp, *end;
+	bool has_nils = false;
+	BAT *r = COLnew(b->hseqbase, tpe, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+
+	assert(default_value);
+
+	switch (ATOMbasetype(tpe)) {
+	case TYPE_bte:
+		ANALYTICAL_LAG_IMP(bte);
+		break;
+	case TYPE_sht:
+		ANALYTICAL_LAG_IMP(sht);
+		break;
+	case TYPE_int:
+		ANALYTICAL_LAG_IMP(int);
+		break;
+	case TYPE_lng:
+		ANALYTICAL_LAG_IMP(lng);
+		break;
+#ifdef HAVE_HGE
+	case TYPE_hge:
+		ANALYTICAL_LAG_IMP(hge);
+		break;
+#endif
+	case TYPE_flt:
+		ANALYTICAL_LAG_IMP(flt);
+		break;
+	case TYPE_dbl:
+		ANALYTICAL_LAG_IMP(dbl);
+		break;
+	default:{
+		const void *restrict curval;
+		nil = ATOMnilptr(tpe);
+		atomeq = ATOMequal(tpe);
+		if (lag == BUN_NONE) {
+			has_nils = true;
+			for (j = 0; j < cnt; j++) {
+				if (BUNappend(r, nil, false) != GDK_SUCCEED) {
+					bat_iterator_end(&bi);
+					bat_iterator_end(&pi);
+					BBPreclaim(r);
+					return NULL;
+				}
+			}
+		} else if (p) {
+			pnp = np = (bit *) pi.base;
+			end = np + cnt;
+			for (; np < end; np++) {
+				if (*np) {
+					j += (np - pnp);
+					ANALYTICAL_LAG_OTHERS;
+					pnp = np;
+				}
+			}
+			j += (np - pnp);
+			ANALYTICAL_LAG_OTHERS;
+		} else {
+			j += cnt;
+			ANALYTICAL_LAG_OTHERS;
+		}
+	}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&pi);
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",p=" ALGOOPTBATFMT
+		  ",lag= " BUNFMT ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(p),
+		  lag, ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+}
+
+#define LEAD_CALC(TPE)							\
+	do {								\
+		if (lead < ncnt) {					\
+			bp += lead;					\
+			l = ncnt - lead;				\
+			for (i = 0; i < l; i++, rb++, bp++) {		\
+				next = *bp;				\
+				*rb = next;				\
+				has_nils |= is_##TPE##_nil(next);	\
+			}						\
+		} else {						\
+			bp += ncnt;					\
+		}							\
+		for (;rb < rp; rb++)					\
+			*rb = def;					\
+		has_nils |= (lead > 0 && is_##TPE##_nil(def));		\
+	} while (0)
+
+#define ANALYTICAL_LEAD_IMP(TPE)				\
+	do {							\
+		TPE *rp, *rb, *bp, *rend,			\
+			def = *((TPE *) default_value), next;	\
+		bp = (TPE*)bi.base;				\
+		rb = rp = (TPE*)Tloc(r, 0);			\
+		rend = rb + cnt;				\
+		if (lead == BUN_NONE) {				\
+			has_nils = true;			\
+			for (; rb < rend; rb++)			\
+				*rb = TPE##_nil;		\
+		} else if (p) {					\
+			pnp = np = (bit*)pi.base;		\
+			end = np + cnt;				\
+			for (; np < end; np++) {		\
+				if (*np) {			\
+					ncnt = (np - pnp);	\
+					rp += ncnt;		\
+					LEAD_CALC(TPE);		\
+					pnp = np;		\
+				}				\
+			}					\
+			ncnt = (np - pnp);			\
+			rp += ncnt;				\
+			LEAD_CALC(TPE);				\
+		} else {					\
+			ncnt = cnt;				\
+			rp += ncnt;				\
+			LEAD_CALC(TPE);				\
+		}						\
+	} while (0)
+
+#define ANALYTICAL_LEAD_OTHERS						\
+	do {								\
+		j += ncnt;						\
+		if (lead < ncnt) {					\
+			m = ncnt - lead;				\
+			for (i = 0,n = k + lead; i < m; i++, n++) {	\
+				curval = BUNtail(&bi, n);		\
+				if (BUNappend(r, curval, false) != GDK_SUCCEED)	{ \
+					bat_iterator_end(&bi);		\
+					bat_iterator_end(&pi);		\
+					BBPreclaim(r);			\
+					return NULL;			\
+				}					\
+				has_nils |= atomeq(curval, nil);	\
+			}						\
+			k += i;						\
+		}							\
+		for (; k < j; k++) {					\
+			if (BUNappend(r, default_value, false) != GDK_SUCCEED) { \
+				bat_iterator_end(&bi);			\
+				bat_iterator_end(&pi);			\
+				BBPreclaim(r);				\
+				return NULL;				\
+			}						\
+		}							\
+		has_nils |= (lead > 0 && atomeq(default_value, nil)); \
+	} while (0)
+
+BAT *
+GDKanalyticallead(BAT *b, BAT *p, BUN lead, const void *restrict default_value, int tpe)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BATiter bi = bat_iterator(b);
+	BATiter pi = bat_iterator(p);
+	bool (*atomeq) (const void *, const void *);
+	const void *restrict nil;
+	BUN i = 0, j = 0, k = 0, l = 0, ncnt, cnt = BATcount(b);
+	bit *np, *pnp, *end;
+	bool has_nils = false;
+	BAT *r = COLnew(b->hseqbase, tpe, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+
+	assert(default_value);
+
+	switch (ATOMbasetype(tpe)) {
+	case TYPE_bte:
+		ANALYTICAL_LEAD_IMP(bte);
+		break;
+	case TYPE_sht:
+		ANALYTICAL_LEAD_IMP(sht);
+		break;
+	case TYPE_int:
+		ANALYTICAL_LEAD_IMP(int);
+		break;
+	case TYPE_lng:
+		ANALYTICAL_LEAD_IMP(lng);
+		break;
+#ifdef HAVE_HGE
+	case TYPE_hge:
+		ANALYTICAL_LEAD_IMP(hge);
+		break;
+#endif
+	case TYPE_flt:
+		ANALYTICAL_LEAD_IMP(flt);
+		break;
+	case TYPE_dbl:
+		ANALYTICAL_LEAD_IMP(dbl);
+		break;
+	default:{
+		BUN m = 0, n = 0;
+		const void *restrict curval;
+		nil = ATOMnilptr(tpe);
+		atomeq = ATOMequal(tpe);
+		if (lead == BUN_NONE) {
+			has_nils = true;
+			for (j = 0; j < cnt; j++) {
+				if (BUNappend(r, nil, false) != GDK_SUCCEED) {
+					bat_iterator_end(&bi);
+					bat_iterator_end(&pi);
+					BBPreclaim(r);
+					return NULL;
+				}
+			}
+		} else if (p) {
+			pnp = np = (bit *) pi.base;
+			end = np + cnt;
+			for (; np < end; np++) {
+				if (*np) {
+					ncnt = (np - pnp);
+					ANALYTICAL_LEAD_OTHERS;
+					pnp = np;
+				}
+			}
+			ncnt = (np - pnp);
+			ANALYTICAL_LEAD_OTHERS;
+		} else {
+			ncnt = cnt;
+			ANALYTICAL_LEAD_OTHERS;
+		}
+	}
+	}
+	bat_iterator_end(&bi);
+	bat_iterator_end(&pi);
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+	TRC_DEBUG(ALGO, "b=" ALGOBATFMT ",p=" ALGOOPTBATFMT
+		  ",lead= " BUNFMT ",tpe=%s -> "
+		  ALGOBATFMT " (" LLFMT " usec)\n",
+		  ALGOBATPAR(b), ALGOOPTBATPAR(p),
+		  lead, ATOMname(tpe), ALGOBATPAR(r),
+		  GDKusec() - t0);
+	return r;
+}
+
+#define ANALYTICAL_MIN_MAX_CALC_FIXED_UNBOUNDED_TILL_CURRENT_ROW(TPE, MIN_MAX) \
+	do {								\
+		TPE curval = TPE##_nil;					\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				if (!is_##TPE##_nil(bp[k])) {		\
+					if (is_##TPE##_nil(curval))	\
+						curval = bp[k];		\
+					else				\
+						curval = MIN_MAX(bp[k], curval); \
+				}					\
+				k++;					\
+			} while (k < i && !op[k]);			\
+			for (; j < k; j++)				\
+				rb[j] = curval;				\
+			has_nils |= is_##TPE##_nil(curval);		\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_FIXED_CURRENT_ROW_TILL_UNBOUNDED(TPE, MIN_MAX) \
+	do {								\
+		TPE curval = TPE##_nil;					\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			if (!is_##TPE##_nil(bp[j])) {			\
+				if (is_##TPE##_nil(curval))		\
+					curval = bp[j];			\
+				else					\
+					curval = MIN_MAX(bp[j], curval); \
+			}						\
+			if (op[j] || j == k) {				\
+				for (; ; l--) {				\
+					rb[l] = curval;			\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_##TPE##_nil(curval);	\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_FIXED_ALL_ROWS(TPE, MIN_MAX)		\
+	do {								\
+		TPE curval = TPE##_nil;					\
+		for (j = k; j < i; j++) {				\
+			TPE v = bp[j];					\
+			if (!is_##TPE##_nil(v)) {			\
+				if (is_##TPE##_nil(curval))		\
+					curval = v;			\
+				else					\
+					curval = MIN_MAX(v, curval);	\
+			}						\
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+		has_nils |= is_##TPE##_nil(curval);			\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_FIXED_CURRENT_ROW(TPE, MIN_MAX)	\
+	do {							\
+		for (; k < i; k++) {				\
+			TPE v = bp[k];				\
+			rb[k] = v;				\
+			has_nils |= is_##TPE##_nil(v);		\
+		}						\
+	} while (0)
+
+#define INIT_AGGREGATE_MIN_MAX_FIXED(TPE, MIN_MAX, NOTHING)	\
+	do {							\
+		computed = TPE##_nil;				\
+	} while (0)
+#define COMPUTE_LEVEL0_MIN_MAX_FIXED(X, TPE, MIN_MAX, NOTHING)	\
+	do {							\
+		computed = bp[j + X];				\
+	} while (0)
+#define COMPUTE_LEVELN_MIN_MAX_FIXED(VAL, TPE, MIN_MAX, NOTHING)	\
+	do {								\
+		if (!is_##TPE##_nil(VAL)) {				\
+			if (is_##TPE##_nil(computed))			\
+				computed = VAL;				\
+			else						\
+				computed = MIN_MAX(computed, VAL);	\
+		}							\
+	} while (0)
+#define FINALIZE_AGGREGATE_MIN_MAX_FIXED(TPE, MIN_MAX, NOTHING) \
+	do {							\
+		rb[k] = computed;				\
+		has_nils |= is_##TPE##_nil(computed);		\
+	} while (0)
+#define ANALYTICAL_MIN_MAX_CALC_FIXED_OTHERS(TPE, MIN_MAX)		\
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE, ncount, INIT_AGGREGATE_MIN_MAX_FIXED, COMPUTE_LEVEL0_MIN_MAX_FIXED, COMPUTE_LEVELN_MIN_MAX_FIXED, NOTHING_ARGS, TPE, MIN_MAX, NOTHING); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(TPE, start[k] - j, end[k] - j, INIT_AGGREGATE_MIN_MAX_FIXED, COMPUTE_LEVELN_MIN_MAX_FIXED, FINALIZE_AGGREGATE_MIN_MAX_FIXED, TPE, MIN_MAX, NOTHING); \
+		j = k;							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_OTHERS_UNBOUNDED_TILL_CURRENT_ROW(GT_LT) \
+	do {								\
+		const void *curval = nil;				\
+		if (ATOMvarsized(tpe)) {				\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					const void *next = BUNtvar(&bi, k); \
+					if (!atomeq(next, nil)) {	\
+						if (atomeq(curval, nil)) \
+							curval = next;	\
+						else			\
+							curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+					}				\
+					k++;				\
+				} while (k < i && !op[k]);		\
+				for (; j < k; j++)			\
+					if ((res = tfastins_nocheckVAR(r, j, curval)) != GDK_SUCCEED) \
+						goto cleanup;		\
+				has_nils |= atomeq(curval, nil);	\
+			}						\
+		} else {						\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					const void *next = BUNtloc(&bi, k); \
+					if (!atomeq(next, nil)) {	\
+						if (atomeq(curval, nil)) \
+							curval = next;	\
+						else			\
+							curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+					}				\
+					k++;				\
+				} while (k < i && !op[k]);		\
+				for (; j < k; j++) {			\
+					memcpy(rcast, curval, width);	\
+					rcast += width;			\
+				}					\
+				has_nils |= atomeq(curval, nil);	\
+			}						\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_OTHERS_CURRENT_ROW_TILL_UNBOUNDED(GT_LT) \
+	do {								\
+		const void *curval = nil;				\
+		l = i - 1;						\
+		if (ATOMvarsized(tpe)) {				\
+			for (j = l; ; j--) {				\
+				const void *next = BUNtvar(&bi, j);	\
+				if (!atomeq(next, nil)) {		\
+					if (atomeq(curval, nil))	\
+						curval = next;		\
+					else				\
+						curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+				}					\
+				if (op[j] || j == k) {			\
+					for (; ; l--) {			\
+						if ((res = tfastins_nocheckVAR(r, l, curval)) != GDK_SUCCEED) \
+							goto cleanup;	\
+						if (l == j)		\
+							break;		\
+					}				\
+					has_nils |= atomeq(curval, nil); \
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		} else {						\
+			for (j = l; ; j--) {				\
+				const void *next = BUNtloc(&bi, j);	\
+				if (!atomeq(next, nil)) {		\
+					if (atomeq(curval, nil))	\
+						curval = next;		\
+					else				\
+						curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+				}					\
+				if (op[j] || j == k) {			\
+					BUN x = l * width;		\
+					for (; ; l--) {			\
+						memcpy(rcast + x, curval, width); \
+						x -= width;		\
+						if (l == j)		\
+							break;		\
+					}				\
+					has_nils |= atomeq(curval, nil); \
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_OTHERS_ALL_ROWS(GT_LT)			\
+	do {								\
+		const void *curval = (void*) nil;			\
+		if (ATOMvarsized(tpe)) {				\
+			for (j = k; j < i; j++) {			\
+				const void *next = BUNtvar(&bi, j);	\
+				if (!atomeq(next, nil)) {		\
+					if (atomeq(curval, nil))	\
+						curval = next;		\
+					else				\
+						curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+				}					\
+			}						\
+			for (; k < i; k++)				\
+				if ((res = tfastins_nocheckVAR(r, k, curval)) != GDK_SUCCEED) \
+					goto cleanup;			\
+		} else {						\
+			for (j = k; j < i; j++) {			\
+				const void *next = BUNtloc(&bi, j);	\
+				if (!atomeq(next, nil)) {		\
+					if (atomeq(curval, nil))	\
+						curval = next;		\
+					else				\
+						curval = atomcmp(next, curval) GT_LT 0 ? curval : next; \
+				}					\
+			}						\
+			for (; k < i; k++) {				\
+				memcpy(rcast, curval, width);		\
+				rcast += width;				\
+			}						\
+		}							\
+		has_nils |= atomeq(curval, nil);			\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_CALC_OTHERS_CURRENT_ROW(GT_LT)		\
+	do {								\
+		if (ATOMvarsized(tpe)) {				\
+			for (; k < i; k++) {				\
+				const void *next = BUNtvar(&bi, k);	\
+				if ((res = tfastins_nocheckVAR(r, k, next)) != GDK_SUCCEED) \
+					goto cleanup;			\
+				has_nils |= atomeq(next, nil);	\
+			}						\
+		} else {						\
+			for (; k < i; k++) {				\
+				const void *next = BUNtloc(&bi, k);	\
+				memcpy(rcast, next, width);		\
+				rcast += width;				\
+				has_nils |= atomeq(next, nil);	\
+			}						\
+		}							\
+	} while (0)
+
+#define INIT_AGGREGATE_MIN_MAX_OTHERS(GT_LT, NOTHING1, NOTHING2)	\
+	do {								\
+		computed = (void*) nil;					\
+	} while (0)
+#define COMPUTE_LEVEL0_MIN_MAX_OTHERS(X, GT_LT, NOTHING1, NOTHING2)	\
+	do {								\
+		computed = BUNtail(&bi, j + X);				\
+	} while (0)
+#define COMPUTE_LEVELN_MIN_MAX_OTHERS(VAL, GT_LT, NOTHING1, NOTHING2)	\
+	do {								\
+		if (!atomeq(VAL, nil)) {				\
+			if (atomeq(computed, nil))		\
+				computed = VAL;				\
+			else						\
+				computed = atomcmp(VAL, computed) GT_LT 0 ? computed : VAL; \
+		}							\
+	} while (0)
+#define FINALIZE_AGGREGATE_MIN_MAX_OTHERS(GT_LT, NOTHING1, NOTHING2)	\
+	do {								\
+		if (ATOMvarsized(tpe)) {				\
+			if ((res = tfastins_nocheckVAR(r, k, computed)) != GDK_SUCCEED) \
+				goto cleanup;				\
+		} else {						\
+			memcpy(rcast, computed, width);			\
+			rcast += width;					\
+		}							\
+		has_nils |= atomeq(computed, nil);		\
+	} while (0)
+#define ANALYTICAL_MIN_MAX_CALC_OTHERS_OTHERS(GT_LT)			\
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(void*), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(const void*, ncount, INIT_AGGREGATE_MIN_MAX_OTHERS, COMPUTE_LEVEL0_MIN_MAX_OTHERS, COMPUTE_LEVELN_MIN_MAX_OTHERS, NOTHING_ARGS, GT_LT, NOTHING, NOTHING); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(void*, start[k] - j, end[k] - j, INIT_AGGREGATE_MIN_MAX_OTHERS, COMPUTE_LEVELN_MIN_MAX_OTHERS, FINALIZE_AGGREGATE_MIN_MAX_OTHERS, GT_LT, NOTHING, NOTHING); \
+		j = k;							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX_PARTITIONS(TPE, MIN_MAX, IMP)		\
+	do {								\
+		TPE *restrict bp = (TPE*)bi.base, *rb = (TPE*)Tloc(r, 0); \
+		if (p) {						\
+			while (i < cnt) {				\
+				if (np[i]) {				\
+minmaxfixed##TPE##IMP:							\
+					ANALYTICAL_MIN_MAX_CALC_FIXED_##IMP(TPE, MIN_MAX); \
+				}					\
+				if (!last)				\
+					i++;				\
+			}						\
+		}							\
+		if (!last) { /* hack to reduce code explosion, there's no need to duplicate the code to iterate each partition */ \
+			last = true;					\
+			i = cnt;					\
+			goto minmaxfixed##TPE##IMP;			\
+		}							\
+	} while (0)
+
+#ifdef HAVE_HGE
+#define ANALYTICAL_MIN_MAX_LIMIT(MIN_MAX, IMP)				\
+	case TYPE_hge:							\
+		ANALYTICAL_MIN_MAX_PARTITIONS(hge, MIN_MAX, IMP);	\
+	break;
+#else
+#define ANALYTICAL_MIN_MAX_LIMIT(MIN_MAX, IMP)
+#endif
+
+#define ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, IMP)		\
+	do {								\
+		switch (ATOMbasetype(tpe)) {				\
+		case TYPE_bte:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(bte, MIN_MAX, IMP); \
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(sht, MIN_MAX, IMP); \
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(int, MIN_MAX, IMP); \
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(lng, MIN_MAX, IMP); \
+			break;						\
+			ANALYTICAL_MIN_MAX_LIMIT(MIN_MAX, IMP)		\
+		case TYPE_flt:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(flt, MIN_MAX, IMP); \
+			break;						\
+		case TYPE_dbl:						\
+			ANALYTICAL_MIN_MAX_PARTITIONS(dbl, MIN_MAX, IMP); \
+			break;						\
+		default: {						\
+			if (p) {					\
+				while (i < cnt) {			\
+					if (np[i]) {			\
+minmaxvarsized##IMP:							\
+						ANALYTICAL_MIN_MAX_CALC_OTHERS_##IMP(GT_LT); \
+					}				\
+					if (!last)			\
+						i++;			\
+				}					\
+			}						\
+			if (!last) {					\
+				last = true;				\
+				i = cnt;				\
+				goto minmaxvarsized##IMP;		\
+			}						\
+		}							\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_MIN_MAX(OP, MIN_MAX, GT_LT)				\
+BAT *									\
+GDKanalytical##OP(BAT *p, BAT *o, BAT *b, BAT *s, BAT *e, int tpe, int frame_type) \
+{									\
+	lng t0 = 0;							\
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();				\
+	BAT *r = COLnew(b->hseqbase, b->ttype, BATcount(b), TRANSIENT); \
+	if (r == NULL)							\
+		return NULL;						\
+	BATiter pi = bat_iterator(p);					\
+	BATiter oi = bat_iterator(o);					\
+	BATiter bi = bat_iterator(b);					\
+	BATiter si = bat_iterator(s);					\
+	BATiter ei = bat_iterator(e);					\
+	bool has_nils = false, last = false;				\
+	oid i = 1, j = 0, k = 0, l = 0, cnt = BATcount(b), *restrict start = si.base, *restrict end = ei.base, \
+		*levels_offset = NULL, nlevels = 0;			\
+	bit *np = pi.base, *op = oi.base;				\
+	const void *nil = ATOMnilptr(tpe);				\
+	int (*atomcmp)(const void *, const void *) = ATOMcompare(tpe);	\
+	bool (*atomeq)(const void *, const void *) = ATOMequal(tpe);	\
+	void *segment_tree = NULL;					\
+	gdk_return res = GDK_SUCCEED;					\
+	uint16_t width = r->twidth;					\
+	uint8_t *restrict rcast = (uint8_t *) Tloc(r, 0);		\
+	Heap *st = NULL;						\
+									\
+	assert(np == NULL || cnt == 0 || np[0] == 0);			\
+	if (cnt > 0) {							\
+		switch (frame_type) {					\
+		case 3: /* unbounded until current row */		\
+			ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, UNBOUNDED_TILL_CURRENT_ROW); \
+			break;						\
+		case 4: /* current row until unbounded */		\
+			ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, CURRENT_ROW_TILL_UNBOUNDED); \
+			break;						\
+		case 5: /* all rows */					\
+			ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, ALL_ROWS); \
+			break;						\
+		case 6: /* current row */				\
+			ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, CURRENT_ROW); \
+			break;						\
+		default:						\
+			if ((st = GDKinitialize_segment_tree()) == NULL) { \
+				res = GDK_FAIL;				\
+				goto cleanup;				\
+			}						\
+			ANALYTICAL_MIN_MAX_BRANCHES(MIN_MAX, GT_LT, OTHERS); \
+			break;						\
+		}							\
+	}								\
+									\
+	BATsetcount(r, cnt);						\
+	r->tnonil = !has_nils;						\
+	r->tnil = has_nils;						\
+cleanup:								\
+	bat_iterator_end(&pi);						\
+	bat_iterator_end(&oi);						\
+	bat_iterator_end(&bi);						\
+	bat_iterator_end(&si);						\
+	bat_iterator_end(&ei);						\
+	if (st)								\
+		HEAPdecref(st, true);					\
+	if (res != GDK_SUCCEED) {					\
+		BBPreclaim(r);						\
+		r = NULL;						\
+	} else {							\
+		TRC_DEBUG(ALGO, "p=" ALGOOPTBATFMT ",o=" ALGOOPTBATFMT	\
+			  ",b=" ALGOBATFMT ",s=" ALGOOPTBATFMT		\
+			  ",e=" ALGOOPTBATFMT ",tpe=%s,frame_type=%d -> " \
+			  ALGOBATFMT " (" LLFMT " usec)\n",		\
+			  ALGOOPTBATPAR(p), ALGOOPTBATPAR(o),		\
+			  ALGOBATPAR(b), ALGOOPTBATPAR(s),		\
+			  ALGOOPTBATPAR(e), ATOMname(tpe),		\
+			  frame_type, ALGOBATPAR(r),			\
+			  GDKusec() - t0);				\
+	}								\
+	return r;							\
+}
+
+ANALYTICAL_MIN_MAX(min, MIN, >)
+ANALYTICAL_MIN_MAX(max, MAX, <)
+
+/* Counting no nils for fixed sizes */
+#define ANALYTICAL_COUNT_FIXED_UNBOUNDED_TILL_CURRENT_ROW(TPE)		\
+	do {								\
+		curval = 0;						\
+		if (count_all) {					\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					k++;				\
+				} while (k < i && !op[k]);		\
+				curval += k - j;			\
+				for (; j < k; j++)			\
+					rb[j] = curval;			\
+			}						\
+		} else {						\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					curval += !is_##TPE##_nil(bp[k]); \
+					k++;				\
+				} while (k < i && !op[k]);		\
+				for (; j < k; j++)			\
+					rb[j] = curval;			\
+			}						\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_COUNT_FIXED_CURRENT_ROW_TILL_UNBOUNDED(TPE)		\
+	do {								\
+		curval = 0;						\
+		l = i - 1;						\
+		if (count_all) {					\
+			for (j = l; ; j--) {				\
+				if (op[j] || j == k) {			\
+					curval += l - j + 1;		\
+					for (; ; l--) {			\
+						rb[l] = curval;		\
+						if (l == j)		\
+							break;		\
+					}				\
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		} else {						\
+			for (j = l; ; j--) {				\
+				curval += !is_##TPE##_nil(bp[j]);	\
+				if (op[j] || j == k) {			\
+					for (; ; l--) {			\
+						rb[l] = curval;		\
+						if (l == j)		\
+							break;		\
+					}				\
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_COUNT_FIXED_ALL_ROWS(TPE)				\
+	do {								\
+		if (count_all) {					\
+			curval = (lng)(i - k);				\
+			for (; k < i; k++)				\
+				rb[k] = curval;				\
+		} else {						\
+			curval = 0;					\
+			for (; j < i; j++)				\
+				curval += !is_##TPE##_nil(bp[j]);	\
+			for (; k < i; k++)				\
+				rb[k] = curval;				\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_COUNT_FIXED_CURRENT_ROW(TPE)			\
+	do {							\
+		if (count_all) {				\
+			for (; k < i; k++)			\
+				rb[k] = 1;			\
+		} else {					\
+			for (; k < i; k++)			\
+				rb[k] = !is_##TPE##_nil(bp[k]); \
+		}						\
+	} while (0)
+
+#define INIT_AGGREGATE_COUNT(TPE, NOTHING1, NOTHING2)	\
+	do {						\
+		computed = 0;				\
+	} while (0)
+#define COMPUTE_LEVEL0_COUNT_FIXED(X, TPE, NOTHING1, NOTHING2)	\
+	do {							\
+		computed = !is_##TPE##_nil(bp[j + X]);		\
+	} while (0)
+#define COMPUTE_LEVELN_COUNT(VAL, NOTHING1, NOTHING2, NOTHING3) \
+	do {							\
+		computed += VAL;				\
+	} while (0)
+#define FINALIZE_AGGREGATE_COUNT(NOTHING1, NOTHING2, NOTHING3)	\
+	do {							\
+		rb[k] = computed;				\
+	} while (0)
+#define ANALYTICAL_COUNT_FIXED_OTHERS(TPE)				\
+	do {								\
+		if (count_all) { /* no segment tree required for the global case (it scales in O(n)) */ \
+			for (; k < i; k++)				\
+				rb[k] = (end[k] > start[k]) ? (lng)(end[k] - start[k]) : 0; \
+		} else {						\
+			oid ncount = i - k;				\
+			if ((res = GDKrebuild_segment_tree(ncount, sizeof(lng), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+				goto cleanup;				\
+			populate_segment_tree(lng, ncount, INIT_AGGREGATE_COUNT, COMPUTE_LEVEL0_COUNT_FIXED, COMPUTE_LEVELN_COUNT, NOTHING_ARGS, TPE, NOTHING, NOTHING); \
+			for (; k < i; k++)				\
+				if (start[k] >= j)			\
+					compute_on_segment_tree(lng, start[k] - j, end[k] - j, INIT_AGGREGATE_COUNT, COMPUTE_LEVELN_COUNT, FINALIZE_AGGREGATE_COUNT, TPE, NOTHING, NOTHING); \
+			j = k;						\
+		}							\
+	} while (0)
+
+/* Counting no nils for other types */
+#define ANALYTICAL_COUNT_OTHERS_UNBOUNDED_TILL_CURRENT_ROW		\
+	do {								\
+		curval = 0;						\
+		if (count_all) {					\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					k++;				\
+				} while (k < i && !op[k]);		\
+				curval += k - j;			\
+				for (; j < k; j++)			\
+					rb[j] = curval;			\
+			}						\
+		} else {						\
+			while (k < i) {					\
+				j = k;					\
+				do {					\
+					curval += !atomeq(BUNtail(&bi, k), nil); \
+					k++;				\
+				} while (k < i && !op[k]);		\
+				for (; j < k; j++)			\
+					rb[j] = curval;			\
+			}						\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_COUNT_OTHERS_CURRENT_ROW_TILL_UNBOUNDED		\
+	do {								\
+		curval = 0;						\
+		l = i - 1;						\
+		if (count_all) {					\
+			for (j = l; ; j--) {				\
+				if (op[j] || j == k) {			\
+					curval += l - j + 1;		\
+					for (; ; l--) {			\
+						rb[l] = curval;		\
+						if (l == j)		\
+							break;		\
+					}				\
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		} else {						\
+			for (j = l; ; j--) {				\
+				curval += !atomeq(BUNtail(&bi, j), nil); \
+				if (op[j] || j == k) {			\
+					for (; ; l--) {			\
+						rb[l] = curval;		\
+						if (l == j)		\
+							break;		\
+					}				\
+					if (j == k)			\
+						break;			\
+					l = j - 1;			\
+				}					\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_COUNT_OTHERS_ALL_ROWS				\
+	do {								\
+		curval = 0;						\
+		if (count_all) {					\
+			curval = (lng)(i - k);				\
+		} else {						\
+			for (; j < i; j++)				\
+				curval += !atomeq(BUNtail(&bi, j), nil); \
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+	} while (0)
+
+#define ANALYTICAL_COUNT_OTHERS_CURRENT_ROW				\
+	do {								\
+		if (count_all) {					\
+			for (; k < i; k++)				\
+				rb[k] = 1;				\
+		} else {						\
+			for (; k < i; k++)				\
+				rb[k] = !atomeq(BUNtail(&bi, k), nil);	\
+		}							\
+	} while (0)
+
+#define COMPUTE_LEVEL0_COUNT_OTHERS(X, NOTHING1, NOTHING2, NOTHING3)	\
+	do {								\
+		computed = !atomeq(BUNtail(&bi, j + X), nil);		\
+	} while (0)
+#define ANALYTICAL_COUNT_OTHERS_OTHERS					\
+	do {								\
+		if (count_all) { /* no segment tree required for the global case (it scales in O(n)) */ \
+			for (; k < i; k++)				\
+				rb[k] = (end[k] > start[k]) ? (lng)(end[k] - start[k]) : 0; \
+		} else {						\
+			oid ncount = i - k;				\
+			if ((res = GDKrebuild_segment_tree(ncount, sizeof(lng), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+				goto cleanup;				\
+			populate_segment_tree(lng, ncount, INIT_AGGREGATE_COUNT, COMPUTE_LEVEL0_COUNT_OTHERS, COMPUTE_LEVELN_COUNT, NOTHING_ARGS, NOTHING, NOTHING, NOTHING); \
+			for (; k < i; k++)				\
+				if (start[k] >= j)			\
+					compute_on_segment_tree(lng, start[k] - j, end[k] - j, INIT_AGGREGATE_COUNT, COMPUTE_LEVELN_COUNT, FINALIZE_AGGREGATE_COUNT, NOTHING, NOTHING, NOTHING); \
+			j = k;						\
+		}							\
+	} while (0)
+
+/* Now do the count analytic function branches */
+#define ANALYTICAL_COUNT_FIXED_PARTITIONS(TPE, IMP)			\
+	do {								\
+		TPE *restrict bp = (TPE*) bheap;			\
+		if (p) {						\
+			while (i < cnt) {				\
+				if (np[i]) {				\
+count##TPE##IMP:							\
+					ANALYTICAL_COUNT_FIXED_##IMP(TPE); \
+				}					\
+				if (!last)				\
+					i++;				\
+			}						\
+		}							\
+		if (!last) {						\
+			last = true;					\
+			i = cnt;					\
+			goto count##TPE##IMP;				\
+		}							\
+	} while (0)
+
+#ifdef HAVE_HGE
+#define ANALYTICAL_COUNT_LIMIT(IMP)				\
+	case TYPE_hge:						\
+		ANALYTICAL_COUNT_FIXED_PARTITIONS(hge, IMP);	\
+	break;
+#else
+#define ANALYTICAL_COUNT_LIMIT(IMP)
+#endif
+
+#define ANALYTICAL_COUNT_BRANCHES(IMP)					\
+	do {								\
+		switch (ATOMbasetype(tpe)) {				\
+		case TYPE_bte:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(bte, IMP);	\
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(sht, IMP);	\
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(int, IMP);	\
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(lng, IMP);	\
+			break;						\
+			ANALYTICAL_COUNT_LIMIT(IMP)			\
+		case TYPE_flt:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(flt, IMP);	\
+			break;						\
+		case TYPE_dbl:						\
+			ANALYTICAL_COUNT_FIXED_PARTITIONS(dbl, IMP);	\
+			break;						\
+		default: {						\
+			if (p) {					\
+				while (i < cnt) {			\
+					if (np[i]) {			\
+countothers##IMP:							\
+						ANALYTICAL_COUNT_OTHERS_##IMP; \
+					}				\
+					if (!last)			\
+						i++;			\
+				}					\
+			}						\
+			if (!last) {					\
+				last = true;				\
+				i = cnt;				\
+				goto countothers##IMP;			\
+			}						\
+		}							\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticalcount(BAT *p, BAT *o, BAT *b, BAT *s, BAT *e, bit ignore_nils, int tpe, int frame_type)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BAT *r = COLnew(b->hseqbase, TYPE_lng, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter pi = bat_iterator(p);
+	BATiter oi = bat_iterator(o);
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	oid i = 1, j = 0, k = 0, l = 0, cnt = BATcount(b), *restrict start = si.base, *restrict end = ei.base,
+		*levels_offset = NULL, nlevels = 0;
+	lng curval = 0, *rb = (lng *) Tloc(r, 0);
+	bit *np = pi.base, *op = oi.base;
+	const void *restrict nil = ATOMnilptr(tpe);
+	bool (*atomeq) (const void *, const void *) = ATOMequal(tpe);
+	const void *restrict bheap = bi.base;
+	bool count_all = !ignore_nils || bi.nonil, last = false;
+	void *segment_tree = NULL;
+	gdk_return res = GDK_SUCCEED;
+	Heap *st = NULL;
+
+	assert(np == NULL || cnt == 0 || np[0] == 0);
+	if (cnt > 0) {
+		switch (frame_type) {
+		case 3: /* unbounded until current row */
+			ANALYTICAL_COUNT_BRANCHES(UNBOUNDED_TILL_CURRENT_ROW);
+			break;
+		case 4: /* current row until unbounded */
+			ANALYTICAL_COUNT_BRANCHES(CURRENT_ROW_TILL_UNBOUNDED);
+			break;
+		case 5: /* all rows */
+			ANALYTICAL_COUNT_BRANCHES(ALL_ROWS);
+			break;
+		case 6: /* current row */
+			ANALYTICAL_COUNT_BRANCHES(CURRENT_ROW);
+			break;
+		default:
+			if (!count_all && (st = GDKinitialize_segment_tree()) == NULL) {
+				res = GDK_FAIL;
+				goto cleanup;
+			}
+			ANALYTICAL_COUNT_BRANCHES(OTHERS);
+			break;
+		}
+	}
+
+	BATsetcount(r, cnt);
+	r->tnonil = true;
+	r->tnil = false;
+cleanup:
+	bat_iterator_end(&pi);
+	bat_iterator_end(&oi);
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	if (st)
+		HEAPdecref(st, true);
+	if (res != GDK_SUCCEED) {
+		BBPreclaim(r);
+		r = NULL;
+	} else {
+		TRC_DEBUG(ALGO, "p=" ALGOOPTBATFMT ",o=" ALGOOPTBATFMT
+			  ",b=" ALGOBATFMT ",s=" ALGOOPTBATFMT
+			  ",e=" ALGOOPTBATFMT ",tpe=%s,frame_type=%d -> "
+			  ALGOBATFMT " (" LLFMT " usec)\n",
+			  ALGOOPTBATPAR(p), ALGOOPTBATPAR(o),
+			  ALGOBATPAR(b), ALGOOPTBATPAR(s),
+			  ALGOOPTBATPAR(e), ATOMname(tpe),
+			  frame_type, ALGOBATPAR(r),
+			  GDKusec() - t0);
+	}
+	return r;
+}
+
+/* sum on fixed size integers */
+#define ANALYTICAL_SUM_IMP_NUM_UNBOUNDED_TILL_CURRENT_ROW(TPE1, TPE2)	\
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				if (!is_##TPE1##_nil(bp[k])) {		\
+					if (is_##TPE2##_nil(curval))	\
+						curval = (TPE2) bp[k];	\
+					else				\
+						ADD_WITH_CHECK(bp[k], curval, TPE2, curval, GDK_##TPE2##_max, goto calc_overflow); \
+				}					\
+				k++;					\
+			} while (k < i && !op[k]);			\
+			for (; j < k; j++)				\
+				rb[j] = curval;				\
+			has_nils |= is_##TPE2##_nil(curval);		\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_NUM_CURRENT_ROW_TILL_UNBOUNDED(TPE1, TPE2)	\
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			if (!is_##TPE1##_nil(bp[j])) {			\
+				if (is_##TPE2##_nil(curval))		\
+					curval = (TPE2) bp[j];		\
+				else					\
+					ADD_WITH_CHECK(bp[j], curval, TPE2, curval, GDK_##TPE2##_max, goto calc_overflow); \
+			}						\
+			if (op[j] || j == k) {				\
+				for (; ; l--) {				\
+					rb[l] = curval;			\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_##TPE2##_nil(curval);	\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_NUM_ALL_ROWS(TPE1, TPE2)			\
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		for (; j < i; j++) {					\
+			TPE1 v = bp[j];					\
+			if (!is_##TPE1##_nil(v)) {			\
+				if (is_##TPE2##_nil(curval))		\
+					curval = (TPE2) v;		\
+				else					\
+					ADDI_WITH_CHECK(v, curval, TPE2, curval, GDK_##TPE2##_max, goto calc_overflow); \
+			}						\
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+		has_nils |= is_##TPE2##_nil(curval);			\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_NUM_CURRENT_ROW(TPE1, TPE2)	\
+	do {						\
+		for (; k < i; k++) {			\
+			TPE1 v = bp[k];			\
+			if (is_##TPE1##_nil(v)) {	\
+				rb[k] = TPE2##_nil;	\
+				has_nils = true;	\
+			} else	{			\
+				rb[k] = (TPE2) v;	\
+			}				\
+		}					\
+	} while (0)
+
+#define INIT_AGGREGATE_SUM(NOTHING1, TPE2, NOTHING2)	\
+	do {						\
+		computed = TPE2##_nil;			\
+	} while (0)
+#define COMPUTE_LEVEL0_SUM(X, TPE1, TPE2, NOTHING)			\
+	do {								\
+		TPE1 v = bp[j + X];					\
+		computed = is_##TPE1##_nil(v) ? TPE2##_nil : (TPE2) v;	\
+	} while (0)
+#define COMPUTE_LEVELN_SUM_NUM(VAL, NOTHING1, TPE2, NOTHING2)		\
+	do {								\
+		if (!is_##TPE2##_nil(VAL)) {				\
+			if (is_##TPE2##_nil(computed))			\
+				computed = VAL;				\
+			else						\
+				ADD_WITH_CHECK(VAL, computed, TPE2, computed, GDK_##TPE2##_max, goto calc_overflow); \
+		}							\
+	} while (0)
+#define FINALIZE_AGGREGATE_SUM(NOTHING1, TPE2, NOTHING2)	\
+	do {							\
+		rb[k] = computed;				\
+		has_nils |= is_##TPE2##_nil(computed);		\
+	} while (0)
+#define ANALYTICAL_SUM_IMP_NUM_OTHERS(TPE1, TPE2)			\
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE2), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE2, ncount, INIT_AGGREGATE_SUM, COMPUTE_LEVEL0_SUM, COMPUTE_LEVELN_SUM_NUM, NOTHING_ARGS, TPE1, TPE2, NOTHING); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(TPE2, start[k] - j, end[k] - j, INIT_AGGREGATE_SUM, COMPUTE_LEVELN_SUM_NUM, FINALIZE_AGGREGATE_SUM, TPE1, TPE2, NOTHING); \
+		j = k;							\
+	} while (0)
+
+/* sum on floating-points */
+#if FLT_RADIX == 2 && DBL_MAX_EXP == 1024
+const double twopow = 8.98846567431158e+307; /* 2 ** 1023 */
+#endif
+
+static inline bool
+samesign(double x, double y)
+{
+	return (x >= 0) == (y >= 0);
+}
+
+/* Add two values, producing the sum and the remainder due to limited
+ * range of floating point arithmetic.  This function depends on the
+ * fact that the sum returns INFINITY in *hi of the correct sign
+ * (i.e. isinf() returns TRUE) in case of overflow. */
+static inline void
+twosum(volatile double *hi, volatile double *lo, double x, double y)
+{
+	volatile double yr;
+
+	assert(fabs(x) >= fabs(y));
+
+	*hi = x + y;
+	yr = *hi - x;
+	*lo = y - yr;
+}
+
+static inline void
+exchange(double *x, double *y)
+{
+	double t = *x;
+	*x = *y;
+	*y = t;
+}
+
+struct pergroup {
+	int npartials;
+	int maxpartials;
+	bool valseen;
+	double *partials;
+};
+
+static double
+crsum(struct pergroup *pg)
+{
+	double *partials = pg->partials + 1;
+	int npartials = pg->npartials - 1;
+
+	if (npartials == 0)
+		return 0.0;
+
+	double total_so_far = partials[--npartials];
+	double lo;
+	while (npartials > 0) {
+		twosum(&total_so_far, &lo, total_so_far, partials[--npartials]);
+		if (lo != 0) {
+			partials[npartials++] = lo;
+			break;
+		}
+	}
+	if (npartials >= 2 &&
+	    samesign(partials[npartials - 1], partials[npartials - 2]) &&
+	    (lo = total_so_far + 2*partials[npartials - 1]) - total_so_far == 2*partials[npartials - 1]) {
+		total_so_far = lo;
+		partials[npartials - 1] = -partials[npartials - 1];
+	}
+	pg->npartials = npartials + 1;
+	return total_so_far;
+}
+
+static void
+initsum(allocator *ma, struct pergroup *pg)
+{
+	*pg = (struct pergroup) {
+		.partials = ma_alloc(ma, sizeof(double) * 2),
+		.maxpartials = 2,
+		.npartials = 1,
+		.valseen = false,
+	};
+	pg->partials[0] = 0;
+}
+
+static bool
+itersum(allocator *ma, struct pergroup *pg, double x)
+{
+	if (pg->partials == NULL)
+		return false;
+	if (isnan(x))
+		return false;
+	if (isinf(x)) {
+		pg->partials[0] += x;
+		return true;
+	}
+	int i = 1;
+	pg->valseen = true;
+	for (int j = 1; j < pg->npartials; j++) {
+		double y = pg->partials[j];
+		if (fabs(x) < fabs(y))
+			exchange(&x, &y);
+		double hi, lo;
+		twosum(&hi, &lo, x, y);
+		if (isinf(hi)) {
+			int sign = hi > 0 ? 1 : -1;
+			hi = x - twopow*sign;
+			x = hi - twopow*sign;
+			pg->partials[0] += sign;
+			if (fabs(x) < fabs(y))
+				exchange(&x, &y);
+			twosum(&hi, &lo, x, y);
+		}
+		if (lo) {
+			pg->partials[i++] = lo;
+		}
+		x = hi;
+	}
+	if (x != 0) {
+		if (i == pg->maxpartials) {
+			size_t osz = pg->maxpartials * sizeof(double);
+			pg->maxpartials += 4;
+			pg->partials = ma_realloc(
+				ma,
+				pg->partials,
+				pg->maxpartials * sizeof(double),
+				osz);
+			if (pg->partials == NULL)
+				return false;
+		}
+		pg->partials[i++] = x;
+	}
+	pg->npartials = i;
+	return true;
+}
+
+static double
+finishsum(allocator *ma, struct pergroup *pg)
+{
+	if (isinf(pg->partials[0]))
+		return pg->partials[0];
+	if (isnan(pg->partials[0]))
+		return pg->partials[0]; /* infs of both signs in summands */
+	if (fabs(pg->partials[0]) == 1.0 &&
+	    pg->npartials > 1 &&
+	    !samesign(pg->partials[pg->npartials - 1], pg->partials[0])) {
+		double hi, lo;
+		twosum(&hi, &lo, pg->partials[0]*twopow,
+		       pg->partials[pg->npartials - 1]/2);
+		if (isinf(2 * hi)) {
+			/* overflow, except in edge case... */
+			double x = hi + 2*lo;
+			if (x - hi == 2 * lo &&
+			    pg->npartials > 2 &&
+			    samesign(lo, pg->partials[pg->npartials - 2]))
+				return 2 * (hi + 2 * lo);
+		} else {
+			pg->npartials--;
+			if (lo != 0) {
+				pg->partials[pg->npartials++] = 2 * lo;
+				if (pg->npartials == pg->maxpartials) {
+					size_t osz = pg->maxpartials * sizeof(double);
+					pg->maxpartials += 4;
+					pg->partials = ma_realloc(
+						ma,
+						pg->partials,
+						pg->maxpartials * sizeof(double),
+						osz);
+					if (pg->partials == NULL)
+						return NAN;
+				}
+			}
+			pg->partials[pg->npartials++] = 2 * hi;
+			pg->partials[0] = 0;
+		}
+	}
+	if (pg->partials[0] == 0) {
+		double s = crsum(pg);
+		pg->partials[pg->npartials++] = s;
+		return s;
+	}
+	return INFINITY;
+}
+
+/* TODO go through a version of dofsum which returns the current partials for all the cases */
+#define ANALYTICAL_SUM_IMP_FP_UNBOUNDED_TILL_CURRENT_ROW(TPE1, TPE2)	\
+	do {								\
+		allocator *ta = MT_thread_getallocator();		\
+		allocator_state ta_state = ma_open(ta);			\
+		struct pergroup pg;					\
+		initsum(ta, &pg);					\
+		double curval = TPE2##_nil;				\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				if (!is_##TPE1##_nil(bp[k])) {		\
+					itersum(ta, &pg, bp[k]);	\
+				}					\
+				k++;					\
+			} while (k < i && !op[k]);			\
+			if (pg.valseen) {				\
+				curval = finishsum(ta, &pg);		\
+				if (isinf(curval) ||			\
+				    isnan(curval) ||			\
+				    curval > GDK_##TPE2##_max ||	\
+				    curval < -GDK_##TPE2##_max)		\
+					goto calc_overflow;		\
+			}						\
+			for (; j < k; j++)				\
+				rb[j] = (TPE2) curval;			\
+			has_nils |= is_dbl_nil(curval);			\
+		}							\
+		ma_close(&ta_state);					\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_FP_CURRENT_ROW_TILL_UNBOUNDED(TPE1, TPE2)	\
+	do {								\
+		allocator *ta = MT_thread_getallocator();		\
+		allocator_state ta_state = ma_open(ta);			\
+		struct pergroup pg;					\
+		initsum(ta, &pg);					\
+		double curval = TPE2##_nil;				\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			if (!is_##TPE1##_nil(bp[j])) {			\
+				itersum(ta, &pg, bp[j]);		\
+			}						\
+			if (op[j] || j == k) {				\
+				if (pg.valseen) {			\
+					curval = finishsum(ta, &pg);	\
+					if (isinf(curval) ||		\
+					    isnan(curval) ||		\
+					    curval > GDK_##TPE2##_max || \
+					    curval < -GDK_##TPE2##_max)	\
+						goto calc_overflow;	\
+				}					\
+				for (; ; l--) {				\
+					rb[l] = (TPE2) curval;		\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_dbl_nil(curval);		\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+		ma_close(&ta_state);					\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_FP_ALL_ROWS(TPE1, TPE2)			\
+	do {								\
+		TPE1 *bs = bp + k;					\
+		BUN parcel = i - k;					\
+		TPE2 curval = TPE2##_nil;				\
+		if (dofsum(bs, 0,					\
+			   &(struct canditer) {				\
+				   .tpe = cand_dense,			\
+				   .ncand = parcel,			\
+			   },						\
+			   &curval, 1, TYPE_##TPE1,			\
+			   TYPE_##TPE2, NULL, 0, 0, true,		\
+			   true) == BUN_NONE) {				\
+			goto bailout;					\
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+		has_nils |= is_##TPE2##_nil(curval);			\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_FP_CURRENT_ROW(TPE1, TPE2)	\
+	do {						\
+		for (; k < i; k++) {			\
+			TPE1 v = bp[k];			\
+			if (is_##TPE1##_nil(v)) {	\
+				rb[k] = TPE2##_nil;	\
+				has_nils = true;	\
+			} else	{			\
+				rb[k] = (TPE2) v;	\
+			}				\
+		}					\
+	} while (0)
+
+#define INIT_AGGR_FP_SUM(TPE1, TPE2, NOTHING2)	\
+	do {					\
+		ta_state = ma_open(ta);		\
+		computed = TPE2##_nil;		\
+		initsum(ta, &pg);		\
+	} while (0)
+#define COMPUTE_LEVELN_FP_SUM(VAL, TPE1, TPE2, NOTHING2)	\
+	do {							\
+		if (!is_##TPE2##_nil(VAL))			\
+			itersum(ta, &pg, VAL);			\
+	} while (0)
+#define COMPUTE_LEVELN_FP_SUM_FINISH(TPE1, TPE2, NOTHING2)	\
+	do {							\
+		if (pg.valseen) {				\
+			double curval = finishsum(ta, &pg);	\
+			computed = (TPE2) curval;		\
+		}						\
+		ma_close(&ta_state);				\
+	} while (0)
+#define FINALIZE_AGGR_FP_SUM(TPE1, TPE2, NOTHING2)		\
+	do {							\
+		if (pg.valseen) {				\
+			double curval = finishsum(ta, &pg);	\
+			if (isinf(curval) ||			\
+			    isnan(curval) ||			\
+			    curval > GDK_##TPE2##_max ||	\
+			    curval < -GDK_##TPE2##_max)		\
+				goto calc_overflow;		\
+			computed = (TPE2) curval;		\
+		}						\
+		rb[k] = computed;				\
+		has_nils |= is_##TPE2##_nil(computed);		\
+		ma_close(&ta_state);				\
+	} while (0)
+
+#define ANALYTICAL_SUM_IMP_FP_OTHERS(TPE1, TPE2)			\
+	do {								\
+		allocator *ta = MT_thread_getallocator();		\
+		allocator_state ta_state;				\
+		struct pergroup pg;					\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE2), \
+						   st, &segment_tree,	\
+						   &levels_offset,	\
+						   &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE2, ncount, INIT_AGGR_FP_SUM,	\
+				      COMPUTE_LEVEL0_SUM,		\
+				      COMPUTE_LEVELN_FP_SUM,		\
+				      COMPUTE_LEVELN_FP_SUM_FINISH,	\
+				      TPE1, TPE2,			\
+				      NOTHING);				\
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(		\
+					TPE2, start[k] - j, end[k] - j, \
+					INIT_AGGR_FP_SUM,		\
+					COMPUTE_LEVELN_FP_SUM,		\
+					FINALIZE_AGGR_FP_SUM,		\
+					TPE1, TPE2, NOTHING);		\
+		j = k;							\
+	} while (0)
+
+#define ANALYTICAL_SUM_CALC(TPE1, TPE2, IMP)			\
+	do {							\
+		TPE1 *restrict bp = (TPE1*)bi.base;		\
+		TPE2 *rb = (TPE2*)Tloc(r, 0);			\
+		if (p) {					\
+			while (i < cnt) {			\
+				if (np[i]) {			\
+sum##TPE1##TPE2##IMP:						\
+					IMP(TPE1, TPE2);	\
+				}				\
+				if (!last)			\
+					i++;			\
+			}					\
+		}						\
+		if (!last) {					\
+			last = true;				\
+			i = cnt;				\
+			goto sum##TPE1##TPE2##IMP;		\
+		}						\
+	} while (0)
+
+#ifdef HAVE_HGE
+#define ANALYTICAL_SUM_LIMIT(IMP)					\
+	case TYPE_hge:{							\
+		switch (tp1) {						\
+		case TYPE_bte:						\
+			ANALYTICAL_SUM_CALC(bte, hge, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_SUM_CALC(sht, hge, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_SUM_CALC(int, hge, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_SUM_CALC(lng, hge, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+			break;						\
+		case TYPE_hge:						\
+			ANALYTICAL_SUM_CALC(hge, hge, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+			break;						\
+		default:						\
+			goto nosupport;					\
+		}							\
+		break;							\
+	}
+#else
+#define ANALYTICAL_SUM_LIMIT(IMP)
+#endif
+
+#define ANALYTICAL_SUM_BRANCHES(IMP)					\
+	do {								\
+		switch (tp2) {						\
+		case TYPE_bte:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_SUM_CALC(bte, bte, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_sht:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_SUM_CALC(bte, sht, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_sht:					\
+				ANALYTICAL_SUM_CALC(sht, sht, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_int:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_SUM_CALC(bte, int, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_sht:					\
+				ANALYTICAL_SUM_CALC(sht, int, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_int:					\
+				ANALYTICAL_SUM_CALC(int, int, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_lng:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_SUM_CALC(bte, lng, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_sht:					\
+				ANALYTICAL_SUM_CALC(sht, lng, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_int:					\
+				ANALYTICAL_SUM_CALC(int, lng, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			case TYPE_lng:					\
+				ANALYTICAL_SUM_CALC(lng, lng, ANALYTICAL_SUM_IMP_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		ANALYTICAL_SUM_LIMIT(IMP)				\
+		case TYPE_flt:{						\
+			switch (tp1) {					\
+			case TYPE_flt:					\
+				ANALYTICAL_SUM_CALC(flt, flt, ANALYTICAL_SUM_IMP_FP_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_dbl:{						\
+			switch (tp1) {					\
+			case TYPE_flt:					\
+				ANALYTICAL_SUM_CALC(flt, dbl, ANALYTICAL_SUM_IMP_FP_##IMP); \
+				break;					\
+			case TYPE_dbl:					\
+				ANALYTICAL_SUM_CALC(dbl, dbl, ANALYTICAL_SUM_IMP_FP_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		default:						\
+			goto nosupport;					\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticalsum(BAT *p, BAT *o, BAT *b, BAT *s, BAT *e, int tp1, int tp2, int frame_type)
+{
+	BAT *r = COLnew(b->hseqbase, tp2, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter pi = bat_iterator(p);
+	BATiter oi = bat_iterator(o);
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	bool has_nils = false, last = false;
+	oid i = 1, j = 0, k = 0, l = 0, cnt = BATcount(b), *restrict start = si.base, *restrict end = ei.base,
+		*levels_offset = NULL, nlevels = 0;
+	bit *np = pi.base, *op = oi.base;
+	void *segment_tree = NULL;
+	gdk_return res = GDK_SUCCEED;
+	Heap *st = NULL;
+	lng t0 = 0;
+
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	assert(np == NULL || cnt == 0 || np[0] == 0);
+	if (cnt > 0) {
+		switch (frame_type) {
+		case 3: /* unbounded until current row */
+			ANALYTICAL_SUM_BRANCHES(UNBOUNDED_TILL_CURRENT_ROW);
+			break;
+		case 4: /* current row until unbounded */
+			ANALYTICAL_SUM_BRANCHES(CURRENT_ROW_TILL_UNBOUNDED);
+			break;
+		case 5: /* all rows */
+			ANALYTICAL_SUM_BRANCHES(ALL_ROWS);
+			break;
+		case 6: /* current row */
+			ANALYTICAL_SUM_BRANCHES(CURRENT_ROW);
+			break;
+		default:
+			if ((st = GDKinitialize_segment_tree()) == NULL) {
+				res = GDK_FAIL;
+				goto cleanup;
+			}
+			ANALYTICAL_SUM_BRANCHES(OTHERS);
+			break;
+		}
+	}
+
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+cleanup:
+	bat_iterator_end(&pi);
+	bat_iterator_end(&oi);
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	if (st)
+		HEAPdecref(st, true);
+	if (res != GDK_SUCCEED) {
+		BBPreclaim(r);
+		r = NULL;
+	} else {
+		TRC_DEBUG(ALGO, "p=" ALGOOPTBATFMT ",o=" ALGOOPTBATFMT
+			  ",b=" ALGOBATFMT ",s=" ALGOOPTBATFMT
+			  ",e=" ALGOOPTBATFMT ",tp1=%s,tp2=%s,frame_type=%d -> "
+			  ALGOBATFMT " (" LLFMT " usec)\n",
+			  ALGOOPTBATPAR(p), ALGOOPTBATPAR(o),
+			  ALGOBATPAR(b), ALGOOPTBATPAR(s),
+			  ALGOOPTBATPAR(e), ATOMname(tp1),
+			  ATOMname(tp2), frame_type, ALGOBATPAR(r),
+			  GDKusec() - t0);
+	}
+	return r;
+
+nosupport:
+	GDKerror("42000!type combination (sum(%s)->%s) not supported.\n", ATOMname(tp1), ATOMname(tp2));
+	res = GDK_FAIL;
+	goto cleanup;
+bailout:
+	GDKerror("42000!error while calculating floating-point sum\n");
+	res = GDK_FAIL;
+	goto cleanup;
+calc_overflow:
+	GDKerror("22003!overflow in calculation.\n");
+	res = GDK_FAIL;
+	goto cleanup;
+}
+
+/* product on integers */
+#define PROD_NUM(TPE1, TPE2, TPE3, ARG)					\
+	do {								\
+		if (!is_##TPE1##_nil(ARG)) {				\
+			if (is_##TPE2##_nil(curval))			\
+				curval = (TPE2) ARG;			\
+			else						\
+				MULI4_WITH_CHECK(ARG, curval, TPE2, curval, GDK_##TPE2##_max, TPE3, goto calc_overflow); \
+		}							\
+	} while(0)
+
+#define ANALYTICAL_PROD_CALC_NUM_UNBOUNDED_TILL_CURRENT_ROW(TPE1, TPE2, TPE3) \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				PROD_NUM(TPE1, TPE2, TPE3, bp[k]);	\
+				k++;					\
+			} while (k < i && !op[k]);			\
+			for (; j < k; j++)				\
+				rb[j] = curval;				\
+			has_nils |= is_##TPE2##_nil(curval);		\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_CURRENT_ROW_TILL_UNBOUNDED(TPE1, TPE2, TPE3) \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			PROD_NUM(TPE1, TPE2, TPE3, bp[j]);		\
+			if (op[j] || j == k) {				\
+				for (; ; l--) {				\
+					rb[l] = curval;			\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_##TPE2##_nil(curval);	\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_ALL_ROWS(TPE1, TPE2, TPE3)	\
+	do {							\
+		TPE2 curval = TPE2##_nil;			\
+		for (; j < i; j++) {				\
+			TPE1 v = bp[j];				\
+			PROD_NUM(TPE1, TPE2, TPE3, v);		\
+		}						\
+		for (; k < i; k++)				\
+			rb[k] = curval;				\
+		has_nils |= is_##TPE2##_nil(curval);		\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_CURRENT_ROW(TPE1, TPE2, TPE3)	\
+	do {							\
+		for (; k < i; k++) {				\
+			TPE1 v = bp[k];				\
+			if (is_##TPE1##_nil(v)) {		\
+				rb[k] = TPE2##_nil;		\
+				has_nils = true;		\
+			} else	{				\
+				rb[k] = (TPE2) v;		\
+			}					\
+		}						\
+	} while (0)
+
+#define INIT_AGGREGATE_PROD(NOTHING1, TPE2, NOTHING2)	\
+	do {						\
+		computed = TPE2##_nil;			\
+	} while (0)
+#define COMPUTE_LEVEL0_PROD(X, TPE1, TPE2, NOTHING)			\
+	do {								\
+		TPE1 v = bp[j + X];					\
+		computed = is_##TPE1##_nil(v) ? TPE2##_nil : (TPE2) v;	\
+	} while (0)
+#define COMPUTE_LEVELN_PROD_NUM(VAL, NOTHING, TPE2, TPE3)		\
+	do {								\
+		if (!is_##TPE2##_nil(VAL)) {				\
+			if (is_##TPE2##_nil(computed))			\
+				computed = VAL;				\
+			else						\
+				MULI4_WITH_CHECK(VAL, computed, TPE2, computed, GDK_##TPE2##_max, TPE3, goto calc_overflow); \
+		}							\
+	} while (0)
+#define FINALIZE_AGGREGATE_PROD(NOTHING1, TPE2, NOTHING2)	\
+	do {							\
+		rb[k] = computed;				\
+		has_nils |= is_##TPE2##_nil(computed);		\
+	} while (0)
+#define ANALYTICAL_PROD_CALC_NUM_OTHERS(TPE1, TPE2, TPE3)		\
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE2), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE2, ncount, INIT_AGGREGATE_PROD, COMPUTE_LEVEL0_PROD, COMPUTE_LEVELN_PROD_NUM, NOTHING_ARGS, TPE1, TPE2, TPE3); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(TPE2, start[k] - j, end[k] - j, INIT_AGGREGATE_PROD, COMPUTE_LEVELN_PROD_NUM, FINALIZE_AGGREGATE_PROD, TPE1, TPE2, TPE3); \
+		j = k;							\
+	} while (0)
+
+/* product on integers while checking for overflows on the output  */
+#define PROD_NUM_LIMIT(TPE1, TPE2, REAL_IMP, ARG)			\
+	do {								\
+		if (!is_##TPE1##_nil(ARG)) {				\
+			if (is_##TPE2##_nil(curval))			\
+				curval = (TPE2) ARG;			\
+			else						\
+				REAL_IMP(ARG, curval, curval, GDK_##TPE2##_max, goto calc_overflow); \
+		}							\
+	} while(0)
+
+#define ANALYTICAL_PROD_CALC_NUM_LIMIT_UNBOUNDED_TILL_CURRENT_ROW(TPE1, TPE2, REAL_IMP) \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				PROD_NUM_LIMIT(TPE1, TPE2, REAL_IMP, bp[k]); \
+				k++;					\
+			} while (k < i && !op[k]);			\
+			for (; j < k; j++)				\
+				rb[j] = curval;				\
+			has_nils |= is_##TPE2##_nil(curval);		\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_LIMIT_CURRENT_ROW_TILL_UNBOUNDED(TPE1, TPE2, REAL_IMP) \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			PROD_NUM_LIMIT(TPE1, TPE2, REAL_IMP, bp[j]);	\
+			if (op[j] || j == k) {				\
+				for (; ; l--) {				\
+					rb[l] = curval;			\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_##TPE2##_nil(curval);	\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_LIMIT_ALL_ROWS(TPE1, TPE2, REAL_IMP)	\
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		for (; j < i; j++) {					\
+			TPE1 v = bp[j];					\
+			PROD_NUM_LIMIT(TPE1, TPE2, REAL_IMP, v);	\
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+		has_nils |= is_##TPE2##_nil(curval);			\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_LIMIT_CURRENT_ROW(TPE1, TPE2, REAL_IMP) \
+	do {								\
+		for (; k < i; k++) {					\
+			TPE1 v = bp[k];					\
+			if (is_##TPE1##_nil(v)) {			\
+				rb[k] = TPE2##_nil;			\
+				has_nils = true;			\
+			} else	{					\
+				rb[k] = (TPE2) v;			\
+			}						\
+		}							\
+	} while (0)
+
+#define COMPUTE_LEVELN_PROD_NUM_LIMIT(VAL, NOTHING, TPE2, REAL_IMP)	\
+	do {								\
+		if (!is_##TPE2##_nil(VAL)) {				\
+			if (is_##TPE2##_nil(computed))			\
+				computed = VAL;				\
+			else						\
+				REAL_IMP(VAL, computed, computed, GDK_##TPE2##_max, goto calc_overflow); \
+		}							\
+	} while (0)
+#define ANALYTICAL_PROD_CALC_NUM_LIMIT_OTHERS(TPE1, TPE2, REAL_IMP)	\
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE2), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE2, ncount, INIT_AGGREGATE_PROD, COMPUTE_LEVEL0_PROD, COMPUTE_LEVELN_PROD_NUM_LIMIT, NOTHING_ARGS, TPE1, TPE2, REAL_IMP); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(TPE2, start[k] - j, end[k] - j, INIT_AGGREGATE_PROD, COMPUTE_LEVELN_PROD_NUM_LIMIT, FINALIZE_AGGREGATE_PROD, TPE1, TPE2, REAL_IMP); \
+		j = k;							\
+	} while (0)
+
+/* product on floating-points */
+#define PROD_FP(TPE1, TPE2, ARG)					\
+	do {								\
+		if (!is_##TPE1##_nil(ARG)) {				\
+			if (is_##TPE2##_nil(curval)) {			\
+				curval = (TPE2) ARG;			\
+			} else if (ABSOLUTE(curval) > 1 && GDK_##TPE2##_max / ABSOLUTE(ARG) < ABSOLUTE(curval)) { \
+				goto calc_overflow;			\
+			} else {					\
+				curval *= ARG;				\
+			}						\
+		}							\
+	} while(0)
+
+#define ANALYTICAL_PROD_CALC_FP_UNBOUNDED_TILL_CURRENT_ROW(TPE1, TPE2, ARG3)	/* ARG3 is ignored here */ \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		while (k < i) {						\
+			j = k;						\
+			do {						\
+				PROD_FP(TPE1, TPE2, bp[k]);		\
+				k++;					\
+			} while (k < i && !op[k]);			\
+			for (; j < k; j++)				\
+				rb[j] = curval;				\
+			has_nils |= is_##TPE2##_nil(curval);		\
+		}							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_FP_CURRENT_ROW_TILL_UNBOUNDED(TPE1, TPE2, ARG3)	/* ARG3 is ignored here */ \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		l = i - 1;						\
+		for (j = l; ; j--) {					\
+			PROD_FP(TPE1, TPE2, bp[j]);			\
+			if (op[j] || j == k) {				\
+				for (; ; l--) {				\
+					rb[l] = curval;			\
+					if (l == j)			\
+						break;			\
+				}					\
+				has_nils |= is_##TPE2##_nil(curval);	\
+				if (j == k)				\
+					break;				\
+				l = j - 1;				\
+			}						\
+		}							\
+		k = i;							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_FP_ALL_ROWS(TPE1, TPE2, ARG3)	/* ARG3 is ignored here */ \
+	do {								\
+		TPE2 curval = TPE2##_nil;				\
+		for (; j < i; j++) {					\
+			TPE1 v = bp[j];					\
+			PROD_FP(TPE1, TPE2, v);				\
+		}							\
+		for (; k < i; k++)					\
+			rb[k] = curval;					\
+		has_nils |= is_##TPE2##_nil(curval);			\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_FP_CURRENT_ROW(TPE1, TPE2, ARG3)	/* ARG3 is ignored here */ \
+	do {								\
+		for (; k < i; k++) {					\
+			TPE1 v = bp[k];					\
+			if (is_##TPE1##_nil(v)) {			\
+				rb[k] = TPE2##_nil;			\
+				has_nils = true;			\
+			} else	{					\
+				rb[k] = (TPE2) v;			\
+			}						\
+		}							\
+	} while (0)
+
+#define COMPUTE_LEVELN_PROD_FP(VAL, NOTHING1, TPE2, NOTHING2)		\
+	do {								\
+		if (!is_##TPE2##_nil(VAL)) {				\
+			if (is_##TPE2##_nil(computed)) {		\
+				computed = VAL;				\
+			} else if (ABSOLUTE(computed) > 1 && GDK_##TPE2##_max / ABSOLUTE(VAL) < ABSOLUTE(computed)) { \
+				goto calc_overflow;			\
+			} else {					\
+				computed *= VAL;			\
+			}						\
+		}							\
+	} while (0)
+#define ANALYTICAL_PROD_CALC_FP_OTHERS(TPE1, TPE2, ARG3) /* ARG3 is ignored here */ \
+	do {								\
+		oid ncount = i - k;					\
+		if ((res = GDKrebuild_segment_tree(ncount, sizeof(TPE2), st, &segment_tree, &levels_offset, &nlevels)) != GDK_SUCCEED) \
+			goto cleanup;					\
+		populate_segment_tree(TPE2, ncount, INIT_AGGREGATE_PROD, COMPUTE_LEVEL0_PROD, COMPUTE_LEVELN_PROD_FP, NOTHING_ARGS, TPE1, TPE2, ARG3); \
+		for (; k < i; k++)					\
+			if (start[k] >= j)				\
+				compute_on_segment_tree(TPE2, start[k] - j, end[k] - j, INIT_AGGREGATE_PROD, COMPUTE_LEVELN_PROD_FP, FINALIZE_AGGREGATE_PROD, TPE1, TPE2, ARG3); \
+		j = k;							\
+	} while (0)
+
+#define ANALYTICAL_PROD_CALC_NUM_PARTITIONS(TPE1, TPE2, TPE3_OR_REAL_IMP, IMP) \
+	do {								\
+		TPE1 *restrict bp = (TPE1*)bi.base;			\
+		TPE2 *rb = (TPE2*)Tloc(r, 0);				\
+		if (p) {						\
+			while (i < cnt) {				\
+				if (np[i]) {				\
+prod##TPE1##TPE2##IMP:							\
+					IMP(TPE1, TPE2, TPE3_OR_REAL_IMP); \
+				}					\
+				if (!last)				\
+					i++;				\
+			}						\
+		}							\
+		if (!last) {						\
+			last = true;					\
+			i = cnt;					\
+			goto prod##TPE1##TPE2##IMP;			\
+		}							\
+	} while (0)
+
+#ifdef HAVE_HGE
+#define ANALYTICAL_PROD_LIMIT(IMP)					\
+	case TYPE_lng:{							\
+		switch (tp1) {						\
+		case TYPE_bte:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, lng, hge, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(sht, lng, hge, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(int, lng, hge, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(lng, lng, hge, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+			break;						\
+		default:						\
+			goto nosupport;					\
+		}							\
+		break;							\
+	}								\
+	case TYPE_hge:{							\
+		switch (tp1) {						\
+		case TYPE_bte:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, hge, HGEMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(sht, hge, HGEMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(int, hge, HGEMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(lng, hge, HGEMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_hge:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(hge, hge, HGEMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		default:						\
+			goto nosupport;					\
+		}							\
+		break;							\
+	}
+#else
+#define ANALYTICAL_PROD_LIMIT(IMP)					\
+	case TYPE_lng:{							\
+		switch (tp1) {						\
+		case TYPE_bte:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, lng, LNGMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_sht:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(sht, lng, LNGMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_int:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(int, lng, LNGMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		case TYPE_lng:						\
+			ANALYTICAL_PROD_CALC_NUM_PARTITIONS(lng, lng, LNGMUL_CHECK, ANALYTICAL_PROD_CALC_NUM_LIMIT_##IMP); \
+			break;						\
+		default:						\
+			goto nosupport;					\
+		}							\
+		break;							\
+	}
+#endif
+
+#define ANALYTICAL_PROD_BRANCHES(IMP)					\
+	do {								\
+		switch (tp2) {						\
+		case TYPE_bte:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, bte, sht, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_sht:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, sht, int, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			case TYPE_sht:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(sht, sht, int, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_int:{						\
+			switch (tp1) {					\
+			case TYPE_bte:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(bte, int, lng, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			case TYPE_sht:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(sht, int, lng, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			case TYPE_int:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(int, int, lng, ANALYTICAL_PROD_CALC_NUM_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		ANALYTICAL_PROD_LIMIT(IMP)				\
+		case TYPE_flt:{						\
+			switch (tp1) {					\
+			case TYPE_flt:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(flt, flt, ;, ANALYTICAL_PROD_CALC_FP_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		case TYPE_dbl:{						\
+			switch (tp1) {					\
+			case TYPE_flt:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(flt, dbl, ;, ANALYTICAL_PROD_CALC_FP_##IMP); \
+				break;					\
+			case TYPE_dbl:					\
+				ANALYTICAL_PROD_CALC_NUM_PARTITIONS(dbl, dbl, ;, ANALYTICAL_PROD_CALC_FP_##IMP); \
+				break;					\
+			default:					\
+				goto nosupport;				\
+			}						\
+			break;						\
+		}							\
+		default:						\
+			goto nosupport;					\
+		}							\
+	} while (0)
+
+BAT *
+GDKanalyticalprod(BAT *p, BAT *o, BAT *b, BAT *s, BAT *e, int tp1, int tp2, int frame_type)
+{
+	lng t0 = 0;
+	TRC_DEBUG_IF(ALGO) t0 = GDKusec();
+	BAT *r = COLnew(b->hseqbase, tp2, BATcount(b), TRANSIENT);
+	if (r == NULL)
+		return NULL;
+	BATiter pi = bat_iterator(p);
+	BATiter oi = bat_iterator(o);
+	BATiter bi = bat_iterator(b);
+	BATiter si = bat_iterator(s);
+	BATiter ei = bat_iterator(e);
+	bool has_nils = false, last = false;
+	oid i = 1, j = 0, k = 0, l = 0, cnt = BATcount(b), *restrict start = si.base, *restrict end = ei.base,
+		*levels_offset = NULL, nlevels = 0;
+	bit *np = pi.base, *op = oi.base;
+	void *segment_tree = NULL;
+	gdk_return res = GDK_SUCCEED;
+	Heap *st = NULL;
+	assert(np == NULL || cnt == 0 || np[0] == 0);
+	if (cnt > 0) {
+		switch (frame_type) {
+		case 3: /* unbounded until current row */
+			ANALYTICAL_PROD_BRANCHES(UNBOUNDED_TILL_CURRENT_ROW);
+			break;
+		case 4: /* current row until unbounded */
+			ANALYTICAL_PROD_BRANCHES(CURRENT_ROW_TILL_UNBOUNDED);
+			break;
+		case 5: /* all rows */
+			ANALYTICAL_PROD_BRANCHES(ALL_ROWS);
+			break;
+		case 6: /* current row */
+			ANALYTICAL_PROD_BRANCHES(CURRENT_ROW);
+			break;
+		default:
+			if ((st = GDKinitialize_segment_tree()) == NULL) {
+				res = GDK_FAIL;
+				goto cleanup;
+			}
+			ANALYTICAL_PROD_BRANCHES(OTHERS);
+			break;
+		}
+	}
+
+	BATsetcount(r, cnt);
+	r->tnonil = !has_nils;
+	r->tnil = has_nils;
+cleanup:
+	bat_iterator_end(&pi);
+	bat_iterator_end(&oi);
+	bat_iterator_end(&bi);
+	bat_iterator_end(&si);
+	bat_iterator_end(&ei);
+	if (st)
+		HEAPdecref(st, true);
+	if (res != GDK_SUCCEED) {
+		BBPreclaim(r);
+		r = NULL;
+	} else {
+		TRC_DEBUG(ALGO, "p=" ALGOOPTBATFMT ",o=" ALGOOPTBATFMT
+			  ",b=" ALGOBATFMT ",s=" ALGOOPTBATFMT
+			  ",e=" ALGOOPTBATFMT ",tp1=%s,tp2=%s,frame_type=%d -> "
+			  ALGOBATFMT " (" LLFMT " usec)\n",
+			  ALGOOPTBATPAR(p), ALGOOPTBATPAR(o),
+			  ALGOBATPAR(b), ALGOOPTBATPAR(s),
+			  ALGOOPTBATPAR(e), ATOMname(tp1),
+			  ATOMname(tp2), frame_type, ALGOBATPAR(r),
+			  GDKusec() - t0);
+	}
+	return r;
+
+	/* various error conditions */
+nosupport:
+	GDKerror("42000!type combination (prod(%s)->%s) not supported.\n",
+		 ATOMname(tp1), ATOMname(tp2));
+	res = GDK_FAIL;
+	goto cleanup;
+calc_overflow:
+	GDKerror("22003!overflow in calculation.\n");
+	res = GDK_FAIL;
+	goto cleanup;
+}

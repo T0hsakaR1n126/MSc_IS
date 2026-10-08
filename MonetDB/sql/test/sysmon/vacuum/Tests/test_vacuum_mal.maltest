@@ -1,0 +1,36 @@
+statement ok
+b:= bat.new(:str);
+bat.append(b, "hello");
+bat.append(b, "world");
+k:= 1@0;
+bat_size_small:= bat.getVHeapSize(b);
+i := 0;
+barrier j:=i<100;
+    u:= uuid.new();
+    s:str:= uuid.str(u);
+    bat.replace(b, k, s);
+    i:=i+1;
+    redo j:= i<100;
+exit j;
+bat_size_next:= bat.getVHeapSize(b);
+x_1:= calc.cmp(bat_size_next, bat_size_small);
+
+query T rowsort
+io.print(x_1)
+----
+1
+
+statement ok
+bn:= bat.vacuum(b)
+
+statement ok
+bat_size_vacuumed:= bat.getVHeapSize(bn)
+
+statement ok
+x_1:= calc.cmp(bat_size_next, bat_size_vacuumed)
+
+query T rowsort
+io.print(x_1)
+----
+1
+

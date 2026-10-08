@@ -1,0 +1,297 @@
+statement ok
+SET TIME ZONE INTERVAL '02:00' HOUR TO MINUTE
+
+query T rowsort
+select cast(123 as varchar(10))
+----
+123
+
+query D rowsort
+select convert(123, decimal(10,3))
+----
+123.000
+
+# numeric
+query I rowsort
+select cast(true as smallint)
+----
+1
+
+query I rowsort
+select cast(42 as int)
+----
+42
+
+query R rowsort
+select cast(123.45 as real)
+----
+123.450
+
+query R rowsort
+select cast('123.45' as double precision)
+----
+123.450
+
+query D rowsort
+select cast(23.45 as decimal(5,2))
+----
+23.45
+
+# date, time and timestamp
+query T rowsort
+select cast('2020-07-29' as date)
+----
+2020-07-29
+
+query T rowsort
+select cast('17:44:59' as time)
+----
+17:44:59
+
+query T rowsort
+select cast('17:44:59.123456' as time)
+----
+17:44:59
+
+query T rowsort
+select cast('2020-07-29 17:44:59' as timestamp)
+----
+2020-07-29 17:44:59
+
+query T rowsort
+select cast('2020-07-29T17:44:59' as timestamp)
+----
+2020-07-29 17:44:59
+
+query T rowsort
+select cast('2020-07-29 17:44:59.123456' as timestamp)
+----
+2020-07-29 17:44:59.123456
+
+query T rowsort
+select cast('17:44:59.321+01:30' as timetz)
+----
+18:14:59.321000+02:00
+
+query T rowsort
+select cast('2020-07-29 17:44:59.321+01:30' as timestamptz)
+----
+2020-07-29 18:14:59.321000+02:00
+
+# intervals
+query T rowsort
+select cast('67' as interval month)
+----
+67
+
+query T rowsort
+select cast('120' as interval day)
+----
+120
+
+query T rowsort
+select cast('86400.123' as interval second)
+----
+1 day, 0:00:00.123000
+
+query T rowsort
+select cast('18:40:05' as interval hour to second)
+----
+18:40:05
+
+query T rowsort
+select cast('2 18:40:05.123' as interval day to second(3))
+----
+2 days, 18:40:05.123000
+
+query T rowsort
+select cast('2-5' as interval year to month)
+----
+29
+
+# blob, clob, inet, json, url, uuid
+query T rowsort
+select cast('abcd' as blob)
+----
+ABCD
+
+query T rowsort
+select cast('abcde' as clob)
+----
+abcde
+
+query T rowsort
+select cast('192.168.1.5/24' as inet)
+----
+192.168.1.5/24
+
+query T rowsort
+select cast(r'{"a":[1,2,4]}' as json)
+----
+{"a":[1,2,4]}
+
+query T rowsort
+select cast('https://www.monetdb.org/Home' as url)
+----
+https://www.monetdb.org/Home
+
+query T rowsort
+select cast('e31960fb-dc8b-452d-ab30-b342723e756a' as uuid)
+----
+e31960fb-dc8b-452d-ab30-b342723e756a
+
+# convert()
+query T rowsort
+select convert('a4cd' , blob)
+----
+A4CD
+
+query T rowsort
+select convert('abcde' , clob)
+----
+abcde
+
+query T rowsort
+select convert('192.168.1.5/24' , inet)
+----
+192.168.1.5/24
+
+query T rowsort
+select convert(r'{"a":[1,2,4]}' , json)
+----
+{"a":[1,2,4]}
+
+query T rowsort
+select convert('https://www.monetdb.org/Home' , url)
+----
+https://www.monetdb.org/Home
+
+query T rowsort
+select convert('e31960fb-dc8b-452d-ab30-b342723e756a' , uuid)
+----
+e31960fb-dc8b-452d-ab30-b342723e756a
+
+# prefix type casting
+query T rowsort
+select E'EA\fB\tC\n\\Z'
+----
+EA@B@C@\Z
+
+query T rowsort
+select e'eA\fB\tC\n\\Z'
+----
+eA@B@C@\Z
+
+query T rowsort
+select R'RA\fB\tC\n\\Z'
+----
+RA\fB\tC\n\\Z
+
+query T rowsort
+select r'rA\fB\tC\n\\Z'
+----
+rA\fB\tC\n\\Z
+
+query T rowsort
+select x'abcd'
+----
+ABCD
+
+query T rowsort
+select blob 'abcd'
+----
+ABCD
+
+statement error
+select clob 'abcde'
+
+query T rowsort
+select cast('abcde' as clob)
+----
+abcde
+
+query T rowsort
+select date '2020-09-28'
+----
+2020-09-28
+
+query T rowsort
+select time '18:40:05'
+----
+18:40:05
+
+query T rowsort
+select time(6) '18:40:05.123456'
+----
+18:40:05.123456
+
+query T rowsort
+select time(3) with time zone '18:40:05.123+02:00'
+----
+18:40:05.123000+02:00
+
+query T rowsort
+select timestamp '2020-09-28 18:40:05'
+----
+2020-09-28 18:40:05
+
+query T rowsort
+select timestamp(6) '2020-09-28 18:40:05.123456'
+----
+2020-09-28 18:40:05.123456
+
+query T rowsort
+select timestamp(3) with time zone '2020-09-28 18:40:05.123+02:00'
+----
+2020-09-28 18:40:05.123000+02:00
+
+query T rowsort
+select interval '67205' second
+----
+18:40:05
+
+query T rowsort
+select interval '30' day
+----
+30
+
+query T rowsort
+select interval '6' month
+----
+6
+
+query T rowsort
+select interval '18:40:05' hour to second
+----
+18:40:05
+
+query T rowsort
+select interval '2 18:40:05.123' day to second(3)
+----
+2 days, 18:40:05.123000
+
+query T rowsort
+select interval '2-5' year to month
+----
+29
+
+query T rowsort
+select inet '192.168.1.5/24'
+----
+192.168.1.5/24
+
+query T rowsort
+select json '{"a":[1,2,4]}'
+----
+{"a":[1,2,4]}
+
+query T rowsort
+select url 'https://www.monetdb.org/Home'
+----
+https://www.monetdb.org/Home
+
+query T rowsort
+select uuid 'e31960fb-dc8b-452d-ab30-b342723e756a'
+----
+e31960fb-dc8b-452d-ab30-b342723e756a
+

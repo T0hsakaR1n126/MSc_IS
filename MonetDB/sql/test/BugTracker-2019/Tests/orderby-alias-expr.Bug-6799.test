@@ -1,0 +1,87 @@
+statement ok
+CREATE TABLE obale (nm VARCHAR(99) )
+
+statement ok
+INSERT INTO obale VALUES ('a'), ('b'), ('b'), (NULL)
+
+query T nosort
+SELECT nm FROM obale ORDER BY 1 desc
+----
+b
+b
+a
+NULL
+
+query T nosort
+SELECT nm FROM obale ORDER BY upper(nm)
+----
+NULL
+a
+b
+b
+
+query T nosort
+SELECT nm FROM obale ORDER BY nm || nm
+----
+NULL
+a
+b
+b
+
+query T nosort
+SELECT nm as alias1 FROM obale ORDER BY alias1, nm
+----
+NULL
+a
+b
+b
+
+statement error
+SELECT nm as alias1 FROM obale ORDER BY upper(alias1)
+
+statement error
+SELECT nm as alias1 FROM obale ORDER BY nm || alias1
+
+query TT nosort
+SELECT nm, upper(nm) as alias1 FROM obale ORDER BY alias1
+----
+NULL
+NULL
+a
+A
+b
+B
+b
+B
+
+query TT nosort
+SELECT nm, nm||nm as alias1 FROM obale ORDER BY alias1
+----
+NULL
+NULL
+a
+aa
+b
+bb
+b
+bb
+
+query TII nosort
+SELECT nm, COUNT(nm) countnm, COUNT(DISTINCT nm) countdnm FROM obale GROUP BY nm ORDER BY countnm desc, countdnm
+----
+b
+2
+1
+a
+1
+1
+NULL
+0
+0
+
+statement error
+SELECT nm, COUNT(nm) countnm, COUNT(DISTINCT nm) countdnm FROM obale GROUP BY nm ORDER BY countdnm - countnm
+
+statement ok
+DROP TABLE obale
+

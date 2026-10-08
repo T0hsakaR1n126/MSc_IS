@@ -1,0 +1,456 @@
+statement ok
+create table analytics (aa int, bb int)
+
+statement ok
+insert into analytics values (15, 3), (3, 1), (2, 1), (5, 3), (NULL, 2), (3, 2), (4, 1), (6, 3), (8, 2), (NULL, 4)
+
+query III nosort
+select cast(sum(1) over () as bigint), rank() over (), nth_value(1, 1) over ()
+----
+1
+1
+1
+
+statement error
+select avg(sum(aa) over ()) from analytics
+
+query I nosort
+select cast(sum(1) * count(*) over () as bigint)
+----
+1
+
+query I nosort
+select cast(sum(aa) * count(*) over () as bigint) from analytics
+----
+46
+
+query I rowsort
+select cast(aa * count(1) over () as bigint) from analytics
+----
+150
+20
+30
+30
+40
+50
+60
+80
+NULL
+NULL
+
+query I nosort
+select cast(sum(aa) * count(1) over () as bigint) from analytics
+----
+46
+
+query I nosort
+select cast(sum(aa) * count(1 + aa) / avg(1) over () as bigint) from analytics
+----
+368
+
+query R nosort
+select avg(sum(aa)) over () from analytics
+----
+46.000
+
+query R nosort
+select sum(cast(aa as double)) over (order by aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+5.000
+8.000
+12.000
+17.000
+23.000
+31.000
+46.000
+
+query R nosort
+select sum(cast(aa as double)) over (order by aa nulls first range unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+8.000
+8.000
+12.000
+17.000
+23.000
+31.000
+46.000
+
+query R nosort
+select avg(avg(aa)) over (rows unbounded preceding) from analytics
+----
+5.750
+
+query R nosort
+select avg(avg(aa)) over (range unbounded preceding) from analytics
+----
+5.750
+
+query R nosort
+select avg(sum(aa)) over (rows unbounded preceding) from analytics
+----
+46.000
+
+query R nosort
+select avg(sum(aa)) over (range unbounded preceding) from analytics
+----
+46.000
+
+query RR nosort
+select avg(sum(aa)) over (), avg(avg(aa)) over () from analytics
+----
+46.000
+5.750
+
+query RIRR nosort
+select avg(sum(aa)) over (),
+       cast(sum(aa) * count(case when bb < 2 then bb - 1 else bb + 1 end) / avg(1) over (rows between current row and current row) as bigint),
+       avg(sum(aa)) over (rows unbounded preceding),
+       avg(sum(aa)) over (range unbounded preceding) from analytics
+----
+46.000
+460
+46.000
+46.000
+
+query R nosort
+select avg(sum(aa)) over () from analytics group by aa
+----
+6.571
+6.571
+6.571
+6.571
+6.571
+6.571
+6.571
+6.571
+
+query I nosort
+select cast(sum(aa) * count(aa) / avg(aa) over (order by aa desc nulls last rows between current row and unbounded following) as bigint) from analytics group by aa order by aa desc nulls last
+----
+2
+2
+2
+1
+1
+5
+1
+NULL
+
+query RRIR nosort
+select avg(sum(aa)) over ( order by aa desc nulls last),
+       avg(sum(aa)) over (order by aa desc nulls last rows unbounded preceding),
+       cast(sum(aa) * count(aa) / avg(aa) over (order by aa desc nulls last rows between current row and unbounded following) as bigint),
+       avg(sum(aa)) over (order by aa desc nulls last range unbounded preceding) from analytics group by aa order by aa desc nulls last
+----
+15.000
+15.000
+2
+15.000
+11.500
+11.500
+2
+11.500
+9.667
+9.667
+2
+9.667
+8.500
+8.500
+1
+8.500
+7.600
+7.600
+1
+7.600
+7.333
+7.333
+5
+7.333
+6.571
+6.571
+1
+6.571
+6.571
+6.571
+NULL
+6.571
+
+query II nosort
+select cast(sum(aa) * count(aa) over () as bigint),
+       cast(sum(aa) over () as bigint) from analytics group by aa order by aa desc nulls last
+----
+105
+43
+56
+43
+42
+43
+35
+43
+28
+43
+42
+43
+14
+43
+NULL
+43
+
+query II nosort
+select cast(sum(sum(aa)) over () as bigint),
+       cast(sum(aa) * count(count(aa)) over () as bigint) from analytics group by aa order by aa desc nulls last
+----
+46
+120
+46
+64
+46
+48
+46
+40
+46
+32
+46
+48
+46
+16
+46
+NULL
+
+query IR nosort
+select count(aa) over (),
+       avg(aa) over () * count(aa) from analytics group by aa order by aa nulls first
+----
+7
+0.000
+7
+6.143
+7
+12.286
+7
+6.143
+7
+6.143
+7
+6.143
+7
+6.143
+7
+6.143
+
+query III nosort
+select cast(sum(aa) over () as bigint),
+       cast(sum(aa) over () as bigint),
+       cast(sum(aa) * count(aa) over () as bigint) from analytics group by aa order by aa desc nulls last
+----
+43
+43
+105
+43
+43
+56
+43
+43
+42
+43
+43
+35
+43
+43
+28
+43
+43
+42
+43
+43
+14
+43
+43
+NULL
+
+query RRI nosort
+select 21 - avg(sum(aa)) over (),
+       avg(45 * count(aa) + sum(aa)) over (),
+       cast(sum(aa) * count(aa) over () as bigint) from analytics group by aa order by aa desc nulls last
+----
+14.429
+58.000
+105
+14.429
+58.000
+56
+14.429
+58.000
+42
+14.429
+58.000
+35
+14.429
+58.000
+28
+14.429
+58.000
+42
+14.429
+58.000
+14
+14.429
+58.000
+NULL
+
+query R sort
+select avg(sum(aa)) over (partition by bb) from analytics group by bb order by bb
+----
+9.000
+11.000
+26.000
+NULL
+
+query I nosort
+select cast(sum(aa) * 100 / sum(sum(aa)) over () as bigint) from analytics
+----
+100
+
+query I nosort
+select cast(sum(aa) * 100 / sum(sum(aa)) over (partition by bb) as bigint) from analytics group by bb order by bb
+----
+100
+100
+100
+NULL
+
+statement error
+select cast(sum(aa) * 100 / sum(sum(aa)) over (partition by bb) as bigint) from analytics
+
+statement error
+select cast(prod(sum(aa)) * count(1 + aa) / avg(null) over () as bigint) from analytics
+
+statement error
+select avg(sum(aa) over ()) over () from analytics
+
+statement error
+select avg(aa) over (partition by sum(aa) over ()) from analytics
+
+query I nosort
+select rank() over (partition by case when aa > 5 then aa else aa + 5 end) from analytics
+----
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+query I nosort
+select rank() over (partition by sum(aa)) from analytics
+----
+1
+
+query I nosort
+select rank() over (partition by 12*sum(aa)) from analytics
+----
+1
+
+query I nosort
+select rank() over (partition by sum(aa)) from analytics group by aa
+----
+1
+1
+1
+1
+1
+1
+1
+1
+
+query I nosort
+select rank() over (partition by sum(aa)) from analytics group by bb
+----
+1
+1
+1
+1
+
+query I nosort
+select rank() over (partition by sum(aa)*sum(bb)) from analytics
+----
+1
+
+query I nosort
+select rank() over (partition by sum(aa), sum(bb)) from analytics
+----
+1
+
+query I nosort
+select rank() over (partition by sum(aa), sum(bb)) from analytics group by aa
+----
+1
+1
+1
+1
+1
+1
+1
+1
+
+statement error
+select rank() over (partition by sum(aa), bb) from analytics group by aa
+
+statement error
+select min(aa) over (partition by sum(bb)) from analytics
+
+statement error
+select min(aa) over (partition by sum(aa)) from analytics
+
+query I nosort
+select rank() over (order by sum(aa)) from analytics
+----
+1
+
+query I nosort
+select rank() over (order by sum(aa), sum(bb)) from analytics
+----
+1
+
+statement error
+select rank() over (order by sum(aa), bb) from analytics
+
+statement error
+select min(aa) over (order by sum(bb)) from analytics
+
+query I nosort
+select dense_rank() over (partition by sum(aa) order by avg(bb)) from analytics
+----
+1
+
+query RI nosort
+select avg(sum(aa)) over (rows unbounded preceding),
+       rank() over (partition by sum(aa)) from analytics
+----
+46.000
+1
+
+query I nosort
+select 1 from analytics order by sum(sum(aa)) over ()
+----
+1
+
+statement error
+select 1 from analytics having sum(aa) over ()
+
+statement error
+select sum(avg(aa) over ()) from analytics
+
+statement ok
+drop table analytics
+

@@ -1,0 +1,75 @@
+statement ok
+set optimizer = 'sequential_pipe'
+
+query TI rowsort
+trace
+select replace(a1,a2,a3), id
+from (
+  select name as a1, 'a' as a2, 'A' as a3, id as id
+  from (values (1, '1'), (2, '2')) as x(id, name)
+) as x
+----
+1
+1
+2
+2
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% batstr.replace%'
+----
+1
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% str.replace%'
+----
+0
+
+query TI rowsort
+trace
+select replace(a1,a2,a3), id
+from (
+  select name as a1, 'a' as a2, 'A' as a3, id + 1 as id
+  from (values (1, '1'), (2, '2')) as x(id, name)
+) as x
+----
+1
+2
+2
+3
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% batstr.replace%'
+----
+1
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% str.replace%'
+----
+0
+
+query TI rowsort
+trace
+select replace(a1,a2,a3), id
+from (
+  select name as a1, 'a' as a2, 'A' as a3, abs(id) as id
+ from (values (1, '1'), (2, '2')) as x(id, name)
+) as x
+----
+1
+1
+2
+2
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% batstr.replace%'
+----
+1
+
+query I rowsort
+select count(*) from sys.tracelog() where stmt like '% str.replace%'
+----
+0
+
+statement ok
+set optimizer = 'default_pipe'
+

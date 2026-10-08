@@ -1,0 +1,825 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+#include <fenv.h>
+#include "mmath_private.h"
+#include "mal_exception.h"
+#include "mal_interpreter.h"
+
+static str
+CMDscienceUNARY(MalStkPtr stk, InstrPtr pci,
+				float (*ffunc)(float), double(*dfunc)(double),
+				const char *malfunc)
+{
+	bat bid;
+	BAT *bn, *b, *s = NULL;
+	struct canditer ci;
+	oid x, off;
+	BUN i;
+	BUN nils = 0;
+	int e = 0, ex = 0;
+	bool inf = false;
+	BATiter bi;
+
+	bid = *getArgReference_bat(stk, pci, 1);
+	if ((b = BATdescriptor(bid)) == NULL)
+		throw(MAL, malfunc, SQLSTATE(HY002) RUNTIME_OBJECT_MISSING);
+
+	if (pci->argc == 3) {
+		bid = *getArgReference_bat(stk, pci, 2);
+		if (!is_bat_nil(bid)) {
+			if ((s = BATdescriptor(bid)) == NULL) {
+				BBPunfix(b->batCacheid);
+				throw(MAL, malfunc, SQLSTATE(HY002) RUNTIME_OBJECT_MISSING);
+			}
+		}
+	}
+
+	canditer_init(&ci, b, s);
+	off = b->hseqbase;
+	bn = COLnew(ci.hseq, b->ttype, ci.ncand, TRANSIENT);
+	if (bn == NULL || ci.ncand == 0) {
+		BBPunfix(b->batCacheid);
+		BBPreclaim(s);
+		if (bn == NULL)
+			throw(MAL, malfunc, GDK_EXCEPTION);
+		goto doreturn;
+	}
+
+	errno = 0;
+	feclearexcept(FE_ALL_EXCEPT);
+	bi = bat_iterator(b);
+	switch (b->ttype) {
+	case TYPE_flt:{
+		const flt *restrict fsrc = (const flt *) bi.base;
+		flt *restrict fdst = (flt *) Tloc(bn, 0);
+		for (i = 0; i < ci.ncand; i++) {
+			x = canditer_next(&ci) - off;
+			if (is_flt_nil(fsrc[x])) {
+				fdst[i] = flt_nil;
+				nils++;
+			} else {
+				fdst[i] = ffunc(fsrc[x]);
+				e = errno;
+				ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+				if (e != 0 || ex != 0) {
+					inf = isinf(fdst[i]);
+					break;
+				}
+			}
+		}
+		break;
+	}
+	case TYPE_dbl:{
+		const dbl *restrict dsrc = (const dbl *) bi.base;
+		dbl *restrict ddst = (dbl *) Tloc(bn, 0);
+		for (i = 0; i < ci.ncand; i++) {
+			x = canditer_next(&ci) - off;
+			if (is_dbl_nil(dsrc[x])) {
+				ddst[i] = dbl_nil;
+				nils++;
+			} else {
+				ddst[i] = dfunc(dsrc[x]);
+				e = errno;
+				ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+				if (e != 0 || ex != 0) {
+					inf = isinf(ddst[i]);
+					break;
+				}
+			}
+		}
+		break;
+	}
+	default:
+		assert(0);
+	}
+	bat_iterator_end(&bi);
+	BBPunfix(b->batCacheid);
+	BBPreclaim(s);
+	if (e != 0 || ex != 0) {
+		const char *err;
+		const char *sqlstate;
+		char buf[128];
+		if (ex & FE_DIVBYZERO) {
+			err = "Divide by zero";
+			sqlstate = SQLSTATE(22012);
+		} else if (ex & FE_OVERFLOW || (e == ERANGE && inf)) {
+			err = "Overflow";
+			sqlstate = SQLSTATE(22003);
+		} else if (e == EDOM) {
+			err = "Invalid argument";
+			if (strncmp(malfunc, "batmmath.log", 12) == 0)
+				sqlstate = SQLSTATE(2201E);
+			else
+				sqlstate = SQLSTATE(22003);
+		} else if (e) {
+			err = GDKstrerror(e, buf, sizeof(buf));
+			sqlstate = "";
+		} else {
+			err = "Invalid result";
+			sqlstate = SQLSTATE(22023);
+		}
+		throw(MAL, malfunc, "%sMath exception: %s", sqlstate, err);
+	}
+
+	BATsetcount(bn, ci.ncand);
+	bn->tsorted = false;
+	bn->trevsorted = false;
+	bn->tnil = nils != 0;
+	bn->tnonil = nils == 0;
+	BATkey(bn, false);
+  doreturn:
+	*getArgReference_bat(stk, pci, 0) = bn->batCacheid;
+	BBPkeepref(bn);
+	return MAL_SUCCEED;
+}
+
+static str
+CMDscienceBINARY(MalStkPtr stk, InstrPtr pci,
+				 float (*ffunc)(float, float), double(*dfunc)(double, double),
+				 const char *malfunc)
+{
+	bat bid;
+	BAT *bn, *b1 = NULL, *b2 = NULL, *s1 = NULL, *s2 = NULL;
+	int tp1, tp2;
+	struct canditer ci1 = { 0 },
+		ci2 = { 0 };
+	oid x1, x2, off1, off2;
+	BUN i, ncand, nils = 0;
+	int e = 0, ex = 0;
+	bool inf = false;
+	BATiter b1i, b2i;
+
+	tp1 = stk->stk[getArg(pci, 1)].vtype;
+	tp2 = stk->stk[getArg(pci, 2)].vtype;
+
+	if (stk->stk[getArg(pci, 1)].bat) {
+		bid = *getArgReference_bat(stk, pci, 1);
+		b1 = BATdescriptor(bid);
+		if (b1 == NULL)
+			goto bailout;
+		tp1 = b1->ttype;
+	}
+
+	if (stk->stk[getArg(pci, 2)].bat) {
+		bid = *getArgReference_bat(stk, pci, 2);
+		b2 = BATdescriptor(bid);
+		if (b2 == NULL)
+			goto bailout;
+		tp2 = b2->ttype;
+	}
+	tp1 = ATOMbasetype(tp1);
+	tp2 = ATOMbasetype(tp2);
+	assert(tp1 == tp2);
+	assert(b1 != NULL || b2 != NULL);
+
+	if (pci->argc > 4) {
+		assert(pci->argc == 5);
+		bid = *getArgReference_bat(stk, pci, 4);
+		if (!is_bat_nil(bid)) {
+			s2 = BATdescriptor(bid);
+			if (s2 == NULL)
+				goto bailout;
+		}
+	}
+	if (pci->argc > 3) {
+		bid = *getArgReference_bat(stk, pci, 3);
+		if (!is_bat_nil(bid)) {
+			s1 = BATdescriptor(bid);
+			if (s1 == NULL)
+				goto bailout;
+			if (b1 == NULL) {
+				s2 = s1;
+				s1 = NULL;
+			}
+		}
+	}
+
+	if (b1)
+		canditer_init(&ci1, b1, s1);
+	if (b2)
+		canditer_init(&ci2, b2, s2);
+	ncand = b1 ? ci1.ncand : ci2.ncand;
+	off1 = b1 ? b1->hseqbase : 0;
+	off2 = b2 ? b2->hseqbase : 0;
+
+	if (b1 == NULL &&
+		(tp1 == TYPE_flt ?
+		 is_flt_nil(stk->stk[getArg(pci, 1)].val.fval) :
+		 is_dbl_nil(stk->stk[getArg(pci, 1)].val.dval))) {
+		bn = BATconstant(ci2.hseq, tp1, ATOMnilptr(tp1), ncand, TRANSIENT);
+		goto doreturn;
+	}
+	if (b2 == NULL &&
+		(tp1 == TYPE_flt ?
+		 is_flt_nil(stk->stk[getArg(pci, 2)].val.fval) :
+		 is_dbl_nil(stk->stk[getArg(pci, 2)].val.dval))) {
+		bn = BATconstant(ci1.hseq, tp1, ATOMnilptr(tp1), ncand, TRANSIENT);
+		goto doreturn;
+	}
+	if (b1)
+		bn = COLnew(ci1.hseq, tp1, ncand, TRANSIENT);
+	else
+		bn = COLnew(ci2.hseq, tp1, ncand, TRANSIENT);
+	if (bn == NULL || ncand == 0)
+		goto doreturn;
+
+	b1i = bat_iterator(b1);
+	b2i = bat_iterator(b2);
+	errno = 0;
+	feclearexcept(FE_ALL_EXCEPT);
+	switch (tp1) {
+	case TYPE_flt:
+		if (b1 && b2) {
+			const flt *fsrc1 = (const flt *) b1i.base;
+			const flt *fsrc2 = (const flt *) b2i.base;
+			flt *restrict fdst = (flt *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x1 = canditer_next(&ci1) - off1;
+				x2 = canditer_next(&ci2) - off2;
+				if (is_flt_nil(fsrc1[x1]) || is_flt_nil(fsrc2[x2])) {
+					fdst[i] = flt_nil;
+					nils++;
+				} else {
+					fdst[i] = ffunc(fsrc1[x1], fsrc2[x2]);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(fdst[i]);
+						break;
+					}
+				}
+			}
+		} else if (b1) {
+			const flt *restrict fsrc1 = (const flt *) b1i.base;
+			flt fval2 = stk->stk[getArg(pci, 2)].val.fval;
+			flt *restrict fdst = (flt *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x1 = canditer_next(&ci1) - off1;
+				if (is_flt_nil(fsrc1[x1])) {
+					fdst[i] = flt_nil;
+					nils++;
+				} else {
+					fdst[i] = ffunc(fsrc1[x1], fval2);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(fdst[i]);
+						break;
+					}
+				}
+			}
+		} else {				/* b2 == NULL */
+			flt fval1 = stk->stk[getArg(pci, 1)].val.fval;
+			const flt *restrict fsrc2 = (const flt *) b2i.base;
+			flt *restrict fdst = (flt *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x2 = canditer_next(&ci2) - off2;
+				if (is_flt_nil(fsrc2[x2])) {
+					fdst[i] = flt_nil;
+					nils++;
+				} else {
+					fdst[i] = ffunc(fval1, fsrc2[x2]);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(fdst[i]);
+						break;
+					}
+				}
+			}
+		}
+		break;
+	case TYPE_dbl:
+		if (b1 && b2) {
+			const dbl *dsrc1 = (const dbl *) b1i.base;
+			const dbl *dsrc2 = (const dbl *) b2i.base;
+			dbl *restrict ddst = (dbl *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x1 = canditer_next(&ci1) - off1;
+				x2 = canditer_next(&ci2) - off2;
+				if (is_dbl_nil(dsrc1[x1]) || is_dbl_nil(dsrc2[x2])) {
+					ddst[i] = dbl_nil;
+					nils++;
+				} else {
+					ddst[i] = dfunc(dsrc1[x1], dsrc2[x2]);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(ddst[i]);
+						break;
+					}
+				}
+			}
+		} else if (b1) {
+			const dbl *restrict dsrc1 = (const dbl *) b1i.base;
+			dbl dval2 = stk->stk[getArg(pci, 2)].val.dval;
+			dbl *restrict ddst = (dbl *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x1 = canditer_next(&ci1) - off1;
+				if (is_dbl_nil(dsrc1[x1])) {
+					ddst[i] = dbl_nil;
+					nils++;
+				} else {
+					ddst[i] = dfunc(dsrc1[x1], dval2);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(ddst[i]);
+						break;
+					}
+				}
+			}
+		} else {				/* b2 == NULL */
+			dbl dval1 = stk->stk[getArg(pci, 1)].val.dval;
+			const dbl *restrict dsrc2 = (const dbl *) b2i.base;
+			dbl *restrict ddst = (dbl *) Tloc(bn, 0);
+			for (i = 0; i < ncand; i++) {
+				x2 = canditer_next(&ci2) - off2;
+				if (is_dbl_nil(dsrc2[x2])) {
+					ddst[i] = dbl_nil;
+					nils++;
+				} else {
+					ddst[i] = dfunc(dval1, dsrc2[x2]);
+					e = errno;
+					ex = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+					if (e != 0 || ex != 0) {
+						inf = isinf(ddst[i]);
+						break;
+					}
+				}
+			}
+		}
+		break;
+	default:
+		assert(0);
+	}
+	bat_iterator_end(&b1i);
+	bat_iterator_end(&b2i);
+
+	BATsetcount(bn, ncand);
+	bn->tsorted = false;
+	bn->trevsorted = false;
+	bn->tnil = nils != 0;
+	bn->tnonil = nils == 0;
+	BATkey(bn, false);
+
+  doreturn:
+	BBPreclaim(b1);
+	BBPreclaim(b2);
+	BBPreclaim(s1);
+	BBPreclaim(s2);
+	if (bn == NULL)
+		throw(MAL, malfunc, GDK_EXCEPTION);
+	if (e != 0 || ex != 0) {
+		const char *err;
+		const char *sqlstate;
+		char buf[128];
+		if (ex & FE_DIVBYZERO) {
+			err = "Divide by zero";
+			sqlstate = SQLSTATE(22012);
+		} else if (ex & FE_OVERFLOW || (e == ERANGE && inf)) {
+			err = "Overflow";
+			sqlstate = SQLSTATE(22003);
+		} else if (e == EDOM) {
+			err = "Invalid argument";
+			if (strncmp(malfunc, "batmmath.log", 12) == 0)
+				sqlstate = SQLSTATE(2201E);
+			else if (strcmp(malfunc, "batmmath.pow") == 0)
+				sqlstate = SQLSTATE(2201F);
+			else
+				sqlstate = SQLSTATE(22003);
+		} else if (e) {
+			err = GDKstrerror(e, buf, sizeof(buf));
+			sqlstate = "";
+		} else {
+			err = "Invalid result";
+			sqlstate = SQLSTATE(22023);
+		}
+		throw(MAL, malfunc, "%sMath exception: %s", sqlstate, err);
+	}
+	*getArgReference_bat(stk, pci, 0) = bn->batCacheid;
+	BBPkeepref(bn);
+	return MAL_SUCCEED;
+
+  bailout:
+	BBPreclaim(b1);
+	BBPreclaim(b2);
+/* cannot happen
+	BBPreclaim(s1);
+*/
+	BBPreclaim(s2);
+	throw(MAL, malfunc, SQLSTATE(HY002) RUNTIME_OBJECT_MISSING);
+}
+
+static str
+CMDscience_bat_randintarg(Client cntxt, MalBlkPtr mb, MalStkPtr stk,
+						  InstrPtr pci)
+{
+	BAT *bn = NULL, *b = NULL, *bs = NULL;
+	BUN q = 0;
+	int *restrict vals;
+	struct canditer ci = { 0 };
+	bat *res = getArgReference_bat(stk, pci, 0);
+
+	(void) cntxt;
+	if (isaBatType(getArgType(mb, pci, 1))) {
+		bat *bid = getArgReference_bat(stk, pci, 1),
+			*sid = pci->argc == 3 ? getArgReference_bat(stk, pci, 2) : NULL;
+		if (!(b = BBPquickdesc(*bid))) {
+			throw(MAL, "batmmath.rand", SQLSTATE(HY002) RUNTIME_OBJECT_MISSING);
+		}
+		if (sid && !is_bat_nil(*sid) && !(bs = BATdescriptor(*sid))) {
+			throw(MAL, "batmmath.rand", SQLSTATE(HY002) RUNTIME_OBJECT_MISSING);
+		}
+		canditer_init(&ci, b, bs);
+		q = ci.ncand;
+		BBPreclaim(bs);
+	} else {
+		q = (BUN) *getArgReference_lng(stk, pci, 1);
+	}
+
+	if (!(bn = COLnew(ci.hseq, TYPE_int, q, TRANSIENT))) {
+		throw(MAL, "batmmath.rand", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+	}
+
+	vals = Tloc(bn, 0);
+#ifdef __COVERITY__
+	for (BUN i = 0; i < q; i++)
+		vals[i] = 0;
+#else
+	MT_lock_set(&mmath_rse_lock);
+	for (BUN i = 0; i < q; i++)
+		vals[i] = (int) (next(mmath_rse) >> 33);
+	MT_lock_unset(&mmath_rse_lock);
+#endif
+
+	BATsetcount(bn, q);
+	bn->tnil = false;
+	bn->tnonil = true;
+	bn->tkey = BATcount(bn) <= 1;
+	bn->tsorted = BATcount(bn) <= 1;
+	bn->trevsorted = BATcount(bn) <= 1;
+	*res = bn->batCacheid;
+	BBPkeepref(bn);
+	return MAL_SUCCEED;
+}
+
+static str
+CMDscience_bat_acos(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, acosf, acos, "batmmath.acos");
+}
+
+static str
+CMDscience_bat_asin(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, asinf, asin, "batmmath.asin");
+}
+
+static str
+CMDscience_bat_atan(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, atanf, atan, "batmmath.atan");
+}
+
+static str
+CMDscience_bat_cos(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, cosf, cos, "batmmath.cos");
+}
+
+static str
+CMDscience_bat_sin(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, sinf, sin, "batmmath.sin");
+}
+
+static str
+CMDscience_bat_tan(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, tanf, tan, "batmmath.tan");
+}
+
+static str
+CMDscience_bat_cot(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, cotf, cot, "batmmath.cot");
+}
+
+static str
+CMDscience_bat_cosh(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, coshf, cosh, "batmmath.cosh");
+}
+
+static str
+CMDscience_bat_sinh(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, sinhf, sinh, "batmmath.sinh");
+}
+
+static str
+CMDscience_bat_tanh(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, tanhf, tanh, "batmmath.tanh");
+}
+
+static str
+CMDscience_bat_radians(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, radiansf, radians, "batmmath.radians");
+}
+
+static str
+CMDscience_bat_degrees(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, degreesf, degrees, "batmmath.degrees");
+}
+
+static str
+CMDscience_bat_exp(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, expf, exp, "batmmath.exp");
+}
+
+static str
+CMDscience_bat_log(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, logf, log, "batmmath.log");
+}
+
+static str
+CMDscience_bat_log10(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, log10f, log10, "batmmath.log10");
+}
+
+static str
+CMDscience_bat_log2(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, log2f, log2, "batmmath.log2");
+}
+
+static str
+CMDscience_bat_sqrt(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, sqrtf, sqrt, "batmmath.sqrt");
+}
+
+static str
+CMDscience_bat_cbrt(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, cbrtf, cbrt, "batmmath.cbrt");
+}
+
+static str
+CMDscience_bat_ceil(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, ceilf, ceil, "batmmath.ceil");
+}
+
+static str
+CMDscience_bat_fabs(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, fabsf, fabs, "batmmath.fabs");
+}
+
+static str
+CMDscience_bat_floor(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceUNARY(stk, pci, floorf, floor, "batmmath.floor");
+}
+
+static str
+CMDscience_bat_atan2(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceBINARY(stk, pci, atan2f, atan2, "batmmath.atan2");
+}
+
+static str
+CMDscience_bat_pow(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceBINARY(stk, pci, powf, pow, "batmmath.pow");
+}
+
+static str
+CMDscience_bat_logbs(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) cntxt;
+	(void) mb;
+
+	return CMDscienceBINARY(stk, pci, logbsf, logbs, "batmmath.logbs");
+}
+
+#include "mel.h"
+static mel_func batmmath_init_funcs[] = {
+ pattern("batmmath", "asin", CMDscience_bat_asin, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "asin", CMDscience_bat_asin, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "asin", CMDscience_bat_asin, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "asin", CMDscience_bat_asin, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "acos", CMDscience_bat_acos, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "acos", CMDscience_bat_acos, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "acos", CMDscience_bat_acos, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "acos", CMDscience_bat_acos, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "atan", CMDscience_bat_atan, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "atan", CMDscience_bat_atan, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "atan", CMDscience_bat_atan, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "atan", CMDscience_bat_atan, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "cos", CMDscience_bat_cos, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "cos", CMDscience_bat_cos, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "cos", CMDscience_bat_cos, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "cos", CMDscience_bat_cos, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "sin", CMDscience_bat_sin, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "sin", CMDscience_bat_sin, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "sin", CMDscience_bat_sin, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "sin", CMDscience_bat_sin, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "tan", CMDscience_bat_tan, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "tan", CMDscience_bat_tan, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "tan", CMDscience_bat_tan, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "tan", CMDscience_bat_tan, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "cot", CMDscience_bat_cot, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "cot", CMDscience_bat_cot, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "cot", CMDscience_bat_cot, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "cot", CMDscience_bat_cot, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "cosh", CMDscience_bat_cosh, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "cosh", CMDscience_bat_cosh, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "cosh", CMDscience_bat_cosh, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "cosh", CMDscience_bat_cosh, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "sinh", CMDscience_bat_sinh, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "sinh", CMDscience_bat_sinh, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "sinh", CMDscience_bat_sinh, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "sinh", CMDscience_bat_sinh, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "tanh", CMDscience_bat_tanh, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "tanh", CMDscience_bat_tanh, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "tanh", CMDscience_bat_tanh, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "tanh", CMDscience_bat_tanh, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "radians", CMDscience_bat_radians, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "radians", CMDscience_bat_radians, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "radians", CMDscience_bat_radians, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "radians", CMDscience_bat_radians, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "degrees", CMDscience_bat_degrees, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "degrees", CMDscience_bat_degrees, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "degrees", CMDscience_bat_degrees, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "degrees", CMDscience_bat_degrees, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "exp", CMDscience_bat_exp, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "exp", CMDscience_bat_exp, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "exp", CMDscience_bat_exp, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "exp", CMDscience_bat_exp, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "log", CMDscience_bat_log, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "log", CMDscience_bat_log, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "log", CMDscience_bat_log, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "log", CMDscience_bat_log, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "log10", CMDscience_bat_log10, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "log10", CMDscience_bat_log10, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "log10", CMDscience_bat_log10, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "log10", CMDscience_bat_log10, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "log2", CMDscience_bat_log2, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "log2", CMDscience_bat_log2, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "log2", CMDscience_bat_log2, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "log2", CMDscience_bat_log2, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),arg("y",dbl))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,4, batarg("",dbl),batarg("x",dbl),arg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,5, batarg("",dbl),batarg("x",dbl),batarg("y",dbl),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",flt),batarg("x",flt),arg("y",flt))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,4, batarg("",flt),batarg("x",flt),arg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,5, batarg("",flt),batarg("x",flt),batarg("y",flt),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",dbl),arg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,4, batarg("",dbl),arg("x",dbl),batarg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,3, batarg("",flt),arg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "log2arg", CMDscience_bat_logbs, false, "", args(1,4, batarg("",flt),arg("x",flt),batarg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "sqrt", CMDscience_bat_sqrt, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "sqrt", CMDscience_bat_sqrt, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "sqrt", CMDscience_bat_sqrt, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "sqrt", CMDscience_bat_sqrt, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "cbrt", CMDscience_bat_cbrt, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "cbrt", CMDscience_bat_cbrt, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "cbrt", CMDscience_bat_cbrt, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "cbrt", CMDscience_bat_cbrt, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "ceil", CMDscience_bat_ceil, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "ceil", CMDscience_bat_ceil, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "ceil", CMDscience_bat_ceil, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "ceil", CMDscience_bat_ceil, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "fabs", CMDscience_bat_fabs, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "fabs", CMDscience_bat_fabs, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "fabs", CMDscience_bat_fabs, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "fabs", CMDscience_bat_fabs, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "floor", CMDscience_bat_floor, false, "", args(1,2, batarg("",dbl),batarg("x",dbl))),
+ pattern("batmmath", "floor", CMDscience_bat_floor, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("s",oid))),
+ pattern("batmmath", "floor", CMDscience_bat_floor, false, "", args(1,2, batarg("",flt),batarg("x",flt))),
+ pattern("batmmath", "floor", CMDscience_bat_floor, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("s",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),arg("y",dbl))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,4, batarg("",dbl),batarg("x",dbl),arg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,5, batarg("",dbl),batarg("x",dbl),batarg("y",dbl),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",flt),batarg("x",flt),arg("y",flt))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,4, batarg("",flt),batarg("x",flt),arg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,5, batarg("",flt),batarg("x",flt),batarg("y",flt),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",dbl),arg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,4, batarg("",dbl),arg("x",dbl),batarg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,3, batarg("",flt),arg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "atan2", CMDscience_bat_atan2, false, "", args(1,4, batarg("",flt),arg("x",flt),batarg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),arg("y",dbl))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,4, batarg("",dbl),batarg("x",dbl),arg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",dbl),batarg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,5, batarg("",dbl),batarg("x",dbl),batarg("y",dbl),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",flt),batarg("x",flt),arg("y",flt))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,4, batarg("",flt),batarg("x",flt),arg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",flt),batarg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,5, batarg("",flt),batarg("x",flt),batarg("y",flt),batarg("s1",oid),batarg("s2",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",dbl),arg("x",dbl),batarg("y",dbl))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,4, batarg("",dbl),arg("x",dbl),batarg("y",dbl),batarg("s",oid))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,3, batarg("",flt),arg("x",flt),batarg("y",flt))),
+ pattern("batmmath", "pow", CMDscience_bat_pow, false, "", args(1,4, batarg("",flt),arg("x",flt),batarg("y",flt),batarg("s",oid))),
+ pattern("batmmath", "rand", CMDscience_bat_randintarg, true, "", args(1,2, batarg("",int),batarg("v",int))),
+ pattern("batmmath", "rand", CMDscience_bat_randintarg, true, "", args(1,3, batarg("",int),batarg("v",int),batarg("s",oid))),
+ pattern("batmmath", "rand", CMDscience_bat_randintarg, true, "", args(1,2, batarg("",int),arg("card",lng))), /* version with cardinality input */
+ { .imp=NULL }
+};
+#include "mal_import.h"
+#ifdef _MSC_VER
+#undef read
+#pragma section(".CRT$XCU",read)
+#endif
+LIB_STARTUP_FUNC(init_batmmath_mal)
+{ mal_module("batmmath", NULL, batmmath_init_funcs); }

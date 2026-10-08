@@ -1,0 +1,8 @@
+statement ok
+prepare select 1=?+?
+
+query I nosort
+exec 0(1,0)
+----
+1
+

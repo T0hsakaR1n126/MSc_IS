@@ -1,0 +1,17 @@
+statement ok
+START TRANSACTION
+
+statement ok
+CREATE TABLE testlz4 (a bigint, b real, c clob, d varchar(64))
+
+statement ok
+COPY INTO testlz4 FROM E'$QTSTSRCDIR/testlz4.lz4' USING DELIMITERS ',',E'\n','"' NULL AS ''
+
+query ITT rowsort
+SELECT a, c, d FROM testlz4 limit 1024
+----
+3072 values hashing to 565adcf384369482e68cab7fe899e89b
+
+statement ok
+ROLLBACK
+

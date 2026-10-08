@@ -1,0 +1,16 @@
+statement ok
+function qry( a:bat[:any_1], b:bat[:any_2], c:bat[:any_3]):bat[:any_3];
+	a1:= a;
+	b1:=b;
+	c1:=c;
+    z:= algebra.join(a,b);
+    zz:= algebra.join(z,c);
+	ww:= algebra.join(z,a1);
+	yy:= algebra.join(ww,b1);
+	xx:= algebra.join(yy,c1);
+    return qry:= xx;
+end qry
+
+statement ok
+optimizer.projectionpath("user","qry")
+

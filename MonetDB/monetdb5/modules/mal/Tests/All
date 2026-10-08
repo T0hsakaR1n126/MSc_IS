@@ -1,0 +1,47 @@
+iterator01
+iterator02
+clients01
+
+bigsum
+
+inspect00
+#inspect05 word size problems on different platforms
+inspect10
+#inspect40 word size problems on different platforms
+
+mserver00
+
+qgram
+
+groupby00
+
+# flags  is influecend by the Mtest command line 
+
+mat
+
+remoteInit
+
+partition
+batpartition
+printf
+#some remote related tests
+mapi04
+mapi05
+mapi06
+mapi07
+mapi01
+
+# might show different output if openssl is compiled without full sha2
+# support
+clients-hashes
+
+#cpustat too system dependent to always run.
+
+pqueue
+pqueue2
+pqueue3
+
+orderidx00
+orderidx01
+orderidx02
+orderidx04

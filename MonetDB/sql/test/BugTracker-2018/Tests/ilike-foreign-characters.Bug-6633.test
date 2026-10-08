@@ -1,0 +1,68 @@
+statement ok
+START TRANSACTION
+
+statement ok
+CREATE TABLE debugme (acol CLOB)
+
+statement ok
+INSERT INTO debugme VALUES ('aa'), ('Aä'), ('AÄ'), ('aä'), ('aÄ'), ('oo'), ('öO'), ('ÖO'), ('öo'), ('Öo')
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE 'aä'
+----
+AÄ
+Aä
+aÄ
+aä
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE '%ä'
+----
+AÄ
+Aä
+aÄ
+aä
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE '%ä%'
+----
+AÄ
+Aä
+aÄ
+aä
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE 'ö%'
+----
+ÖO
+Öo
+öO
+öo
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE '%ö%'
+----
+ÖO
+Öo
+öO
+öo
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE 'ö_'
+----
+ÖO
+Öo
+öO
+öo
+
+query T rowsort
+SELECT acol FROM debugme WHERE acol ILIKE 'öo'
+----
+ÖO
+Öo
+öO
+öo
+
+statement ok
+ROLLBACK
+

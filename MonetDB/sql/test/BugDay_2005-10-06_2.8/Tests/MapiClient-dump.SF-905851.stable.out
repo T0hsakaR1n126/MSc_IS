@@ -1,0 +1,53 @@
+START TRANSACTION;
+SET SCHEMA "sys";
+CREATE TABLE "sys"."allnewtriples" (
+	"id"        INTEGER       NOT NULL,
+	"subject"   INTEGER       NOT NULL,
+	"predicate" INTEGER       NOT NULL,
+	"object"    INTEGER       NOT NULL,
+	"explicit"  BOOLEAN       NOT NULL,
+	CONSTRAINT "allnewtriples_id_pkey" PRIMARY KEY ("id"),
+	CONSTRAINT "unique_key" UNIQUE ("subject", "predicate", "object")
+);
+CREATE INDEX "allnewtriples_object_idx" ON "sys"."allnewtriples" ("object");
+CREATE INDEX "allnewtriples_predicate_idx" ON "sys"."allnewtriples" ("predicate");
+CREATE INDEX "allnewtriples_subject_idx" ON "sys"."allnewtriples" ("subject");
+COPY 7 RECORDS INTO "sys"."allnewtriples" FROM stdin USING DELIMITERS E'\t',E'\n','"';
+1	1	1	1	false
+2	1	1	2	false
+3	1	2	1	false
+4	2	1	1	false
+5	1	2	2	false
+6	2	2	1	false
+7	2	2	2	false
+CREATE TABLE "sys"."foreign" (
+	"id"        INTEGER       NOT NULL,
+	"subject"   INTEGER       NOT NULL,
+	"predicate" INTEGER       NOT NULL,
+	"object"    INTEGER       NOT NULL
+);
+COPY 7 RECORDS INTO "sys"."foreign" FROM stdin USING DELIMITERS E'\t',E'\n','"';
+1	1	1	1
+2	2	2	2
+3	1	2	2
+4	2	2	1
+5	2	1	1
+6	1	2	1
+7	1	1	2
+CREATE TABLE "sys"."triples" (
+	"id"        INTEGER       NOT NULL,
+	"subject"   INTEGER       NOT NULL,
+	"predicate" INTEGER       NOT NULL,
+	"object"    INTEGER       NOT NULL,
+	"explicit"  BOOLEAN       NOT NULL,
+	CONSTRAINT "triples_subject_predicate_object_unique" UNIQUE ("subject", "predicate", "object")
+);
+CREATE INDEX "triples_object_idx" ON "sys"."triples" ("object");
+CREATE INDEX "triples_predicate_idx" ON "sys"."triples" ("predicate");
+CREATE INDEX "triples_predicate_object_idx" ON "sys"."triples" ("predicate", "object");
+CREATE INDEX "triples_subject_idx" ON "sys"."triples" ("subject");
+CREATE INDEX "triples_subject_object_idx" ON "sys"."triples" ("subject", "object");
+CREATE INDEX "triples_subject_predicate_idx" ON "sys"."triples" ("subject", "predicate");
+ALTER TABLE "sys"."foreign" ADD CONSTRAINT "foreign_id_fkey" FOREIGN KEY ("id") REFERENCES "sys"."allnewtriples" ("id");
+ALTER TABLE "sys"."foreign" ADD CONSTRAINT "foreign_subject_predicate_object_fkey" FOREIGN KEY ("subject", "predicate", "object") REFERENCES "sys"."allnewtriples" ("subject", "predicate", "object");
+COMMIT;

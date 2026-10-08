@@ -1,0 +1,37 @@
+statement ok
+CREATE TABLE cols_6624 as
+ SELECT id, type FROM sys.columns WHERE table_id IN (SELECT id FROM sys.tables WHERE schema_id IN (SELECT id FROM sys.schemas WHERE name = 'tmp')) WITH DATA
+
+query TI nosort
+SELECT type,COUNT(id) FROM cols_6624 GROUP BY type HAVING COUNT(id)>5 ORDER BY COUNT(id) DESC
+----
+int
+22
+varchar
+15
+smallint
+7
+
+query TI nosort
+SELECT type,COUNT(id) FROM cols_6624 GROUP BY type HAVING COUNT(id)>5 ORDER BY 2 DESC
+----
+int
+22
+varchar
+15
+smallint
+7
+
+query TI nosort
+SELECT type,COUNT(id) as cnt FROM cols_6624 GROUP BY type HAVING COUNT(id)>5 ORDER BY cnt DESC
+----
+int
+22
+varchar
+15
+smallint
+7
+
+statement ok
+DROP TABLE cols_6624
+

@@ -1,0 +1,20 @@
+query T nosort
+select asciify('Olá Mundo!')
+----
+Ola Mundo!
+
+query T nosort
+select asciify('João')
+----
+Joao
+
+query T nosort
+select asciify('Parabéns Ri!')
+----
+Parabens Ri!
+
+query T nosort
+select asciify('Müller')
+----
+Muller
+

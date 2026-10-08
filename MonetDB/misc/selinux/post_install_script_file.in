@@ -1,0 +1,7 @@
+for selinuxvariant in "@SELINUX_TYPES@"
+do
+  /usr/sbin/semodule -s ${selinuxvariant} -i \
+    @CMAKE_INSTALL_DATADIR@/selinux/${selinuxvariant}/monetdb.pp &> /dev/null || :
+done
+/sbin/restorecon -R @CMAKE_INSTALL_FULL_LOCALSTATEDIR@/monetdb5 @CMAKE_INSTALL_FULL_LOCALSTATEDIR@/log/monetdb @CMAKE_INSTALL_FULL_RUNSTATEDIR@/monetdb @CMAKE_INSTALL_FULL_BINDIR@/monetdbd @CMAKE_INSTALL_FULL_BINDIR@/mserver5 %{_unitdir}/monetdbd.service &> /dev/null || :
+/usr/bin/systemctl try-restart monetdbd.service

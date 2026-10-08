@@ -1,0 +1,63 @@
+statement ok
+set optimizer = 'minimal_pipe'
+
+statement ok
+create table oblo (a int)
+
+statement ok
+insert into oblo values (4)
+
+statement ok
+insert into oblo values (3)
+
+statement ok
+insert into oblo values (2)
+
+statement ok
+insert into oblo values (1)
+
+query I rowsort
+select * from oblo
+----
+1
+2
+3
+4
+
+query I nosort
+select * from oblo ORDER BY a
+----
+1
+2
+3
+4
+
+query I nosort
+select * from oblo ORDER BY a OFFSET 2
+----
+3
+4
+
+query I nosort
+select * from oblo ORDER BY a LIMIT 2
+----
+1
+2
+
+query I nosort
+select * from oblo ORDER BY a LIMIT 2 OFFSET 1
+----
+2
+3
+
+query I nosort
+select * from oblo ORDER BY a LIMIT 1 OFFSET 2
+----
+3
+
+statement ok
+drop table oblo
+
+statement ok
+set optimizer = 'default_pipe'
+

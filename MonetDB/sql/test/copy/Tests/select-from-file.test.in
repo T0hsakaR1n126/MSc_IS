@@ -1,0 +1,61 @@
+query IT rowsort
+SELECT * FROM R'$TSTSRCDIR/aapnootmies.csv'
+----
+1
+Xaap
+2
+Xnoot
+3
+Xmies
+
+statement ok
+DROP TABLE IF EXISTS foo
+
+statement ok
+CREATE TABLE foo(i INT, t TEXT)
+
+statement ok
+INSERT INTO foo SELECT * FROM R'$TSTSRCDIR/aapnootmies.csv'
+
+query IT rowsort
+SELECT * FROM foo
+----
+1
+Xaap
+2
+Xnoot
+3
+Xmies
+
+query IT nosort
+SELECT * FROM R'$TSTSRCDIR/aapnootmies.csv' ORDER BY name_1
+----
+1
+Xaap
+3
+Xmies
+2
+Xnoot
+
+query IT nosort
+SELECT * FROM R'$TSTSRCDIR/aapnootmies.csv' WHERE name_1 = 'Xaap'
+----
+1
+Xaap
+
+query IT rowsort
+SELECT count(name_0), name_1 FROM R'$TSTSRCDIR/aapnootmies.csv' GROUP BY name_1
+----
+1
+Xaap
+1
+Xmies
+1
+Xnoot
+
+query IT nosort
+SELECT * FROM R'$TSTSRCDIR/aapnootmies.csv' a WHERE a.name_1 = 'Xaap'
+----
+1
+Xaap
+

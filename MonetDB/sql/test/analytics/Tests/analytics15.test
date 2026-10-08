@@ -1,0 +1,1612 @@
+statement ok
+start transaction
+
+statement ok
+create table analytics (aa int, bb int)
+
+statement ok
+insert into analytics values (15, 3), (3, 1), (2, 1), (5, 3), (NULL, 2), (3, 2), (4, 1), (6, 3), (8, 2), (NULL, 4)
+
+query RRRR nosort
+select covar_samp(aa, aa) over (partition by bb),
+       covar_samp(aa, aa) over (partition by bb order by bb asc),
+       covar_samp(aa, aa) over (partition by bb order by bb desc),
+       covar_samp(aa, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+30.333
+12.500
+12.500
+12.500
+21.300
+12.500
+12.500
+12.500
+21.300
+12.500
+12.500
+12.500
+21.300
+1.000
+1.000
+1.000
+17.643
+1.000
+1.000
+1.000
+17.643
+1.000
+1.000
+1.000
+17.643
+
+query RRRR nosort
+select covar_samp(bb, bb) over (partition by bb),
+       covar_samp(bb, bb) over (partition by bb order by bb asc),
+       covar_samp(bb, bb) over (partition by bb order by bb desc),
+       covar_samp(bb, bb) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.250
+0.000
+0.000
+0.000
+0.250
+0.000
+0.000
+0.000
+0.250
+0.000
+0.000
+0.000
+0.571
+0.000
+0.000
+0.000
+0.571
+0.000
+0.000
+0.000
+0.571
+0.000
+0.000
+0.000
+1.067
+0.000
+0.000
+0.000
+1.067
+0.000
+0.000
+0.000
+1.067
+
+query RRRR nosort
+select corr(bb, bb) over (partition by bb),
+       corr(bb, bb) over (partition by bb order by bb asc),
+       corr(bb, bb) over (partition by bb order by bb desc),
+       corr(bb, bb) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+
+query RRRR nosort
+select covar_pop(aa, aa) over (partition by bb),
+       covar_pop(aa, aa) over (partition by bb order by bb asc),
+       covar_pop(aa, aa) over (partition by bb order by bb desc),
+       covar_pop(aa, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+20.222
+6.250
+6.250
+6.250
+17.040
+6.250
+6.250
+6.250
+17.040
+6.250
+6.250
+6.250
+17.040
+0.667
+0.667
+0.667
+15.438
+0.667
+0.667
+0.667
+15.438
+0.667
+0.667
+0.667
+15.438
+
+query RRRR nosort
+select covar_pop(bb, bb) over (partition by bb),
+       covar_pop(bb, bb) over (partition by bb order by bb asc),
+       covar_pop(bb, bb) over (partition by bb order by bb desc),
+       covar_pop(bb, bb) over (order by bb desc) from analytics order by bb desc
+----
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.188
+0.000
+0.000
+0.000
+0.188
+0.000
+0.000
+0.000
+0.188
+0.000
+0.000
+0.000
+0.490
+0.000
+0.000
+0.000
+0.490
+0.000
+0.000
+0.000
+0.490
+0.000
+0.000
+0.000
+0.960
+0.000
+0.000
+0.000
+0.960
+0.000
+0.000
+0.000
+0.960
+
+query RRRR nosort
+select corr(bb, bb) over (partition by bb),
+       corr(bb, bb) over (partition by bb order by bb asc),
+       corr(bb, bb) over (partition by bb order by bb desc),
+       corr(bb, bb) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+
+query RRRR nosort
+select covar_samp(aa, bb) over (partition by bb),
+       covar_samp(aa, bb) over (partition by bb order by bb asc),
+       covar_samp(aa, bb) over (partition by bb order by bb desc),
+       covar_samp(aa, bb) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+2.429
+0.000
+0.000
+0.000
+2.429
+0.000
+0.000
+0.000
+2.429
+
+query RRRR nosort
+select covar_samp(bb, aa) over (partition by bb),
+       covar_samp(bb, aa) over (partition by bb order by bb asc),
+       covar_samp(bb, aa) over (partition by bb order by bb desc),
+       covar_samp(bb, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+0.950
+0.000
+0.000
+0.000
+2.429
+0.000
+0.000
+0.000
+2.429
+0.000
+0.000
+0.000
+2.429
+
+query RRRR nosort
+select corr(bb, aa) over (partition by bb),
+       corr(bb, aa) over (partition by bb order by bb asc),
+       corr(bb, aa) over (partition by bb order by bb desc),
+       corr(bb, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.625
+NULL
+NULL
+NULL
+0.625
+NULL
+NULL
+NULL
+0.625
+
+query RRRR nosort
+select covar_pop(aa, bb) over (partition by bb),
+       covar_pop(aa, bb) over (partition by bb order by bb asc),
+       covar_pop(aa, bb) over (partition by bb order by bb desc),
+       covar_pop(aa, bb) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+2.125
+0.000
+0.000
+0.000
+2.125
+0.000
+0.000
+0.000
+2.125
+
+query RRRR nosort
+select covar_pop(bb, aa) over (partition by bb),
+       covar_pop(bb, aa) over (partition by bb order by bb asc),
+       covar_pop(bb, aa) over (partition by bb order by bb desc),
+       covar_pop(bb, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+0.760
+0.000
+0.000
+0.000
+2.125
+0.000
+0.000
+0.000
+2.125
+0.000
+0.000
+0.000
+2.125
+
+query RRRR nosort
+select corr(bb, aa) over (partition by bb),
+       corr(bb, aa) over (partition by bb order by bb asc),
+       corr(bb, aa) over (partition by bb order by bb desc),
+       corr(bb, aa) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.376
+NULL
+NULL
+NULL
+0.625
+NULL
+NULL
+NULL
+0.625
+NULL
+NULL
+NULL
+0.625
+
+query RRRR nosort
+select covar_pop(aa, 1) over (partition by bb),
+       covar_pop(aa, 1) over (partition by bb order by bb asc),
+       covar_pop(aa, 1) over (partition by bb order by bb desc),
+       covar_pop(aa, 1) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+
+query RRRR nosort
+select covar_pop(bb, -100) over (partition by bb),
+       covar_pop(bb, -100) over (partition by bb order by bb asc),
+       covar_pop(bb, -100) over (partition by bb order by bb desc),
+       covar_pop(bb, -100) over (order by bb desc) from analytics order by bb desc
+----
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+
+query RRRR nosort
+select corr(bb, -100) over (partition by bb),
+       corr(bb, -100) over (partition by bb order by bb asc),
+       corr(bb, -100) over (partition by bb order by bb desc),
+       corr(bb, -100) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRR nosort
+select covar_samp(aa, 1) over (partition by bb),
+       covar_samp(aa, 1) over (partition by bb order by bb asc),
+       covar_samp(aa, 1) over (partition by bb order by bb desc),
+       covar_samp(aa, 1) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+
+query RRRR nosort
+select covar_samp(bb, -100) over (partition by bb),
+       covar_samp(bb, -100) over (partition by bb order by bb asc),
+       covar_samp(bb, -100) over (partition by bb order by bb desc),
+       covar_samp(bb, -100) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+
+query RRRR nosort
+select corr(bb, -100) over (partition by bb),
+       corr(bb, -100) over (partition by bb order by bb asc),
+       corr(bb, -100) over (partition by bb order by bb desc),
+       corr(bb, -100) over (order by bb desc) from analytics order by bb desc
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRRRR nosort
+select covar_pop(aa, aa) over (),
+       covar_pop(bb, bb) over (),
+       covar_pop(aa, bb) over (),
+       covar_pop(bb, aa) over (),
+       covar_pop(aa, 1) over (),
+       covar_pop(aa, 1) over () from analytics order by bb desc
+----
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+15.437
+0.960
+2.125
+2.125
+0.000
+0.000
+
+query RRRRRR nosort
+select covar_samp(aa, aa) over (),
+       covar_samp(bb, bb) over (),
+       covar_samp(aa, bb) over (),
+       covar_samp(bb, aa) over (),
+       covar_samp(aa, 1) over (),
+       covar_samp(bb, -100) over () from analytics
+----
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+17.643
+1.067
+2.429
+2.429
+0.000
+0.000
+
+query RRRRRR nosort
+select corr(aa, aa) over (),
+       corr(bb, bb) over (),
+       corr(aa, bb) over (),
+       corr(bb, aa) over (),
+       corr(aa, 1) over (),
+       corr(bb, -100) over () from analytics
+----
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+1.000
+1.000
+0.625
+0.625
+NULL
+NULL
+
+query RRRRR nosort
+select covar_samp(NULL, 2) over (),
+       covar_samp(2, NULL) over (),
+       covar_samp(aa, NULL) over (),
+       covar_samp(NULL, aa) over (),
+       covar_samp(NULL, NULL) over () from analytics
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRRR nosort
+select covar_pop(NULL, 2) over (),
+       covar_pop(2, NULL) over (),
+       covar_pop(aa, NULL) over (),
+       covar_pop(NULL, aa) over (),
+       covar_pop(NULL, NULL) over () from analytics
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRRR nosort
+select corr(NULL, 2) over (),
+       corr(2, NULL) over (),
+       corr(aa, NULL) over (),
+       corr(NULL, aa) over (),
+       corr(NULL, NULL) over () from analytics
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRRRR nosort
+select covar_pop(1,1) over (), covar_samp(1,1) over (), corr(1,1) over (), covar_pop(1,null) over (), covar_samp(1,null) over (), corr(1,null) over ()
+----
+0.000
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRRRR nosort
+select covar_pop(1,1) over (), covar_samp(1,1) over (), corr(1,1) over (), covar_pop(1,null) over (), covar_samp(1,null) over (), corr(1,null) over () from analytics
+----
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+0.000
+0.000
+NULL
+NULL
+NULL
+NULL
+
+query RRRR nosort
+select covar_samp(aa, 1) over (order by bb, aa nulls first rows between 5 preceding and 0 following),
+       covar_samp(aa, aa) over (order by bb, aa nulls first rows between 5 preceding and 2 following),
+       covar_samp(aa, -100) over (partition by bb order by bb rows between 5 preceding and 0 following),
+       covar_samp(aa, bb) over (partition by bb order by bb rows between 5 preceding and 2 following) from analytics order by bb, aa nulls first
+----
+NULL
+1.000
+NULL
+0.000
+0.000
+1.000
+0.000
+0.000
+0.000
+0.667
+0.000
+0.000
+0.000
+5.500
+NULL
+0.000
+0.000
+4.567
+NULL
+0.000
+0.000
+4.286
+0.000
+0.000
+0.000
+17.905
+NULL
+0.000
+0.000
+18.967
+0.000
+0.000
+0.000
+21.300
+0.000
+0.000
+0.000
+21.300
+NULL
+NULL
+
+query RR nosort
+select covar_samp(bb, aa) over (order by bb, aa nulls first rows 2 preceding),
+       covar_samp(10, bb) over (partition by bb order by bb, aa nulls first rows 2 preceding) from analytics order by bb, aa nulls first
+----
+NULL
+NULL
+0.000
+0.000
+0.000
+0.000
+0.000
+NULL
+-0.500
+0.000
+0.000
+0.000
+-0.167
+NULL
+-0.833
+0.000
+0.000
+0.000
+0.000
+NULL
+
+query RRRR nosort
+select covar_pop(aa, 1) over (order by bb groups between 5 preceding and 0 following),
+       covar_pop(aa, aa) over (order by bb groups between 5 preceding and 2 following),
+       covar_pop(aa, -100) over (partition by bb order by bb groups between 5 preceding and 0 following),
+       covar_pop(aa, bb) over (partition by bb order by bb groups between 5 preceding and 2 following) from analytics order by bb
+----
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+0.000
+0.000
+0.000
+15.438
+NULL
+NULL
+
+query RR nosort
+select covar_pop(bb, aa) over (order by bb groups 2 preceding),
+       covar_pop(10, bb) over (partition by bb order by bb groups 2 preceding) from analytics order by bb
+----
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.600
+0.000
+0.600
+0.000
+0.600
+0.000
+2.125
+0.000
+2.125
+0.000
+2.125
+0.000
+0.760
+0.000
+
+query RRRR nosort
+select corr(aa, 1) over (order by bb rows between 5 preceding and 0 following),
+       corr(aa, aa) over (order by bb rows between 5 preceding and 2 following),
+       corr(aa, -100) over (partition by bb order by bb rows between 5 preceding and 0 following),
+       corr(aa, bb) over (partition by bb order by bb rows between 5 preceding and 2 following) from analytics
+----
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+
+query RRR nosort
+select corr(bb, aa) over (order by bb, aa nulls last rows 2 preceding),
+       corr(10, bb) over (partition by bb order by bb rows 2 preceding),
+       corr(bb, aa) over (order by bb nulls last, aa nulls last rows 2 preceding) from analytics order by bb nulls last, aa nulls last
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+-0.500
+NULL
+-0.500
+0.327
+NULL
+0.327
+NULL
+NULL
+NULL
+-1.000
+NULL
+-1.000
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query RRRR nosort
+select corr(aa, 1) over (order by bb groups between 5 preceding and 0 following),
+       corr(aa, aa) over (order by bb groups between 5 preceding and 2 following),
+       corr(aa, -100) over (partition by bb order by bb groups between 5 preceding and 0 following),
+       corr(aa, bb) over (partition by bb order by bb groups between 5 preceding and 2 following) from analytics order by bb
+----
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+NULL
+1.000
+NULL
+NULL
+
+query RR nosort
+select corr(bb, aa) over (order by bb groups 2 preceding),
+       corr(10, bb) over (partition by bb order by bb groups 2 preceding) from analytics order by bb
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+0.584
+NULL
+0.584
+NULL
+0.584
+NULL
+0.625
+NULL
+0.625
+NULL
+0.625
+NULL
+0.376
+NULL
+
+statement ok
+rollback
+

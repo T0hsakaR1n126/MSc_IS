@@ -1,0 +1,9 @@
+statement error
+select @debug
+
+statement error
+select explain
+
+statement error
+select @explain
+

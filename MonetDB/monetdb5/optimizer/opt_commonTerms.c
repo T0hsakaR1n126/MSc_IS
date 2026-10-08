@@ -1,0 +1,268 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+#include "opt_commonTerms.h"
+#include "mal_exception.h"
+ /*
+  * Caveat. A lot of time was lost due to constants that are indistinguisable
+  * at the surface level.  It requires the constant optimizer to be ran first.
+  */
+
+/* The key for finding common terms is that they share variables.
+ * Therefore we skip all constants, except for a constant only situation.
+ */
+
+/*
+ * Speed up simple insert operations by skipping the common terms.
+*/
+
+__attribute__((__pure__))
+static int
+hashInstruction(const MalBlkRecord *mb, const InstrRecord *p)
+{
+	int i;
+	for (i = p->argc - 1; i >= p->retc; i--)
+		if (!isVarConstant(mb, getArg(p, i)))
+			return getArg(p, i);
+	if (isVarConstant(mb, getArg(p, p->retc)))
+		return p->retc;
+	return -1;
+}
+
+str
+OPTcommonTermsImplementation(Client ctx, MalBlkPtr mb, MalStkPtr stk,
+							 InstrPtr pci)
+{
+	int i, j, k, barrier = 0, bailout = 0;
+	InstrPtr p, q;
+	int actions = 0;
+	int limit, slimit;
+	int duplicate;
+	int *alias = NULL;
+	int *hash = NULL, h;
+	int *list = NULL;
+	str msg = MAL_SUCCEED;
+
+	InstrPtr *old = NULL;
+	allocator *ta = MT_thread_getallocator();
+
+	old = mb->stmt;
+	limit = mb->stop;
+	slimit = mb->ssize;
+	for (i = 0; i < limit; i++) {
+		p = old[i];
+		if (isUpdateInstruction(p)) {
+			old = NULL;
+			goto wrapup1;
+		}
+	}
+
+	/* catch simple insert operations */
+	if (isSimpleSQL(mb) || MB_LARGE(mb)) {
+		old = NULL;
+		goto wrapup1;
+	}
+	for (i = 0; i < mb->stop; i++) {
+		p = mb->stmt[i];
+		if (getFunctionId(p) == replaceRef)
+			goto wrapup1;
+	}
+
+	(void) stk;
+	allocator_state ta_state = ma_open(ta);
+	alias = (int *) ma_zalloc(ta, sizeof(int) * mb->vtop);
+	list = (int *) ma_zalloc(ta, sizeof(int) * mb->stop);
+	hash = (int *) ma_zalloc(ta, sizeof(int) * mb->vtop);
+	if (alias == NULL || list == NULL || hash == NULL) {
+		msg = createException(MAL, "optimizer.commonTerms",
+							  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+		goto wrapup;
+	}
+
+	if (newMalBlkStmt(mb, mb->ssize) < 0) {
+		msg = createException(MAL, "optimizer.commonTerms",
+							  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+		old = NULL;
+		goto wrapup;
+	}
+
+	for (i = 0; mb->errors == NULL && i < limit; i++) {
+		p = old[i];
+		duplicate = 0;
+
+		for (k = 0; k < p->argc; k++)
+			if (alias[getArg(p, k)])
+				getArg(p, k) = alias[getArg(p, k)];
+
+		if (p->token == ENDsymbol) {
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			break;
+		}
+		/*
+		 * Any barrier block signals the end of this optimizer,
+		 * because the impact of the block can affect the common code eliminated.
+		 */
+		barrier |= (p->barrier == BARRIERsymbol || p->barrier == CATCHsymbol
+					|| p->barrier == RETURNsymbol);
+		/*
+		 * Also block further optimization when you have seen an assert().
+		 * This works particularly for SQL, because it is not easy to track
+		 * the BAT identifier aliases to look for updates. The sql.assert
+		 * at least tells us that an update is planned.
+		 * Like all optimizer decisions, it is safe to stop.
+		 */
+		barrier |= getFunctionId(p) == assertRef;
+		if (barrier || p->token == ASSIGNsymbol) {
+			TRC_DEBUG(MAL_OPTIMIZER, "Skipped[%d]: %d %d\n", i, barrier,
+					  p->retc == p->argc);
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			break;
+		}
+
+		/* when we enter a barrier block, we should ditch all previous instructions from consideration */
+		if (p->barrier == BARRIERsymbol || p->barrier == CATCHsymbol
+			|| p->barrier == RETURNsymbol) {
+			memset(list, 0, sizeof(int) * mb->stop);
+			memset(hash, 0, sizeof(int) * mb->vtop);
+		}
+		/* side-effect producing operators can never be replaced */
+		/* the same holds for function calls without an argument, it is
+		 * unclear where the results comes from (e.g. clock()) */
+		if (mayhaveSideEffects(ctx, mb, p, TRUE) || p->argc == p->retc) {
+			TRC_DEBUG(MAL_OPTIMIZER, "Skipped[%d] side-effect: %d\n", i,
+					  p->retc == p->argc);
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			continue;
+		}
+		/* simple SQL bind operations need not be merged, they are cheap
+		 * and/or can be duplicated eliminated elsewhere cheaper */
+		if (getModuleId(p) == sqlRef && (getFunctionId(p) != tidRef && getFunctionId(p) != bindRef)) {
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			continue;
+		}
+		if (getModuleId(p) == matRef) { /* mat.packIncrement has requirement on number of instructions (or that needs an update */
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			continue;
+		}
+
+		/* from here we have a candidate to look for a match */
+
+		h = hashInstruction(mb, p);
+
+		TRC_DEBUG(MAL_OPTIMIZER, "Candidate[%d] look at list[%d] => %d\n", i, h,
+				  hash[h]);
+		traceInstruction(mb, 0, p, LIST_MAL_ALL);
+
+		if (h < 0) {
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			continue;
+		}
+
+		bailout = 1024;			// don't run over long collision list
+		/* Look into the hash structure for matching instructions */
+		for (j = hash[h]; j > 0 && bailout-- > 0; j = list[j]) {
+			if ((q = getInstrPtr(mb, j))
+				&& getFunctionId(q) == getFunctionId(p)
+				&& getModuleId(q) == getModuleId(p)) {
+				TRC_DEBUG(MAL_OPTIMIZER,
+						  "Candidate[%d->%d] %d %d :%d %d %d=%d %d %d %d\n", j,
+						  list[j], hasSameSignature(mb, p, q),
+						  hasSameArguments(mb, p, q), q->token != ASSIGNsymbol,
+						  list[getArg(q, q->argc - 1)], i, !hasCommonResults(p,
+																			 q),
+						  !isUnsafeFunction(q), !isUpdateInstruction(q),
+						  isLinearFlow(q));
+				traceInstruction(mb, 0, q, LIST_MAL_ALL);
+
+				/*
+				 * Simple assignments are not replaced either. They should be
+				 * handled by the alias removal part. All arguments should
+				 * be assigned their value before instruction p.
+				 */
+				if (hasSameArguments(mb, p, q)
+					&& hasSameSignature(mb, p, q)
+					&& !hasCommonResults(p, q)
+					&& !isUnsafeFunction(q)
+					&& !isUpdateInstruction(q)
+					&& isLinearFlow(q)) {
+					if (safetyBarrier(p, q)) {
+						TRC_DEBUG(MAL_OPTIMIZER, "Safety barrier reached\n");
+						break;
+					}
+					duplicate = 1;
+					clrFunction(p);
+					p->argc = p->retc;
+					for (k = 0; k < q->retc; k++) {
+						alias[getArg(p, k)] = getArg(q, k);
+						/* we know the arguments fit so the instruction can safely be patched */
+						p = pushArgument(mb, p, getArg(q, k));
+					}
+
+					TRC_DEBUG(MAL_OPTIMIZER, "Modified expression %d -> %d ",
+							  getArg(p, 0), getArg(p, 1));
+					traceInstruction(mb, 0, p, LIST_MAL_ALL);
+
+					actions++;
+					break;		/* end of search */
+				}
+			} else if (isUpdateInstruction(p)) {
+				TRC_DEBUG(MAL_OPTIMIZER, "Skipped: %d %d\n",
+						  mayhaveSideEffects(ctx, mb, q, TRUE),
+						  isUpdateInstruction(p));
+				traceInstruction(mb, 0, q, LIST_MAL_ALL);
+			}
+		}
+
+		if (duplicate) {
+			pushInstruction(mb, p);
+			old[i] = NULL;
+			continue;
+		}
+		/* update the hash structure with another candidate for reuse */
+		TRC_DEBUG(MAL_OPTIMIZER,
+				  "Update hash[%d] - look at arg '%d' hash '%d' list '%d'\n", i,
+				  getArg(p, p->argc - 1), h, hash[h]);
+		traceInstruction(mb, 0, p, LIST_MAL_ALL);
+
+		if (!mayhaveSideEffects(ctx, mb, p, TRUE) && p->argc != p->retc
+			&& isLinearFlow(p) && !isUnsafeFunction(p)
+			&& !isUpdateInstruction(p)) {
+			list[i] = hash[h];
+			hash[h] = i;
+			pushInstruction(mb, p);
+			old[i] = NULL;
+		}
+	}
+	for (; i < slimit; i++)
+		if (old[i])
+			pushInstruction(mb, old[i]);
+	/* Defense line against incorrect plans */
+	if (actions > 0) {
+		msg = chkTypes(ctx->usermodule, mb, FALSE);
+		if (!msg)
+			msg = chkFlow(mb);
+		if (!msg)
+			msg = chkDeclarations(mb);
+	}
+  wrapup:
+	ma_close(&ta_state);
+  wrapup1:
+	/* keep actions taken as a fake argument */
+	(void) pushInt(mb, pci, actions);
+
+	return msg;
+}

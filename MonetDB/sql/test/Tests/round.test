@@ -1,0 +1,29 @@
+query DDDD rowsort
+SELECT ROUND(748.58, -1),ROUND(748.58, -2),ROUND(748.58, -3),ROUND(748.58, -4)
+----
+750.00
+700.00
+1000.00
+0.00
+
+query DD rowsort
+SELECT ROUND(123.9994, 3),ROUND(123.9995, 3)
+----
+123.9990
+124.0000
+
+query D rowsort
+SELECT ROUND(123.4545, 2)
+----
+123.4500
+
+query D rowsort
+SELECT ROUND(123.45, -2)
+----
+100.00
+
+query D rowsort
+SELECT ROUND(150.75, 0)
+----
+151.00
+

@@ -1,0 +1,66 @@
+query I nosort
+SELECT endswith(NULL, '')
+----
+NULL
+
+query I nosort
+SELECT endswith('', NULL)
+----
+NULL
+
+query I nosort
+SELECT endswith('', '')
+----
+1
+
+query I nosort
+SELECT endswith('johndoe', '')
+----
+1
+
+query I nosort
+SELECT endswith('', 'johndoe')
+----
+0
+
+query I nosort
+SELECT endswith('johndoe', 'doe')
+----
+1
+
+query I nosort
+SELECT endswith('one two three', 'three', true)
+----
+1
+
+query I nosort
+SELECT endswith('Thomas Müller', 'müller', true)
+----
+1
+
+query I nosort
+SELECT endswith('Thomas Müller', 'müller', false)
+----
+0
+
+# Ⱥ and ⱥ are not the same length in UTF-8 encoding
+query I nosort
+SELECT endswith('XXXȺ', 'ⱥ', false)
+----
+0
+
+query I nosort
+SELECT endswith('XXXȺ', 'ⱥ', true)
+----
+1
+
+query I nosort
+SELECT endswith('xxxⱥ', 'Ⱥ', false)
+----
+0
+
+query I nosort
+SELECT endswith('xxxⱥ', 'Ⱥ', true)
+----
+1
+

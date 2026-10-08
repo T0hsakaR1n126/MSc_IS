@@ -1,0 +1,98 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/* Author(s) Martin Kersten
+ * This module contains the framework for inclusion query transformers, i.e.
+ * C-programs geared at optimizing a piece of MAL.
+ * The query transformer appears at the language level as an ordinary function,
+ * but it is effective only at a specific execution phase.
+ *
+ * Each optimizer function has access to the runtime scope of the
+ * routine in which it is called. This can be used to maintain status
+ * information between successive calls.
+ *
+ * The routines below are linked with the kernel by default
+*/
+#include "monetdb_config.h"
+#include "mal_scenario.h"
+#include "optimizer.h"
+#include "optimizer_private.h"
+#include "opt_pipes.h"
+#include "mal_session.h"
+
+str
+optimizer_epilogue(Client ctx, void *ret)
+{
+	(void) ctx;
+	(void) ret;
+	opt_pipes_reset();
+	return MAL_SUCCEED;
+}
+
+#define optwrapper_pattern(NAME, DESC) \
+	pattern("optimizer", NAME, OPTwrapper, false, "", args(1,1, arg("",str))), \
+	pattern("optimizer", NAME, OPTwrapper, false, DESC, args(1,3, arg("",str),arg("mod",str),arg("fcn",str)))
+
+
+#include "mel.h"
+static mel_func optimizer_init_funcs[] = {
+	optwrapper_pattern("aliases", "Alias removal optimizer"),
+	optwrapper_pattern("coercions", "Handle simple type coercions"),
+	optwrapper_pattern("commonTerms", "Common sub-expression optimizer"),
+	optwrapper_pattern("candidates", "Mark candidate list variables"),
+	optwrapper_pattern("constants", "Duplicate constant removal optimizer"),
+	optwrapper_pattern("profiler", "Collect properties for the profiler"),
+	optwrapper_pattern("costModel",
+					   "Estimate the cost of a relational expression"),
+	optwrapper_pattern("dataflow", "Dataflow bracket code injection"),
+	optwrapper_pattern("deadcode", "Dead code optimizer"),
+	optwrapper_pattern("emptybind", "Evaluate empty set expressions"),
+	optwrapper_pattern("evaluate", "Evaluate constant expressions once"),
+	optwrapper_pattern("garbageCollector", "Garbage collector optimizer"),
+	optwrapper_pattern("generator", "Sequence generator optimizer"),
+	optwrapper_pattern("querylog", "Collect SQL query statistics"),
+	optwrapper_pattern("minimalpipe", "Fast compound minimal optimizer pipe"),
+	optwrapper_pattern("defaultpipe", "Fast compound default optimizer pipe"),
+	optwrapper_pattern("sequentialpipe", "Fast compound sequential optimizer pipe"),
+	optwrapper_pattern("recursivepipe", "Fast compound recursive optimizer pipe"),
+	optwrapper_pattern("nomitosispipe", "Fast compound optimizer pipe without mitosis"),
+	optwrapper_pattern("wrapper", "Fake optimizer"),
+	command("optimizer", "epilogue", optimizer_epilogue, false,
+			"release the resources held by the optimizer module",
+			args(1, 1, arg("", void))),
+	optwrapper_pattern("inline", "Expand inline functions"),
+	optwrapper_pattern("projectionpath", "Join path constructor"),
+	optwrapper_pattern("mergetable", "Resolve the multi-table definitions"),
+	optwrapper_pattern("mitosis",
+					   "Modify the plan to exploit parallel processing on multiple cores"),
+	optwrapper_pattern("multiplex", "Compiler for multiplexed instructions"),
+	optwrapper_pattern("matpack", "Unroll the mat.pack operation"),
+	optwrapper_pattern("reduce", "Reduce the stack space claims"),
+	optwrapper_pattern("remap",
+					   "Remapping function calls to a their multiplex variant"),
+	optwrapper_pattern("remoteQueries", "Resolve the multi-table definitions"),
+	optwrapper_pattern("reorder", "Reorder by dataflow dependencies"),
+	optwrapper_pattern("pushselect", "Push selects down projections"),
+	optwrapper_pattern("postfix", "Postfix the plan,e.g. pushing projections"),
+	optwrapper_pattern("strimps", "Use strimps index if appropriate"),
+	optwrapper_pattern("for", "Push for decompress down"),
+	optwrapper_pattern("dict", "Push dict decompress down"),
+	{.imp = NULL}
+};
+
+#include "mal_import.h"
+#ifdef _MSC_VER
+#undef read
+#pragma section(".CRT$XCU",read)
+#endif
+LIB_STARTUP_FUNC(init_optimizer_mal)
+{
+	mal_module2("optimizer", NULL, optimizer_init_funcs, NULL, NULL);
+}

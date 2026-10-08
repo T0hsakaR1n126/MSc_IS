@@ -1,0 +1,13 @@
+statement ok
+b := bat.new(:lng,10000001);
+bat.append(b,10000000000000000:lng);
+b1:= generator.series(0:lng, 10000000:lng);
+b2:= algebra.project(b1, 1:lng);
+bat.append(b, b2);
+s:dbl := aggr.sum(b);
+
+query T nosort
+io.print(s)
+----
+1.000000001e+16
+

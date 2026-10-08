@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0.  If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# For copyright information, see the file debian/copyright.
+
+# blank: any type file
+# -b: block device
+# -c: character device
+# -d: directory
+# -p: named pipe
+# -l: symbolic link
+# -s: socket file
+# --: regular file
+@CMAKE_INSTALL_FULL_BINDIR@/monetdbd(-.*)?						gen_context(system_u:object_r:monetdbd_exec_t,s0)
+@CMAKE_INSTALL_FULL_BINDIR@/mserver5(-.*)?						gen_context(system_u:object_r:mserver5_exec_t,s0)
+@CMAKE_INSTALL_PREFIX@/lib/systemd/system/monetdbd\.service			--	gen_context(system_u:object_r:monetdbd_unit_file_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/log/monetdb(/.*)?					gen_context(system_u:object_r:monetdbd_log_t,s0)
+@CMAKE_INSTALL_FULL_RUNSTATEDIR@/monetdb(/.*)?						gen_context(system_u:object_r:monetdbd_var_run_t,s0)
+# database "farm"
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/monetdb5/dbfarm(/.*)?				gen_context(system_u:object_r:mserver5_db_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/monetdb5/dbfarm/\.merovingian_properties	--	gen_context(system_u:object_r:monetdbd_etc_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/monetdb5/dbfarm/\.merovingian_lock		--	gen_context(system_u:object_r:monetdbd_lock_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/monetdb5/dbfarm/.*/\.gdk_lock		--	gen_context(system_u:object_r:mserver5_lock_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/lib/monetdb(/.*)?					gen_context(system_u:object_r:mserver5_db_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/lib/monetdb/\.merovingian_properties		--	gen_context(system_u:object_r:monetdbd_etc_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/lib/monetdb/\.merovingian_lock		--	gen_context(system_u:object_r:monetdbd_lock_t,s0)
+@CMAKE_INSTALL_FULL_LOCALSTATEDIR@/lib/monetdb/.*/\.gdk_lock			--	gen_context(system_u:object_r:mserver5_lock_t,s0)

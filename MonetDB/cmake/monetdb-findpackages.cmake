@@ -1,0 +1,154 @@
+#[[
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0.  If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# For copyright information, see the file debian/copyright.
+#]]
+
+# Detect required packages
+find_package(BISON 3.0 REQUIRED)
+find_package(Iconv)
+find_package(Threads)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(XXHASH REQUIRED libxxhash)
+if(${XXHASH_VERSION} VERSION_GREATER_EQUAL "0.8.0")
+  # with version at least 0.8.0 we inline all xxhash functions so we
+  # don't need the library
+  set(XXHASH_LDFLAGS "")
+  set(XXH_INLINE_ALL 1)
+endif()
+
+find_package(Python3 COMPONENTS Interpreter Development)
+
+if(WITH_RTREE)
+  find_package(RTree)
+endif()
+
+if(WITH_LZMA)
+  find_package(Lzma)
+endif()
+
+if(WITH_XML2)
+  find_package(LibXml2)
+endif()
+
+if(WITH_CMOCKA)
+  find_package(CMocka)
+  if (TARGET cmocka::cmocka)
+    set(CMOCKA_LIBRARY cmocka::cmocka)
+  endif()
+endif()
+
+if(WITH_PCRE)
+  find_package(PCRE)
+endif()
+
+if(WITH_BZ2)
+  find_package(BZip2)
+endif()
+
+if(WITH_CURL)
+  find_package(CURL)
+endif()
+
+if(WITH_ZLIB)
+  find_package(ZLIB)
+endif()
+
+if(WITH_LZ4)
+  find_package(LZ4 1.8.0)
+endif()
+
+if(WITH_SNAPPY)
+  find_package(Snappy)
+endif()
+
+if(WITH_ZSTD)
+  find_package(ZSTD)
+endif()
+
+if(WITH_BROTLI)
+  find_package(BROTLI)
+endif()
+
+if(WITH_PROJ)
+  find_package(Proj 6.0)
+endif()
+
+if(WITH_VALGRIND)
+  find_package(Valgrind)
+endif()
+
+if(WITH_READLINE)
+  find_package(Readline)
+endif()
+
+if(FITS)
+  find_package(CFitsIO)
+endif()
+
+if(NETCDF)
+  find_package(NetCDF)
+endif()
+
+find_package(KVM)
+
+if(GEOM)
+  find_package(Geos 3.10.0)
+endif()
+
+if(SHP)
+  if(NOT GEOS_FOUND)
+    message(STATUS "Disable SHP, geom module required for ESRI Shapefile vault")
+  else()
+    find_package(GDAL)
+  endif()
+endif()
+
+if(ODBC)
+  find_package(ODBC)
+  find_package(ODBCinst)
+endif()
+
+if(WITH_MALLOC)
+  find_package(PkgConfig QUIET)
+  if(${WITH_MALLOC} STREQUAL "mimalloc")
+    find_package(mimalloc REQUIRED)
+    add_library(Malloc::Malloc ALIAS mimalloc)
+    set(MALLOC_FOUND 1)
+  else()
+    pkg_search_module(PC_MALLOC ${WITH_MALLOC} lib${WITH_MALLOC})
+
+    if(PC_MALLOC_FOUND)
+      set(MALLOC_FOUND 1)
+      find_library(MALLOC_LIBRARY ${PC_MALLOC_LIBRARIES} HINTS ${PC_MALLOC_LIBDIR} ${PC_MALLOC_LIBRARY_DIRS})
+      add_library(Malloc::Malloc UNKNOWN IMPORTED)
+      set_target_properties(Malloc::Malloc
+        PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${PC_MALLOC_INCLUDE_DIR}"
+        IMPORTED_LINK_INTERFACE_LANGUAGES "C" IMPORTED_LOCATION "${MALLOC_LIBRARY}")
+    endif()
+  endif()
+endif()
+
+if(WITH_OPENSSL)
+  find_package(OpenSSL 1.1.1)
+endif()
+
+find_package(Sphinx)
+find_package(Semodule)
+find_package(Awk)
+
+if(TAGS)
+  find_program(CTAGS_PATH ctags)
+  if(CTAGS_PATH)
+    message(STATUS "Found ctags: ${CTAGS_PATH}")
+  endif(CTAGS_PATH)
+  find_program(CSCOPE_PATH cscope)
+  if(CSCOPE_PATH)
+    message(STATUS "Found cscope: ${CSCOPE_PATH}")
+  endif(CSCOPE_PATH)
+endif(TAGS)

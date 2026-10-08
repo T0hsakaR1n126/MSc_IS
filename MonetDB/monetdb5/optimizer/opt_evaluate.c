@@ -1,0 +1,260 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+#include "opt_evaluate.h"
+#include "opt_aliases.h"
+
+static bool
+OPTallConstant(Client ctx, MalBlkPtr mb, InstrPtr p)
+{
+	int i;
+	(void) ctx;
+
+	if (p->token != ASSIGNsymbol
+		&& getModuleId(p) != calcRef
+		&& getModuleId(p) != strRef
+		&& getModuleId(p) != mtimeRef
+		&& getModuleId(p) != mmathRef)
+		return false;
+	if (getModuleId(p) == mmathRef && strcmp(getFunctionId(p), "rand") == 0)
+		return false;
+
+	for (i = p->retc; i < p->argc; i++)
+		if (isVarConstant(mb, getArg(p, i)) == FALSE)
+			return false;
+	for (i = 0; i < p->retc; i++) {
+		if (isaBatType(getArgType(mb, p, i)))
+			return false;
+		if (p->unsafeProp || mb->unsafeProp)
+			return false;
+	}
+	return true;
+}
+
+static bool
+OPTsimpleflow(MalBlkPtr mb, int pc)
+{
+	int i, block = 0;
+	bool simple = true;
+	InstrPtr p;
+
+	for (i = pc; i < mb->stop; i++) {
+		p = getInstrPtr(mb, i);
+		if (blockStart(p))
+			block++;
+		if (blockExit(p))
+			block--;
+		if (blockCntrl(p))
+			simple = false;
+		if (block == 0) {
+			return simple;
+		}
+	}
+	return false;
+}
+
+/* barrier blocks can only be dropped when they are fully excluded.  */
+static str
+OPTremoveUnusedBlocks(Client ctx, MalBlkPtr mb)
+{
+	/* catch and remove constant bounded blocks */
+	int i, j = 0, action = 0, block = -1, skip = 0, multipass = 1;
+	InstrPtr p;
+	str msg = MAL_SUCCEED;
+
+	while (multipass--) {
+		block = -1;
+		skip = 0;
+		j = 0;
+		for (i = 0; i < mb->stop; i++) {
+			p = mb->stmt[i];
+			if (blockExit(p) && block == getArg(p, 0)) {
+				block = -1;
+				skip = 0;
+				freeInstruction(mb, p);
+				mb->stmt[i] = 0;
+				continue;
+			}
+			if (p->argc == 2 && blockStart(p) && block < 0
+				&& isVarConstant(mb, getArg(p, 1))
+				&& getArgType(mb, p, 1) == TYPE_bit) {
+				if (getVarConstant(mb, getArg(p, 1)).val.btval == 0) {
+					block = getArg(p, 0);
+					skip++;
+					action++;
+				}
+				// Try to remove the barrier statement itself (when true).
+				if (getVarConstant(mb, getArg(p, 1)).val.btval == 1
+					&& OPTsimpleflow(mb, i)) {
+					block = getArg(p, 0);
+					skip = 0;
+					action++;
+					freeInstruction(mb, p);
+					mb->stmt[i] = 0;
+					continue;
+				}
+			} else if (p->argc == 2 && blockStart(p) && block >= 0 && skip == 0
+					   && isVarConstant(mb, getArg(p, 1))
+					   && getArgType(mb, p, 1) == TYPE_bit && multipass == 0)
+				multipass++;
+			if (skip) {
+				freeInstruction(mb, p);
+				mb->stmt[i] = 0;
+			} else
+				mb->stmt[j++] = p;
+		}
+		mb->stop = j;
+		for (; j < i; j++)
+			mb->stmt[j] = NULL;
+	}
+	if (action)
+		msg = chkTypes(ctx->usermodule, mb, TRUE);
+	return msg;
+}
+
+str
+OPTevaluateImplementation(Client ctx, MalBlkPtr mb, MalStkPtr stk,
+						  InstrPtr pci)
+{
+	InstrPtr p;
+	int i, k, limit, *alias = 0, barrier;
+	MalStkPtr env = NULL;
+	int actions = 0, constantblock = 0;
+	int *assigned = 0, use;
+	str msg = MAL_SUCCEED;
+	allocator *ta = MT_thread_getallocator();
+
+	(void) stk;
+
+	if (mb->inlineProp || MB_LARGE(mb)) {
+		(void) pushInt(mb, pci, actions);
+		return MAL_SUCCEED;
+	}
+
+	allocator_state ta_state = ma_open(ta);
+	assigned = (int *) ma_zalloc(ta, sizeof(int) * mb->vtop);
+	alias = (int *) ma_zalloc(ta, mb->vtop * sizeof(int) * 2);	/* we introduce more */
+	if (assigned == NULL || alias == NULL) {
+		ma_close(&ta_state);
+		throw(MAL, "optimizer.evaluate", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+	}
+	// arguments are implicitly assigned by context
+	p = getInstrPtr(mb, 0);
+	for (k = p->retc; k < p->argc; k++) {
+		assert(getArg(p, k) >= 0);
+		assigned[getArg(p, k)]++;
+	}
+	limit = mb->stop;
+	for (i = 1; i < limit; i++) {
+		p = getInstrPtr(mb, i);
+		// The double count emerging from a barrier exit is ignored.
+		if (!blockExit(p) || (blockExit(p) && p->retc != p->argc))
+			for (k = 0; k < p->retc; k++)
+				if (p->retc != p->argc || p->token != ASSIGNsymbol) {
+					assert(getArg(p, k) >= 0);
+					assigned[getArg(p, k)]++;
+				}
+	}
+
+	for (i = 1; i < limit && ctx->mode != FINISHCLIENT; i++) {
+		p = getInstrPtr(mb, i);
+		// to avoid management of duplicate assignments over multiple blocks
+		// we limit ourselves to evaluation of the first assignment only.
+		assert(getArg(p, 0) >= 0);
+		use = assigned[getArg(p, 0)] == 1 && !(p->argc == p->retc
+											   && blockExit(p));
+		for (k = p->retc; k < p->argc; k++)
+			if (alias[getArg(p, k)])
+				getArg(p, k) = alias[getArg(p, k)];
+		/* be aware that you only assign once to a variable */
+		if (use && p->retc == 1 && getFunctionId(p)
+			&& OPTallConstant(ctx, mb, p) && !isUnsafeFunction(p)) {
+			barrier = p->barrier;
+			p->barrier = 0;
+			if (env == NULL) {
+				env = prepareMALstack(mb->ma, mb, 2 * mb->vsize);
+				if (!env) {
+					msg = createException(MAL, "optimizer.evaluate",
+										  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+					p->barrier = barrier;
+					goto wrapup;
+				}
+				env->keepAlive = TRUE;
+			}
+			msg = reenterMAL(ctx, mb, i, i + 1, env);
+			p->barrier = barrier;
+			if (msg == MAL_SUCCEED) {
+				int nvar;
+				ValRecord cst;
+
+				actions++;
+				cst.vtype = 0;
+				if (VALcopy(mb->ma, &cst, &env->stk[getArg(p, 0)]) == NULL) {
+					msg = createException(MAL, "optimizer.evaluate",
+										  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+					goto wrapup;
+				}
+				/* You may not overwrite constants.  They may be used by
+				 * other instructions */
+				nvar = defConstant(mb, getArgType(mb, p, 0), &cst);
+				if (nvar >= 0)
+					getArg(p, 1) = nvar;
+				if (nvar >= env->stktop) {
+					if (VALcopy(mb->ma, &env->stk[getArg(p, 1)],
+								&getVarConstant(mb, getArg(p, 1))) == NULL) {
+						msg = createException(MAL, "optimizer.evaluate",
+											  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+						goto wrapup;
+					}
+					env->stktop = getArg(p, 1) + 1;
+				}
+				alias[getArg(p, 0)] = getArg(p, 1);
+				p->argc = 2;
+				p->token = ASSIGNsymbol;
+				clrFunction(p);
+				p->barrier = barrier;
+				/* freeze the type */
+				setVarFixed(mb, getArg(p, 1));
+			} else {
+				/* if there is an error, we should postpone message handling,
+				   as the actual error (eg. division by zero ) may not happen) */
+				msg = MAL_SUCCEED;
+				mb->errors = NULL;
+			}
+		}
+		constantblock += blockStart(p) && OPTallConstant(ctx, mb, p);	/* default */
+	}
+	// produces errors in SQL when enabled
+	if (constantblock)
+		msg = OPTremoveUnusedBlocks(ctx, mb);
+
+	/* Defense line against incorrect plans */
+	/* Plan is unaffected */
+	if (!msg)
+		msg = chkTypes(ctx->usermodule, mb, FALSE);
+	if (!msg)
+		msg = chkFlow(mb);
+	if (!msg)
+		msg = chkDeclarations(mb);
+	/* keep all actions taken as a post block comment */
+
+  wrapup:
+	ma_close(&ta_state);
+
+	/* keep actions taken as a fake argument */
+	(void) pushInt(mb, pci, actions);
+
+	if (env) {
+		assert(env->stktop < env->stksize);
+		freeStack(env);
+	}
+	return msg;
+}

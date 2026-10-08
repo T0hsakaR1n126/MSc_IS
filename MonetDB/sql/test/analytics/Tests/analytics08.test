@@ -1,0 +1,95 @@
+statement ok
+create table analytics (aa int, bb int)
+
+statement ok
+insert into analytics values (15, 3), (3, 1), (2, 1), (5, 3), (NULL, 2), (3, 2), (4, 1), (6, 3), (8, 2), (NULL, 4)
+
+query I nosort
+select first_value(aa) over (w order by bb, aa nulls first) from analytics window w as (partition by bb) order by 1 nulls first
+----
+NULL
+NULL
+NULL
+NULL
+2
+2
+2
+5
+5
+5
+
+query II nosort
+select first_value(aa) over (w1 order by bb, aa nulls first),
+       last_value(aa) over (w2 order by bb, aa nulls first) from analytics window w1 as (w2), w2 as (), w3 as (w1) order by bb, aa nulls first
+----
+2
+2
+2
+3
+2
+4
+2
+NULL
+2
+3
+2
+8
+2
+5
+2
+6
+2
+15
+2
+NULL
+
+query III nosort
+select first_value(aa) over (w1 partition by bb),
+       last_value(aa) over (w2 range unbounded preceding),
+       count(aa) over (w3) from analytics window w1 as (w2), w2 as (order by bb, aa nulls first), w3 as (w2 partition by bb) order by bb, aa nulls first
+----
+2
+2
+1
+2
+3
+2
+2
+4
+3
+NULL
+NULL
+0
+NULL
+3
+1
+NULL
+8
+2
+5
+5
+1
+5
+6
+2
+5
+15
+3
+NULL
+NULL
+0
+
+statement error
+select first_value(aa) over (w1 order by bb) from analytics
+
+statement error
+select first_value(aa) over (w1 order by aa),
+       last_value(aa) over (w2) from analytics window w1 as (w2), w2 as (order by bb)
+
+statement error
+select first_value(aa) over (w1 order by bb),
+       last_value(aa) over (w2 order by bb) from analytics window w1 as (w2), w2 as (w3), w3 as (w1)
+
+statement ok
+drop table analytics
+

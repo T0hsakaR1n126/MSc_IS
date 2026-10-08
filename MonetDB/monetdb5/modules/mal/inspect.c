@@ -1,0 +1,661 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/*
+ * author Martin Kersten
+ * Inspection
+ * This module introduces a series of commands that provide access
+ * to information stored within the interpreter data structures.
+ * It's primary use is debugging.
+ * In all cases, the pseudo BAT operation is returned that
+ * should be garbage collected after being used.
+ *
+ * The main performance drain would be to use a pseudo BAT directly to
+ * successively access it components. This can be avoided by first assigning
+ * the pseudo BAT to a variable.
+ */
+#include "monetdb_config.h"
+#include "gdk.h"
+#include <time.h>
+#include "mal_resolve.h"
+#include "mal_client.h"
+#include "mal_exception.h"
+#include "mal_interpreter.h"
+#include "mal_listing.h"
+#include "mal_namespace.h"
+
+/*
+ * Symbol table
+ * Mal symbol table and environment analysis.
+ *
+ * Collect symbol table information in a series of BATs for analysis
+ * and display. Note, the elements are aligned using a counter,
+ * which makes it susceptable for intermediate updates
+ */
+
+static str
+INSPECTgetAllFunctions(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	Module s;
+	Symbol t;
+	int i, j;
+	Module *moduleList;
+	int length;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	bat *ret = getArgReference_bat(stk, pci, 0);
+
+	(void) mb;
+	if (b == 0)
+		throw(MAL, "inspect.getgetFunctionId", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	allocator *ta = MT_thread_getallocator();
+	allocator_state ta_state = ma_open(ta);
+	getModuleList(ta, &moduleList, &length);
+	if (moduleList == NULL)
+		goto bailout;
+	for (j = -1; j < length; j++) {
+		s = j < 0 ? cntxt->usermodule : moduleList[j];
+		for (i = 0; s && i < MAXSCOPE; i++) {
+			if (s->space[i]) {
+				for (t = s->space[i]; t; t = t->peer) {
+					InstrPtr sig = getSignature(t);
+					if (BUNappend(b, getFunctionId(sig), false) != GDK_SUCCEED)
+						goto bailout;
+				}
+			}
+		}
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	ma_close(&ta_state);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	ma_close(&ta_state);
+	throw(MAL, "inspect.getgetFunctionId", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetAllModules(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	Module s;
+	Symbol t;
+	int i, j;
+	Module *moduleList;
+	int length;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	bat *ret = getArgReference_bat(stk, pci, 0);
+
+	(void) mb;
+	if (b == 0)
+		throw(MAL, "inspect.getmodule", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	allocator *ta = MT_thread_getallocator();
+	allocator_state ta_state = ma_open(ta);
+	getModuleList(ta, &moduleList, &length);
+	if (moduleList == NULL)
+		goto bailout;
+	for (j = -1; j < length; j++) {
+		s = j < 0 ? cntxt->usermodule : moduleList[j];
+		for (i = 0; s && i < MAXSCOPE; i++) {
+			if (s->space[i]) {
+				for (t = s->space[i]; t; t = t->peer) {
+					InstrPtr sig = getSignature(t);
+
+					if (BUNappend(b, getModuleId(sig), false) != GDK_SUCCEED)
+						goto bailout;
+				}
+			}
+		}
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	ma_close(&ta_state);
+
+	return MAL_SUCCEED;
+  bailout:
+	ma_close(&ta_state);
+	BBPreclaim(b);
+	throw(MAL, "inspect.getmodule", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetkind(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	Module s;
+	Symbol t;
+	int i, j;
+	Module *moduleList;
+	int length;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	bat *ret = getArgReference_bat(stk, pci, 0);
+
+	(void) mb;
+	if (b == 0)
+		throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	allocator *ta = MT_thread_getallocator();
+	allocator_state ta_state = ma_open(ta);
+	getModuleList(ta, &moduleList, &length);
+	if (moduleList == NULL)
+		goto bailout;
+	for (j = -1; j < length; j++) {
+		s = j < 0 ? cntxt->usermodule : moduleList[j];
+		for (i = 0; s && i < MAXSCOPE; i++) {
+			if (s->space[i]) {
+				for (t = s->space[i]; t; t = t->peer) {
+					InstrPtr sig = getSignature(t);
+					str kind = operatorName(sig->token);
+					if (BUNappend(b, kind, false) != GDK_SUCCEED)
+						goto bailout;
+				}
+			}
+		}
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	ma_close(&ta_state);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	ma_close(&ta_state);
+	throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetAllSignatures(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	Module s;
+	Symbol t;
+	int i, j;
+	Module *moduleList;
+	int length;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	char sig[BLOCK], *a;
+	bat *ret = getArgReference_bat(stk, pci, 0);
+
+	(void) mb;
+	if (b == 0)
+		throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	allocator *ta = MT_thread_getallocator();
+	allocator_state ta_state = ma_open(ta);
+	getModuleList(ta, &moduleList, &length);
+	if (moduleList == NULL)
+		goto bailout;
+	for (j = -1; j < length; j++) {
+		s = j < 0 ? cntxt->usermodule : moduleList[j];
+		for (i = 0; s && i < MAXSCOPE; i++)
+			if (s->space[i]) {
+				for (t = s->space[i]; t; t = t->peer) {
+					fcnDefinition(t->def, getSignature(t), sig, 0, sig, BLOCK);
+					a = strstr(sig, "address");
+					if (a)
+						*a = 0;
+					if (BUNappend(b, (a = strchr(sig, '(')) ? a : "", false) != GDK_SUCCEED)
+						goto bailout;
+				}
+			}
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	ma_close(&ta_state);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	ma_close(&ta_state);
+	throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+#if 0
+static str
+INSPECTgetAllAddresses(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	Module s;
+	Symbol t;
+	int i, j;
+	Module *moduleList;
+	int length;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	char sig[BLOCK], *a;
+	bat *ret = getArgReference_bat(stk, pci, 0);
+
+	(void) mb;
+
+	if (b == 0)
+		throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	allocator *ta = MT_thread_getallocator();
+	allocator_state ta_state = ma_open(ta);
+	getModuleList(ta, &moduleList, &length);
+	if (moduleList == NULL)
+		goto bailout;
+	for (j = -1; j < length; j++) {
+		s = j < 0 ? cntxt->usermodule : moduleList[j];
+		for (i = 0; s && i < MAXSCOPE; i++)
+			if (s->space[i]) {
+				for (t = s->space[i]; t; t = t->peer) {
+					fcnDefinition(t->def, getSignature(t), sig, 0, sig, BLOCK);
+					a = strstr(sig, "address");
+					if (a)
+						for (a = a + 7; isspace((unsigned char) *a); a++) ;
+					if (BUNappend(b, (a ? a : "nil"), false) != GDK_SUCCEED)
+						goto bailout;
+				}
+			}
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	ma_close(&ta_state);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	ma_close(&ta_state);
+	throw(MAL, "inspect.get", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+#endif
+
+static str
+INSPECTgetDefinition(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	bat *ret = getArgReference_bat(stk, pci, 0);
+	str *mod = getArgReference_str(stk, pci, 1);
+	str *fcn = getArgReference_str(stk, pci, 2);
+	Symbol s;
+	BAT *b;
+	(void) mb;
+
+	s = findSymbol(cntxt->usermodule, putName(*mod), putName(*fcn));
+	if (s == 0)
+		throw(MAL, "inspect.getDefinition", RUNTIME_SIGNATURE_MISSING);
+
+	b = COLnew(0, TYPE_str, 256, TRANSIENT);
+	if (b == 0)
+		throw(MAL, "inspect.getDefinition", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	while (s) {
+		int i;
+		str ps;
+
+		for (i = 0; i < s->def->stop; i++) {
+			if ((ps = instruction2str(s->def, 0, getInstrPtr(s->def, i), 0)) == NULL)
+				goto bailout;
+			if (BUNappend(b, ps + 1, false) != GDK_SUCCEED) {
+				goto bailout;
+			}
+		}
+		s = s->peer;
+	}
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	throw(MAL, "inspect.getDefinition", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetExistence(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	(void) mb;
+
+	bit *ret = getArgReference_bit(stk, pci, 0);
+	str *mod = getArgReference_str(stk, pci, 1);
+	str *fcn = getArgReference_str(stk, pci, 2);
+
+	Symbol s = findSymbol(cntxt->usermodule, getName(*mod), putName(*fcn));
+
+	*ret = (s != NULL);
+
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTgetSignature(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	bat *ret = getArgReference_bat(stk, pci, 0);
+	str *mod = getArgReference_str(stk, pci, 1);
+	str *fcn = getArgReference_str(stk, pci, 2);
+	Symbol s;
+	str ps, tail;
+	BAT *b;
+	(void) mb;
+
+	s = findSymbol(cntxt->usermodule, getName(*mod), putName(*fcn));
+	if (s == 0)
+		throw(MAL, "inspect.getSignature", RUNTIME_SIGNATURE_MISSING);
+	b = COLnew(0, TYPE_str, 12, TRANSIENT);
+	if (b == 0)
+		throw(MAL, "inspect.getSignature", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	while (s != NULL) {
+		if (strcmp(s->name, *fcn) == 0) {
+			InstrPtr p = getSignature(s);
+			char *c, *w;
+
+			ps = instruction2str(s->def, 0, p, 0);
+			if (ps == 0) {
+				continue;
+			}
+			c = strchr(ps, '(');
+			if (c == 0) {
+				continue;
+			}
+			tail = strstr(c, "address");
+			if (tail)
+				*tail = 0;
+			if (tail && (w = strchr(tail, ';')))
+				*w = 0;
+			if (BUNappend(b, c, false) != GDK_SUCCEED) {
+				goto bailout;
+			}
+		}
+		s = s->peer;
+	}
+
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	throw(MAL, "inspect.getSignature", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetComment(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	bat *ret = getArgReference_bat(stk, pci, 0);
+	str *mod = getArgReference_str(stk, pci, 1);
+	str *fcn = getArgReference_str(stk, pci, 2);
+	Symbol s;
+	BAT *b;
+	(void) mb;
+
+	s = findSymbol(cntxt->usermodule, getName(*mod), putName(*fcn));
+	if (s == 0)
+		throw(MAL, "inspect.getComment", RUNTIME_SIGNATURE_MISSING);
+	b = COLnew(0, TYPE_str, 12, TRANSIENT);
+	if (b == 0)
+		throw(MAL, "inspect.getComment", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	while (s != NULL) {
+		if (strcmp(s->name, *fcn) == 0 &&
+			BUNappend(b, s->def->help, false) != GDK_SUCCEED)
+			goto bailout;
+		s = s->peer;
+	}
+
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	throw(MAL, "inspect.getComment", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetSource(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	str *ret = getArgReference_str(stk, pci, 0);
+	str *mod = getArgReference_str(stk, pci, 1);
+	str *fcn = getArgReference_str(stk, pci, 2);
+	Symbol s;
+	char *buf;
+	size_t len, lim;
+	(void) mb;
+
+	s = findSymbol(cntxt->usermodule, getName(*mod), putName(*fcn));
+	if (s == 0)
+		throw(MAL, "inspect.getSource", RUNTIME_SIGNATURE_MISSING);
+
+	buf = (char *) ma_alloc(mb->ma, BUFSIZ);
+	if (buf == NULL)
+		throw(MAL, "inspect.getSource", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+	snprintf(buf, BUFSIZ, "%s.%s", *mod, *fcn);
+	buf[0] = 0;
+	len = 0;
+	lim = BUFSIZ;
+
+	while (s) {
+		int i;
+		str ps;
+
+		for (i = 0; i < s->def->stop; i++) {
+			if ((ps = instruction2str(s->def, 0, getInstrPtr(s->def, i),
+									  LIST_MAL_NAME)) == NULL) {
+				throw(MAL, "inspect.getSource",
+					  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+			}
+			if (strlen(ps) >= lim - len) {
+				/* expand the buffer */
+				buf = ma_realloc(mb->ma, buf, lim + BUFSIZ, lim);
+				if (buf == NULL) {
+					throw(MAL, "inspect.getSource",
+						  SQLSTATE(HY013) MAL_MALLOC_FAIL);
+				}
+				lim += BUFSIZ;
+			}
+			strcat(buf + len, ps);
+			len += strlen(ps);
+			buf[len++] = '\n';
+			buf[len] = 0;
+		}
+		s = s->peer;
+	}
+	*ret = buf;
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTatom_names(Client ctx, bat *ret)
+{
+	(void) ctx;
+	int i;
+	BAT *b = COLnew(0, TYPE_str, 256, TRANSIENT);
+
+	if (b == 0)
+		throw(MAL, "inspect.getAtomNames", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	for (i = 0; i < GDKatomcnt; i++)
+		if (BUNappend(b, ATOMname(i), false) != GDK_SUCCEED)
+			goto bailout;
+
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	throw(MAL, "inspect.getAtomNames", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+static str
+INSPECTgetEnvironment(Client ctx, bat *ret, bat *ret2)
+{
+	(void) ctx;
+	BAT *k, *v;
+
+	if (GDKcopyenv(&k, &v, false) != GDK_SUCCEED)
+		throw(MAL, "inspect.getEnvironment", GDK_EXCEPTION);
+
+	*ret = k->batCacheid;
+	BBPkeepref(k);
+	*ret2 = v->batCacheid;
+	BBPkeepref(v);
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTgetEnvironmentKey(Client ctx, str *ret, const char *const *key)
+{
+	(void) ctx;
+	const char *s;
+	*ret = 0;
+	allocator *ma = ctx->curprg->def->ma;
+	assert(ma);
+
+	s = GDKgetenv(*key);
+	if (s == 0)
+		throw(MAL, "inspect.getEnvironment",
+			  "environment variable '%s' not found", *key);
+	*ret = ma_strdup(ma, s);
+	if (*ret == NULL)
+		throw(MAL, "inspect.getEnvironment", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTgetDatabaseName(Client ctx, str *ret)
+{
+	(void) ctx;
+	const char *key = "gdk_dbname";
+	return INSPECTgetEnvironmentKey(ctx, ret, &key);
+}
+
+static str
+INSPECTatom_sizes(Client ctx, bat *ret)
+{
+	(void) ctx;
+	int i;
+	int s;
+	BAT *b = COLnew(0, TYPE_int, 256, TRANSIENT);
+
+	if (b == 0)
+		throw(MAL, "inspect.getAtomSizes", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+
+	for (i = 0; i < GDKatomcnt; i++) {
+		s = ATOMsize(i);
+		if (BUNappend(b, &s, false) != GDK_SUCCEED)
+			goto bailout;
+	}
+
+	*ret = b->batCacheid;
+	BBPkeepref(b);
+
+	return MAL_SUCCEED;
+  bailout:
+	BBPreclaim(b);
+	throw(MAL, "inspect.getAtomSizes", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+}
+
+/* calculate to trimmed storage space */
+static lng
+INSPECTcalcSize(MalBlkPtr mb)
+{
+	lng size, args = 0, i;
+	InstrPtr p;
+
+	for (i = 0; i < mb->stop; i++) {
+		p = getInstrPtr(mb, i);
+		args += (p->argc - 1) * sizeof(*p->argv);
+	}
+	size = (offsetof(InstrRecord, argv) + sizeof(InstrPtr)) * mb->stop;
+	size += sizeof(VarRecord) * mb->vtop;
+	size += args;
+	return size;
+}
+
+static str
+INSPECTgetSize(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr p)
+{
+	lng *ret = getArgReference_lng(stk, p, 0);
+
+
+	*ret = INSPECTcalcSize(mb);
+	(void) cntxt;
+	(void) mb;
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTgetFunctionSize(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	lng *ret = getArgReference_lng(stk, pci, 0);
+	const char *mod = *getArgReference_str(stk, pci, 1);
+	const char *fcn = *getArgReference_str(stk, pci, 2);
+	Symbol s;
+	(void) mb;
+
+	s = findSymbol(cntxt->usermodule, getName(mod), putName(fcn));
+	if (s == 0)
+		throw(MAL, "inspect.getSize", RUNTIME_SIGNATURE_MISSING);
+	*ret = INSPECTcalcSize(s->def);
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTequalType(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	bit *ret;
+	(void) stk;
+	(void) cntxt;
+	ret = getArgReference_bit(stk, pci, 0);
+	*ret = getArgType(mb, pci, 1) == getArgType(mb, pci, 2);
+	return MAL_SUCCEED;
+}
+
+static str
+INSPECTtypeName(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	str *hn, *tn = 0;
+
+	hn = getArgReference_str(stk, pci, 0);
+
+	(void) cntxt;
+	if (pci->retc == 2) {
+		tn = getArgReference_str(stk, pci, 1);
+		*hn = getTypeName(mb->ma, TYPE_oid);
+		*tn = getTypeName(mb->ma, getBatType(getArgType(mb, pci, 2)));
+	} else if (isaBatType(getArgType(mb, pci, 1))) {
+		bat *bid = getArgReference_bat(stk, pci, 1);
+		BAT *b;
+		if ((b = BBPquickdesc(*bid)))
+			*hn = getTypeName(mb->ma, newBatType(b->ttype));
+		else
+			*hn = getTypeName(mb->ma, getArgType(mb, pci, 1));
+	} else
+		*hn = getTypeName(mb->ma, getArgType(mb, pci, 1));
+	return MAL_SUCCEED;
+}
+
+#include "mel.h"
+static mel_func inspect_init_funcs[] = {
+ pattern("inspect", "getDefinition", INSPECTgetDefinition, false, "Returns a string representation of a specific function.", args(1,3, batarg("",str),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getExistence", INSPECTgetExistence, false, "Returns a boolean indicating existence of a definition of a specific function.", args(1,3, arg("",bit),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getSignature", INSPECTgetSignature, false, "Returns the function signature(s).", args(1,3, batarg("",str),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getComment", INSPECTgetComment, false, "Returns the function help information.", args(1,3, batarg("",str),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getSource", INSPECTgetSource, false, "Return the original input for a function.", args(1,3, arg("",str),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getKind", INSPECTgetkind, false, "Obtain the instruction kind.", args(1,1, batarg("",str))),
+ pattern("inspect", "getModule", INSPECTgetAllModules, false, "Obtain the function name.", args(1,1, batarg("",str))),
+ pattern("inspect", "getFunction", INSPECTgetAllFunctions, false, "Obtain the function name.", args(1,1, batarg("",str))),
+ pattern("inspect", "getSignatures", INSPECTgetAllSignatures, false, "Obtain the function signatures.", args(1,1, batarg("",str))),
+ pattern("inspect", "getSize", INSPECTgetSize, false, "Return the storage size for the current function (in bytes).", args(1,1, arg("",lng))),
+ pattern("inspect", "getSize", INSPECTgetFunctionSize, false, "Return the storage size for a function (in bytes).", args(1,3, arg("",lng),arg("mod",str),arg("fcn",str))),
+ pattern("inspect", "getType", INSPECTtypeName, false, "Return the concrete type of a variable (expression).", args(1,2, arg("",str),argany("v",1))),
+ pattern("inspect", "equalType", INSPECTequalType, false, "Return true if both operands are of the same type", args(1,3, arg("",bit),argany("l",0),argany("r",0))),
+ command("inspect", "getAtomNames", INSPECTatom_names, false, "Collect a BAT with the atom names.", args(1,1, batarg("",str))),
+ command("inspect", "getAtomSizes", INSPECTatom_sizes, false, "Collect a BAT with the atom sizes.", args(1,1, batarg("",int))),
+ command("inspect", "getEnvironment", INSPECTgetEnvironment, false, "Collect the environment variables.", args(2,2, batarg("k",str),batarg("v",str))),
+ command("inspect", "getEnvironment", INSPECTgetEnvironmentKey, false, "Get the value of an environment variable", args(1,2, arg("",str),arg("k",str))),
+ command("inspect", "getDatabaseName", INSPECTgetDatabaseName, false, "Return database name", args(1,1, arg("",str))),
+ { .imp=NULL }
+};
+#include "mal_import.h"
+#ifdef _MSC_VER
+#undef read
+#pragma section(".CRT$XCU",read)
+#endif
+LIB_STARTUP_FUNC(init_inspect_mal)
+{ mal_module("inspect", NULL, inspect_init_funcs); }

@@ -1,0 +1,77 @@
+statement ok
+start transaction
+
+statement ok
+create table input_double (a1 string, a2 double, prob double)
+
+statement ok
+INSERT INTO input_double VALUES ('latitude',52.0,1.0)
+
+statement ok
+INSERT INTO input_double VALUES ('longitude',5.1,1.0)
+
+statement ok
+CREATE TABLE v(a1 int, a2 point, prob double)
+
+statement ok
+insert into v values(0,'point(50 4)',1)
+
+statement ok
+insert into v values(1,'point(51 5)',1)
+
+statement ok
+insert into v values(2,'point(52 6)',1)
+
+statement ok
+CREATE VIEW p AS
+SELECT ST_Point(a1,a2) AS a1, prob AS prob
+FROM (
+	  SELECT tmp_2.a2 AS a1, tmp_3.a2 AS a2, tmp_2.prob * tmp_3.prob AS prob
+	  FROM
+	    (SELECT a2, prob FROM input_double WHERE a1 = 'latitude') AS tmp_2,
+	    (SELECT a2, prob FROM input_double WHERE a1 = 'longitude') AS tmp_3
+) AS tmp
+
+statement ok
+CREATE VIEW r AS
+SELECT a1 AS a1, ST_Distance(a2,a3) AS prob
+FROM (
+	  SELECT v.a1 AS a1, v.a2 AS a2, p.a1 AS a3, v.prob * p.prob AS prob
+	  FROM v,p
+) AS tmp
+
+query IR rowsort
+select * from r
+----
+0
+2.283
+1
+1.005
+2
+0.900
+
+skipif knownfail
+query T nosort
+EXPLAIN SHOW DETAILS select * from r
+----
+project (
+| project (
+| | crossproduct (
+| | | table("sys"."v") [ "v"."a1" NOT NULL UNIQUE, "v"."a2" NOT NULL ],
+| | | project (
+| | | | crossproduct (
+| | | | | select (
+| | | | | | table("sys"."input_double") [ "input_double"."a1" NOT NULL UNIQUE, "input_double"."a2" NOT NULL UNIQUE ]
+| | | | | ) [ ("input_double"."a1" NOT NULL UNIQUE) = (varchar "latitude") ],
+| | | | | select (
+| | | | | | table("sys"."input_double") [ "input_double"."a1" NOT NULL UNIQUE, "input_double"."a2" NOT NULL UNIQUE ]
+| | | | | ) [ ("input_double"."a1" NOT NULL UNIQUE) = (varchar "longitude") ]
+| | | | ) [  ]
+| | | ) [ "sys"."st_point"("input_double"."a2" NOT NULL, "input_double"."a2" NOT NULL) as "a1" ]
+| | ) [  ]
+| ) [ "v"."a1" NOT NULL as "a1", "sys"."st_distance"("v"."a2" NOT NULL, "a1") as "prob" ]
+) [ "a1" NOT NULL as "r"."a1", "prob" as "r"."prob" ]
+
+statement ok
+rollback
+

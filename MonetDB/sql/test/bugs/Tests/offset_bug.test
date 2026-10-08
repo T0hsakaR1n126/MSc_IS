@@ -1,0 +1,88 @@
+statement ok
+CREATE TABLE query_users (
+        user_id INT NOT NULL AUTO_INCREMENT,
+        user_name VARCHAR(20),
+        PRIMARY KEY (user_id)
+)
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (1, 'john')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (2, 'jack')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (3, 'ed')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (4, 'wendy')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (5, 'laura')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (6, 'ralph')
+
+statement ok
+INSERT INTO query_users (user_id, user_name) VALUES (7, 'fido')
+
+query IT nosort
+select * from query_users order by user_name
+----
+3
+ed
+7
+fido
+2
+jack
+1
+john
+5
+laura
+6
+ralph
+4
+wendy
+
+statement ok rowcount 7
+select * from query_users
+
+query IT nosort
+SELECT query_users.user_id, query_users.user_name
+FROM query_users ORDER BY query_users.user_id
+LIMIT 3 OFFSET 2
+----
+3
+ed
+4
+wendy
+5
+laura
+
+statement ok rowcount 3
+SELECT query_users.user_id, query_users.user_name
+FROM query_users
+LIMIT 3 OFFSET 2
+
+query IT nosort
+select * from query_users order BY user_name
+OFFSET 2
+----
+2
+jack
+1
+john
+5
+laura
+6
+ralph
+4
+wendy
+
+statement ok rowcount 5
+select * from query_users
+OFFSET 2
+
+statement ok
+drop table query_users
+

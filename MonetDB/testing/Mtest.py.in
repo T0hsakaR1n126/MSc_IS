@@ -1,0 +1,4558 @@
+#!@PYTHON@
+
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0.  If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# For copyright information, see the file debian/copyright.
+
+import os
+import sys
+import shutil
+import shlex
+import platform
+import re
+import secrets
+import time
+import socket
+import struct
+import signal
+import fnmatch
+import http
+import http.server
+import datetime
+import pymonetdb  # check for pymonetdb early: it is essential for our work
+import concurrent.futures
+
+MonetDB_VERSION = '@MONETDB_VERSION@'.split('.')
+
+procdebug = False
+verbose = False
+approve = False
+replace = False
+threshold = None
+stop_crash = False
+
+initdb = None
+single_in_memory = False
+restart = False
+produce_html = True
+ignore_conditions = False
+skip_timeout = False
+usetcp = False                  # use UNIX domain socket if available
+
+# extra mserver5 options
+mserver5_opts = []
+
+global_timeout = 0
+start_time = time.time()
+test_progress = 0
+test_errors = 0
+
+# whether output goes to a tty
+isatty = os.isatty(sys.stdout.fileno())
+
+mapiportre = re.compile(r'(mapi:)?monetdb://[-.a-zA-Z0-9_]+:(?P<port>\d+)/')
+
+geos_version = '@GEOS_VERSION@'.split('.')
+
+# free bats, used bats, total bats
+fbre = re.compile(r' (?P<bats>\d+) free bats')
+ubre = re.compile(r' (?P<bats>\d+) in use')
+tbre = re.compile(r'^(?P<bats>\d+) bats total')
+
+# collect errors if not verbose
+errors = []
+warnings = []
+
+
+# default is no color (these three functions may get redefined)
+def prred(str):
+    print(str, end='')
+def prgreen(str):
+    print(str, end='')
+def prpurple(str):
+    print(str, end='')
+use_esc = False
+if isatty:
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            origmode = ctypes.c_long()
+            handle = kernel32.GetStdHandle(-11) # STD_OUTPUT_HANDLE
+            if kernel32.GetConsoleMode(handle, ctypes.byref(origmode)):
+                if kernel32.SetConsoleMode(handle, origmode.value | 0x0004):
+                    use_esc = True
+        except (ImportError, AttributeError):
+            pass
+    else:
+        use_esc = True
+    if use_esc:
+        # color output a little
+        RED = '\033[1;31m'
+        GREEN = '\033[0;32m'
+        PURPLE = '\033[1;35m'       # actually magenta
+        BLACK = '\033[0;0m'
+        def prred(str, *, RED=RED, BLACK=BLACK):
+            try:
+                print(RED, end='')
+                print(str, end='')
+            finally:
+                print(BLACK, end='')
+        def prgreen(str, *, GREEN=GREEN, BLACK=BLACK):
+            try:
+                print(GREEN, end='')
+                print(str, end='')
+            finally:
+                print(BLACK, end='')
+        def prpurple(str, *, PURPLE=PURPLE, BLACK=BLACK):
+            try:
+                print(PURPLE, end='')
+                print(str, end='')
+            finally:
+                print(BLACK, end='')
+    else:
+        try:
+            import ctypes
+        except ImportError:
+            pass
+        else:
+            STD_OUTPUT_HANDLE = -11
+            try:
+                handle = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+            except AttributeError:
+                pass
+            else:
+                def get_csbi_attributes(handle):
+                    # Based on IPython's winconsole.py, written by Alexander Belchenko
+                    csbi = ctypes.create_string_buffer(22)
+                    res = ctypes.windll.kernel32.GetConsoleScreenBufferInfo(handle, csbi)
+                    assert res
+                    (bufx, bufy, curx, cury, wattr,
+                    left, top, right, bottom, maxx, maxy) = struct.unpack('hhhhHhhhhhh', csbi.raw)
+                    return wattr
+                reset = get_csbi_attributes(handle)
+                def prred(str, *,
+                          scta=ctypes.windll.kernel32.SetConsoleTextAttribute):
+                    try:
+                        print(end='', flush=True)
+                        scta(handle, 0x4)
+                        print(str, end='', flush=True)
+                    finally:
+                        scta(handle, reset)
+                def prgreen(str, *,
+                            scta=ctypes.windll.kernel32.SetConsoleTextAttribute):
+                    try:
+                        print(end='', flush=True)
+                        scta(handle, 0x2)
+                        print(str, end='', flush=True)
+                    finally:
+                        scta(handle, reset)
+                def prpurple(str, *,
+                             scta=ctypes.windll.kernel32.SetConsoleTextAttribute):
+                    try:
+                        print(end='', flush=True)
+                        scta(handle, 0x5)
+                        print(str, end='', flush=True)
+                    finally:
+                        scta(handle, reset)
+
+if os.path.exists('/usr/bin/coredumpctl'):
+    # probably Linux if /usr/bin/coredumpctl exists
+    # try raising the core dump size limit to infinite so that when we
+    # get a crash we have a chance to retrieve the stack trace
+    try:
+        import resource
+    except ImportError:
+        pass
+    else:
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE,
+                               (resource.RLIM_INFINITY,
+                                resource.getrlimit(resource.RLIMIT_CORE)[1]))
+        except ValueError:
+            # if we can't raise the limit, just forget it
+            pass
+
+# use our own process module (instead of subprocess) because it has
+# _BufferedPipe
+try:
+    import process
+except ImportError:
+    try:
+        import MonetDBtesting.process as process
+    except ImportError:
+        p = os.path.join('@QXprefix@', '@QXPYTHON_LIBDIR@')
+        sys.path.insert(0, p)
+        import MonetDBtesting.process as process
+        if 'PYTHONPATH' in os.environ:
+            p += os.pathsep + os.environ['PYTHONPATH']
+        os.environ['PYTHONPATH'] = p
+
+try:
+    ttywidth = os.get_terminal_size(1).columns
+except:
+    ttywidth = 0
+else:
+    if ttywidth > 0 and os.name == 'nt':
+        ttywidth -= 1           # don't go to the edge
+
+
+def remove(file):
+    try:
+        os.remove(file)
+    except FileNotFoundError:
+        pass
+    except IsADirectoryError:
+        shutil.rmtree(file, ignore_errors=True)
+    except PermissionError:
+        # on Windows and MacOS we get a weird error from os.remove on a
+        # directory
+        if platform.system() in ('Windows', 'Darwin'):
+            shutil.rmtree(file, ignore_errors=True)
+        else:
+            Warn(f'could not remove {file}')
+    except:
+        Warn(f'could not remove {file}')
+
+
+def isexecutable(TST, ext='.sh'):
+    if   os.name == 'nt':
+        for ext in '.exe', '.com', '.bat', '.cmd':
+            if TST.lower().endswith(ext):
+                ext = ''
+            if os.path.isfile(TST+ext) or os.path.isfile(TST+ext+'.src'):
+                return (True, ext)
+    elif os.name == 'posix':
+        TST += ext
+        if ( os.path.isfile(TST       ) and os.access(TST       ,os.X_OK) ) or \
+           ( os.path.isfile(TST+'.src') and os.access(TST+'.src',os.X_OK) ):
+            return (True, ext)
+    return (False, '')
+
+
+def CheckExec(cmd):
+    for p in os.environ['PATH'].split(os.pathsep):
+        x = isexecutable(os.path.join(p,cmd), ext='')
+        if x[0]:
+            return os.path.join(p, cmd + x[1])
+    return ''
+
+import argparse
+
+import threading
+
+(F_SKIP, F_OK, F_WARN, F_SOCK, F_ERROR, F_TIME, F_ABRT, F_RECU, F_SEGV, F_FAIL) = range(10)
+
+FAILURES = {
+    F_SKIP  : ('F_SKIP',  '-'),
+    F_OK    : ('F_OK',    'o'),
+    F_WARN  : ('F_WARN',  'x'),
+    F_SOCK  : ('F_SOCK',  'S'),
+    F_ERROR : ('F_ERROR', 'X'),
+    F_TIME  : ('F_TIME',  'T'),
+    F_ABRT  : ('F_ABRT',  'A'),
+    F_RECU  : ('F_RECU',  'R'),
+    F_SEGV  : ('F_SEGV',  'C'),
+    F_FAIL  : ('F_FAIL',  'F'),
+}
+
+CONDITIONALS = {
+    # X == true   =>  @X_TRUE@='',  @X_FALSE@='#'
+    # X == false  =>  @X_TRUE@='#', @X_FALSE@=''
+    # from configure.ag:
+    # These should cover all AM_CONDITIONALS defined in configure.ag, i.e.,
+    # `grep AM_CONDITIONAL configure.ag | sed 's|^AM_CONDITIONAL(\([^,]*\),.*$|\1|' | sort -u`
+    'HAVE_CURL'            : '@HAVE_CURL_FALSE@',
+    'HAVE_FITS'            : '@HAVE_FITS_FALSE@',
+    'HAVE_GEOM'            : '@HAVE_GEOM_FALSE@',
+    'HAVE_GETENTROPY'      : '@HAVE_GETENTROPY_FALSE@',
+    'HAVE_HGE'             : '@HAVE_HGE_FALSE@',
+    'HAVE_LIBBZ2'          : '@HAVE_LIBBZ2_FALSE@',
+    'HAVE_LIBLZ4'          : '@HAVE_LIBLZ4_FALSE@',
+    'HAVE_LIBLZMA'         : '@HAVE_LIBLZMA_FALSE@',
+    'HAVE_LIBPCRE'         : '@HAVE_LIBPCRE_FALSE@',
+    'HAVE_LIBXML'          : '@HAVE_LIBXML_FALSE@',
+    'HAVE_LIBZ'            : '@HAVE_LIBZ_FALSE@',
+    'HAVE_SNAPPY'          : '@HAVE_SNAPPY_FALSE@',
+    'HAVE_ZSTD'            : '@HAVE_ZSTD_FALSE@',
+    'HAVE_NETCDF'          : '@HAVE_NETCDF_FALSE@',
+    'HAVE_ODBC'            : '@HAVE_ODBC_FALSE@',
+    'HAVE_OPENSSL'         : '@HAVE_OPENSSL_FALSE@',
+    'HAVE_PROJ'            : '@HAVE_PROJ_FALSE@',
+    'HAVE_SHP'             : '@HAVE_SHP_FALSE@',
+    'NATIVE_WIN32'         : '@NATIVE_WIN32_FALSE@',
+    'NOT_WIN32'            : '@NOT_WIN32_FALSE@',
+    'SANITIZER'            : '@SANITIZER_FALSE@',
+    # unknown at compile time;
+    # hence, we set them only at runtime in main() below
+    'KNOWNFAIL'            : False, # normally skip, but --alltests or explicit
+    'BAD_HOSTNAME'         : False,
+    'HAVE_CPP'             : False,
+    'HAVE_DATA_PATH'       : False,
+    'HAVE_IPV6'            : False,
+    'HAVE_JDBCCLIENT_JAR'  : False,
+    'HAVE_JDBCTESTS'       : False,
+    'HAVE_JDBCTESTS_JAR'   : False,
+    'HAVE_MONETDBJDBC_JAR' : False,
+    'HAVE_RUBY'            : False,
+    'HAVE_SQLITE3ODBC'     : False,
+    'MERCURIAL'            : False,
+    'NOWAL'                : False,
+    'PIPELINE'             : False,
+    'RELEASERUN'           : False,
+    # optional Python modules
+#    'HAVE_LIBPANDAS3'      : False,
+    'HAVE_LIBSCIPY3'       : False, # import scipy
+    'HAVE_CRYPTOGRAPHY'    : False, # import cryptography
+    'HAVE_PYODBC'          : False, # import pyodbc
+    'HAVE_PYTHON_LZ4'      : False, # import lz4
+}
+
+
+# a bunch of classes to help with generating (X)HTML files
+class _Encode:
+    # mix-in class for encoding text and attribute values so that they
+    # don't get interpreted as something else by the browser
+    def encode(self, data, attr):
+        map = [('&', '&amp;'),          # MUST be first
+               ('<', '&lt;'),
+               ('>', '&gt;'),
+               (None, None),
+               # following chars only translated in attr values (attr is True)
+               ('"', '&quot;'),
+               ('\t', '&#9;'),
+               ('\n', '&#10;'),
+               ('\r', '&#13;'),
+               ]
+        for c, tr in map:
+            if c is None:
+                if not attr:
+                    break
+                continue
+            data = data.replace(c, tr)
+        return data
+
+
+class Element(_Encode):
+    # class to represent an (X)HTML element with its attributes and
+    # children
+
+    # inline elements, we do not add newlines to the contents of these
+    # elements
+    inline = ['tt','i','b','big','small','em','strong','dfn','code',
+              'samp','kbd','var','cite','abbr','acronym','a','img',
+              'object','br','script','map','q','sub','sup','span',
+              'bdo','input','select','textarea','label','button','font']
+    # empty elements
+    empty = ['link', 'basefont', 'br', 'area', 'img', 'param', 'hr',
+             'input', 'col', 'frame', 'isindex', 'base', 'meta', ]
+    xml = True                          # write XHTML instead of HTML
+
+    def __init__(self, tag, attrdict=None, *children):
+        self.tag = tag
+        if attrdict is None:
+            attrdict = {}
+        self.attrdict = attrdict
+        if children is None:
+            children = []
+        self.isempty = tag.lower() in self.empty
+        if self.isempty:
+            if children:
+                raise ValueError("empty element can't have children")
+            self.children = None
+        else:
+            self.children = list(children)
+
+    def __str__(self):
+        # string representation of the element with its children
+        s = ['<%s' % self.tag]
+        for name, value in sorted(self.attrdict.items()):
+            s.append(' %s="%s"' % (name, self.encode(value, True)))
+        if self.children or (not self.xml and not self.isempty):
+            s.append('>')
+            for c in self.children:
+                s.append(str(c))
+            s.append('</%s>' % self.tag)
+        elif self.xml:
+            s.append('/>')
+        else:
+            s.append('>')               # empty HTML element
+        return ''.join(s)
+
+    def write(self, f, newline=False):
+        # write the element with its children to a file
+        # if newline is set, add newlines at strategic points
+        if self.tag.lower() == 'html':
+            # before we write the DOCTYPE we should really check
+            # whether the document conforms...
+            if self.xml:
+                f.write('<!DOCTYPE html PUBLIC '
+                        '"-//W3C//DTD XHTML 1.0 Transitional//EN"\n'
+                        '                      '
+                        '"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">\n')
+            else:
+                f.write('<!DOCTYPE html PUBLIC '
+                        '"-//W3C//DTD HTML 4.01 Transitional//EN"\n'
+                        '                      '
+                        '"http://www.w3.org/TR/html4/loose.dtd">\n')
+        inline = self.tag.lower() in self.inline
+        f.write('<%s' % self.tag)
+        for name, value in sorted(self.attrdict.items()):
+            f.write(' %s="%s"' % (name, self.encode(value, True)))
+        if self.children or (not self.xml and not self.isempty):
+            if not inline:
+                for c in self.children:
+                    if not isinstance(c, Element):
+                        inline = True
+                        break
+            f.write('>')
+            if newline and not inline:
+                f.write('\n')
+            for c in self.children:
+                c.write(f, newline and not inline)
+            f.write('</%s>' % self.tag)
+        elif self.xml:
+            f.write('/>')
+        else:
+            f.write('>')                # empty HTML element
+        if newline:
+            f.write('\n')
+
+    def addchild(self, child):
+        self.children.append(child)
+
+    def addchildren(self, children):
+        for child in children:
+            self.children.append(child)
+
+    def inschild(self, index, child):
+        self.children.insert(index, child)
+
+
+class Text(_Encode):
+    # class to represent text in (X)HTML
+    def __init__(self, text='', raw=False):
+        self.text = text
+        self.raw = raw
+
+    def __str__(self):
+        if self.raw:
+            return self.text
+        return self.encode(self.text, False)
+
+    def write(self, f, newline=False):
+        f.write(str(self))
+        if newline and not self.raw:
+            f.write('\n')
+
+
+class Comment:
+    # class to represent an (X)HTML comment (not currently used)
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return '<!--%s-->' % self.text
+
+    def write(self, f, newline=False):
+        f.write(str(self))
+
+
+REV = ''                # revision (output of hg id), default unknown
+
+black = 'black'                         # #000000
+white = 'white'                         # #ffffff
+red = 'red'                             # #ff0000
+lime = 'lime'                           # #00ff00
+green = '#00aa00'
+darkgreen = '#005500'
+orange = '#ffaa00'
+purple = '#aa00aa'
+stylesheet = Element('style', None, Text('''
+.error     { font-weight: bold; font-style: italic; color: red; }
+.segfault  { font-weight: bold; font-style: italic; color: purple; }
+.abort     { font-weight: bold; font-style: italic; color: purple; }
+.recursion { font-weight: bold; font-style: italic; color: purple; }
+.timeout   { font-weight: bold; font-style: italic; color: purple; }
+.socket    { font-weight: bold; font-style: italic; color: purple; }
+.warning   { font-weight: bold; color: orange; }
+.good      {  }
+.header    { font-family: helvetica, arial; text-align: center; }
+.black     { color: black; }
+'''))
+
+TIMES = []
+
+
+def ErrMsg(TEXT):
+    print(end='', flush=True)
+    print('\n%s:  ERROR:  %s\n' % (THISFILE, TEXT), file=sys.stderr, flush=True)
+
+
+def ErrXit(TEXT):
+    ErrMsg(TEXT)
+    sys.exit(1)
+
+
+def Warn(TEXT):
+    msg = f'{THISFILE}  Warning:  {TEXT}'
+    if not verbose:
+        warnings.append(msg)
+        return
+    try:
+        print(end='', flush=True)
+    except IOError:
+        pass
+    try:
+        print(f'\n{msg}\n', file=sys.stderr, flush=True)
+    except IOError:
+        pass
+
+
+def startswithpath(str,pre):
+    return os.path.normcase(str[:len(pre)]) == os.path.normcase(pre)
+
+import urllib.request, urllib.parse
+path = urllib.request.url2pathname
+
+
+def url(str):
+    url = urllib.request.pathname2url(str)
+    # on Windows, C:\tmp\foo becomes ///C:/tmp/foo, turn into /C:/tmp/foo
+    if url.startswith('///'):
+        url = url[2:]
+    return url
+
+
+def openutf8(file, mode='r'):
+    return open(file, mode, encoding='utf-8', errors='replace')
+
+
+def try_open(path, mode):
+    try:
+        f = openutf8(path, mode)
+    except IOError as err:
+        Warn("Opening file '%s' in mode '%s' failed with #%d: '%s'." % (path, mode, err.errno, err.strerror))
+        f = None
+    return f
+
+
+def CreateHtmlIndex(env, TSTDIR, TSTTRGDIR, ssout, sserr, *body):
+    if TSTDIR:
+        INDEX='.index'
+    else:
+        INDEX='index'
+
+    if body:
+        if TSTDIR:
+            header = Text(TSTDIR)
+            if REV:
+                header = Element('a',
+                                 {'href': '%s%s/%s' % (URLPREFIX, url(TSTDIR), TSTSUFF),
+                                  'target': '%s_%s_body' % (DISTVER, TSTDIR),
+                                  'class': 'black',
+                                  'title': TSTDIR},
+                                 header)
+            th = Element('th', {'class': 'header'}, header)
+            if os.path.exists(os.path.join(TSTTRGDIR, 'SingleServer.out.html')):
+                th.addchild(Element('br'))
+                th.addchildren(AddHref('SingleServer.out.html',
+                                       '%s_%s_body' % (DISTVER, TSTDIR),
+                                       'out', ssout))
+                th.addchild(Text(' | '))
+                th.addchildren(AddHref('SingleServer.err.html',
+                                       '%s_%s_body' % (DISTVER, TSTDIR),
+                                       'err', sserr))
+            tr = Element('tr', {'valign': 'top'}, th)
+            tr.addchildren(body)
+            hbody = Element('body',
+                            {'bgcolor': white,
+                             'text': black,
+                             'link': green,
+                             'vlink': darkgreen,
+                             'alink': lime},
+                            Element('center', {},
+                                    Element('table',
+                                            {'align': 'abscenter',
+                                             'border': '1',
+                                             'cellspacing': '0',
+                                             'cellpadding': '3'},
+                                            tr)))
+        else:
+            header = Element('h3', {},
+                             Text(DISTVER))
+            hbody = Element('body',
+                            {'bgcolor': white,
+                             'text': black,
+                             'link': green,
+                             'vlink': darkgreen,
+                             'alink': lime},
+                            header)
+            hbody.addchildren(body)
+        html = Element('html', {},
+                       Element('head', {},
+                               Element('meta', {'charset':'utf8'}),
+                               Element('title', {}, Text(HTMLTITLE)),
+                               stylesheet),
+                       hbody)
+        with openutf8(os.path.join(TSTTRGDIR, '%s.head.html' % INDEX),'w') as f:
+            html.write(f, True)
+
+        if TSTDIR:
+            layout = 'rows'
+            ROWS='8%'
+        else:
+            layout = 'cols'
+            ROWS='10%'
+        html = Element('html', {},
+                       Element('head', {},
+                               Element('meta', {'charset':'utf8'}),
+                               Element('title', {}, Text(HTMLTITLE))),
+                       Element('frameset',
+                               {layout: '%s,*' % ROWS,
+                                'frameborder': 'yes',
+                                'border': '1',
+                                'bordercolor': white,
+                                'marginwidth': '0',
+                                'marginheight': '0'},
+                               Element('frame',
+                                       {'src': '%s.head.html' % INDEX,
+                                        'scrolling': 'auto',
+                                        'name': '%s_%s_head' % (DISTVER, TSTDIR),
+                                        'frameborder': 'yes',
+                                        'bordercolor': white,
+                                        'marginwidth': '0',
+                                        'marginheight': '0'}),
+                               Element('frame',
+                                       {'src': url(env['_%s_BODY_' % TSTDIR][0]),
+                                        'scrolling': 'auto',
+                                        'name': '%s_%s_body' % (DISTVER, TSTDIR),
+                                        'frameborder': 'yes',
+                                        'bordercolor': white,
+                                        'marginwidth': '0',
+                                        'marginheight': '0'})))
+        with openutf8(os.path.join(TSTTRGDIR, '%s.html' % INDEX), 'w') as f:
+            html.write(f, True)
+
+
+bugre = re.compile(r'\.(sf|bug)-(?P<bugno>[1-9]\d+)', re.I)
+
+
+def CreateTstWhatXhtml(env, TST, stableWHAT, EXT, result, TSTDIR, TSTTRGDIR, TSTSRCDIR, RELSRCDIR):
+    WHAT = stableWHAT[7:11]
+
+    if result == F_OK:
+        diffclass = 'good'
+        difftext = 'No differences'
+    elif result == F_WARN:
+        diffclass = 'warning'
+        difftext = 'Minor differences'
+    else:                       # result == F_ERROR:
+        difftext = 'Major differences'
+        if result == F_SOCK:
+            diffclass = 'socket'
+            difftext += ' (Socket)'
+        elif result == F_TIME:
+            diffclass = 'timeout'
+            difftext += ' (Timeout)'
+        elif result == F_RECU:
+            diffclass = 'recursion'
+            difftext += ' (Recursion)'
+        elif result == F_ABRT:
+            diffclass = 'abort'
+            difftext += ' (Aborted)'
+        elif result == F_SEGV:
+            diffclass = 'segfault'
+            difftext += ' (Crash)'
+        else:
+            diffclass = 'error'
+
+    SYSTEM = '%s:' % DISTVER
+
+    html = Element('html', {},
+                   Element('head', {},
+                           Element('title', {}, Text(HTMLTITLE)),
+                           stylesheet),
+                   Element('frameset', {'rows': '42,*',
+                                        'frameborder': 'yes',
+                                        'border': '1',
+                                        'bordercolor': white,
+                                        'marginwidth': '0',
+                                        'marginheight': '0'},
+                           Element('frame',
+                                   {'src': '.%s%s.head.html' % (TST, WHAT),
+                                    'scrolling': 'auto',
+                                    'name': '%s_%s_%s_%s_head' % (DISTVER, TSTDIR, TST, WHAT[1:]),
+                                    'frameborder': 'yes',
+                                    'bordercolor': white,
+                                    'marginwidth': '0',
+                                    'marginheight': '0'}),
+                           Element('frame',
+                                   {'src': '%s%s.diff.html' % (TST, WHAT),
+                                    'scrolling': 'auto',
+                                    'name': '%s_%s_%s_%s_body' % (DISTVER, TSTDIR, TST, WHAT[1:]),
+                                    'frameborder': 'yes',
+                                    'bordercolor': white,
+                                    'marginwidth': '0',
+                                    'marginheight': '0'})))
+    with openutf8(os.path.join(TSTTRGDIR, '.%s%s.html' % (TST, WHAT)), 'w') as f:
+        html.write(f, True)
+    f = openutf8(os.path.join(TSTTRGDIR, '.%s%s.head.html' % (TST, WHAT)),'w')
+    target = '%s_%s_%s_%s_body' % (DISTVER, TSTDIR, TST, WHAT[1:])
+    if REV:                     # implies URLPREFIX is not None
+        urlpref = '%s%s/%s' % (URLPREFIX, url(TSTDIR), TSTSUFF)
+        hg = Element('a', {'href': urlpref,
+                           'target': target},
+                     Text('hg'))
+    else:
+        hg = None
+    text = Element('div', {'class': 'header'},
+                   Text(SYSTEM),
+                   Text(' '),
+                   Element('a', {'href': '%s%s.diff.html' % (TST, WHAT),
+                                 'target': target,
+                                 'class': diffclass},
+                           Text(difftext)))
+    if os.path.exists(os.path.join(TSTTRGDIR, f'{TST}{stableWHAT}')):
+        text.addchildren([
+            Text(' between '),
+            Element('a', {'href': '%s%s' % (TST, stableWHAT),
+                          'target': target},
+                    Text(stableWHAT[1:]))])
+        if REV:
+            d = urlpref
+            if os.path.isfile(TST + stableWHAT + '.src'):
+                # there's only one file like this...
+                with openutf8(os.path.join(TSTTRGDIR, TST + stableWHAT + '.src')) as fil:
+                    fl = fil.readline().strip()
+                if fl.startswith('$RELSRCDIR/'):
+                    fl = fl[11:]
+                    while fl.startswith('../'):
+                        fl = fl[3:]
+                        d = d[:d.rindex('/')]
+                fl = '%s/%s' % (d, fl)
+            else:
+                fl = '%s/%s%s' % (d, TST, stableWHAT)
+            text.addchildren([
+                    Text(' (id '),
+                    Element('a', {'href': fl,
+                                  'target': target}, Text(REV)),
+                    Text(')')])
+        text.addchildren([
+                Text(' and '),
+                Element('a', {'href': '%s.test%s' % (TST, WHAT),
+                              'target': target},
+                        Text('test%s' % WHAT)),
+                Text(' of ')])
+    else:
+        text.addchild(Text(' in '))
+    text.addchild(
+            Element('a', {'href': TST + EXT, 'target': target},
+                    Text(TST + EXT)))
+    if REV:
+        d = urlpref
+        if os.path.isfile(TST + EXT + '.src'):
+            with openutf8(os.path.join(TSTTRGDIR, TST + EXT + '.src')) as fil:
+                fl = fil.readline().strip()
+            if fl.startswith('$RELSRCDIR/'):
+                fl = fl[11:]
+                while fl.startswith('../'):
+                    fl = fl[3:]
+                    d = d[:d.rindex('/')]
+            fl = '%s/%s' % (d, fl)
+        elif os.path.isfile(TST + EXT + '.in'):
+            fl = '%s/%s%s.in' % (d, TST, EXT)
+        else:
+            fl = '%s/%s%s' % (d, TST, EXT)
+        text.addchildren([
+                Text(' (id '),
+                Element('a', {'href': fl,
+                              'target': target}, Text(REV)),
+                Text(')')])
+    text.addchildren([
+            Text(' in '),
+            Element('a', {'href': './', 'target': target},
+                    Text(TSTDIR)),
+            Text(' (')])
+    if hg:
+        text.addchildren([hg,
+                          Text(', ')])
+    text.addchildren([
+            Element('a', {'href': url(RELSRCDIR),
+                          'target': target},
+                    Text('src')),
+            Text(')')])
+    res = bugre.search(TST)
+    if res is not None:
+        bugno = res.group('bugno')
+        text.addchildren([
+                Text(' ('),
+                Element('a', {'href': 'https://github.com/MonetDB/MonetDB/issues/%s' % bugno,
+                              'target': '_blank'},
+                        Text('Bug tracker')),
+                Text(')')])
+    html = Element('html', {},
+                   Element('head', {},
+                           Element('title', {},
+                                   Text(HTMLTITLE)),
+                           stylesheet),
+                   Element('body',
+                           {'bgcolor': white,
+                            'text': black,
+                            'link': green,
+                            'vlink': darkgreen,
+                            'alink': lime},
+                           text))
+
+    html.write(f, True)
+    f.close()
+
+
+def CreateSrcIndex(env, TST, EXT, TSTDIR, TSTTRGDIR, TSTSRCDIR):
+    if REV:
+        framesrc = '%s%s/%s/%s%s' % (URLPREFIX, url(TSTDIR), TSTSUFF, TST, EXT)
+    else:
+        html = Element('html', {},
+                       Element('head', {},
+                               Element('title', {},
+                                       Text(HTMLTITLE)),
+                               stylesheet),
+                       Element('body',
+                               {'bgcolor': white,
+                                'text': black,
+                                'link': green,
+                                'vlink': darkgreen,
+                                'alink': lime},
+                               Element('center', {},
+                                       Text('no source available'))))
+        framesrc = '.%s.nosrc.index.html' % TST
+        with openutf8(os.path.join(TSTTRGDIR, '.%s.nosrc.index.html' % TST), 'w') as f:
+            html.write(f, True)
+    html = Element('html', {},
+                   Element('head', {},
+                           Element('title', {}, Text(HTMLTITLE))),
+                   Element('frameset',
+                           {'rows': '54,*',
+                            'frameborder': 'yes',
+                            'border': '1',
+                            'bordercolor': white,
+                            'marginwidth': '0',
+                            'marginheight': '0'},
+                           Element('frame',
+                                   {'src': '.%s.src.index.head.html' % TST,
+                                    'scrolling': 'auto',
+                                    'name': '%s_%s_%s_head' % (DISTVER, TSTDIR, TST),
+                                    'frameborder': 'yes',
+                                    'bordercolor': white,
+                                    'marginwidth': '0',
+                                    'marginheight': '0'}),
+                           Element('frame',
+                                   {'src': framesrc,
+                                    'scrolling': 'auto',
+                                    'name': '%s_%s_%s_body' % (DISTVER, TSTDIR, TST),
+                                    'frameborder': 'yes',
+                                    'bordercolor': white,
+                                    'marginwidth': '0',
+                                    'marginheight': '0'})))
+    with openutf8(os.path.join(TSTTRGDIR, '.%s.src.index.html' % TST),'w') as f:
+        html.write(f, True)
+
+    tr = Element('tr', {},
+                 Element('th', {'class': 'header'},
+                         Text(TST)))
+    for s in listdir(TSTSRCDIR):
+        if s.startswith(TST):
+            slink = Text(s)
+            if REV:
+                slink = Element('a',
+                                {'href': '%s%s/%s/%s' % (URLPREFIX, url(TSTDIR), TSTSUFF, s),
+                                 'target': '%s_%s_%s_body' % (DISTVER, TSTDIR, TST)},
+                                slink)
+            tr.addchild(Element('td', {'class': 'header'},
+                                slink))
+    html = Element('html', {},
+                   Element('head', {},
+                           Element('title', {},
+                                   Text(HTMLTITLE)),
+                           stylesheet),
+                   Element('body',
+                           {'bgcolor': white,
+                            'text': black,
+                            'link': green,
+                            'vlink': darkgreen,
+                            'alink': lime},
+                           Element('center', {},
+                                   Element('table',
+                                           {'align': 'abscenter',
+                                            'border': '1',
+                                            'cellspacing': '0',
+                                            'cellpadding': '3'},
+                                           tr))))
+    with openutf8(os.path.join(TSTTRGDIR, '.%s.src.index.head.html' % TST), 'w') as f:
+        html.write(f, True)
+
+
+def AddHref(href, target, linktext, diff):
+    if   diff == F_ERROR:
+        klass = 'error'
+    elif diff == F_RECU:
+        klass = 'recursion'
+    elif diff == F_TIME:
+        klass = 'timeout'
+    elif diff == F_SOCK:
+        klass = 'socket'
+    elif diff == F_ABRT:
+        klass = 'abort'
+    elif diff == F_SEGV:
+        klass = 'segfault'
+    elif diff == F_WARN:
+        klass = 'warning'
+    elif diff == F_FAIL:
+        klass = 'error'
+    else:
+        klass = 'good'
+    a = Element('a', {'href': href, 'target': target, 'class': klass,
+                      'title': linktext},
+                Text(linktext))
+    if klass == 'good':
+        return [Text('('), a, Text(')')]
+    else:
+        return [a]
+
+
+def AddTstToHtmlIndex(env, TST, STABLEout, STABLEerr, EXT, o, e, TSTDIR,
+                      TSTTRGDIR, TSTSRCDIR, RELSRCDIR):
+    CreateTstWhatXhtml(env, TST, STABLEout, EXT, o, TSTDIR, TSTTRGDIR,
+                       TSTSRCDIR, RELSRCDIR)
+    CreateTstWhatXhtml(env, TST, STABLEerr, EXT, e, TSTDIR, TSTTRGDIR,
+                       TSTSRCDIR, RELSRCDIR)
+
+    if e == F_RECU:
+        tstclass = 'recursion'
+    elif e == F_TIME:
+        tstclass = 'timeout'
+    elif e == F_SOCK:
+        tstclass = 'socket'
+    elif e == F_ABRT:
+        tstclass = 'abort'
+    elif e == F_SEGV:
+        tstclass = 'segfault'
+    elif o == F_ERROR or e == F_ERROR:
+        tstclass = 'error'
+    elif o == F_WARN or e == F_WARN:
+        tstclass = 'warning'
+    else:
+        tstclass = 'good'
+
+    td = Element('td', {'class': 'header'},
+                 Element('a', {'href': '.%s.src.index.html' % TST,
+                               'target': '%s_%s_body' % (DISTVER, TSTDIR),
+                               'class': tstclass},
+                         Text(TST)),
+                 Element('br'))
+    td.addchildren(AddHref('.%s%s.html' % (TST, '.out'),
+                           '%s_%s_body' % (DISTVER, TSTDIR),
+                           'out', o))
+    td.addchild(Text('&nbsp;|&nbsp;', raw=True))
+    td.addchildren(AddHref('.%s%s.html' % (TST, '.err'),
+                           '%s_%s_body' % (DISTVER, TSTDIR),
+                           'err', e))
+    if f'_{TSTDIR}_BODY_' not in env  or  \
+       not env[f'_{TSTDIR}_BODY_'][0]  or  \
+       env[f'_{TSTDIR}_BODY_'][1] < max(e, o):
+        if e > o:
+            env[f'_{TSTDIR}_BODY_'] = ['.%s.err.html' % TST, e]
+        else:
+            env[f'_{TSTDIR}_BODY_'] = ['.%s.out.html' % TST, o]
+
+    CreateSrcIndex(env, TST, EXT, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+
+    return td
+
+
+def AddSubToHtmlIndex(env, TSTDIR, diff):
+    elem = Element('p', {})
+    elem.addchildren(AddHref('%s/.index.html' % url(TSTDIR),
+                             '%s__body' % DISTVER,
+                             TSTDIR, diff))
+    if '__BODY_' not in env  or  \
+       not env['__BODY_'][0]  or  \
+       env['__BODY_'][1] < diff:
+        env['__BODY_'] = ['%s/.index.html' % TSTDIR, diff]
+    return elem
+
+
+def SkipTest(env, TST, EXT, REASON, length, TSTDIR, TSTTRGDIR, TSTSRCDIR):
+    if verbose:
+        if REASON.startswith('as '):
+            REASON = REASON[3:]
+        if REASON.endswith('.'):
+            REASON = REASON[:-1]
+        if length + 10 + len(REASON) + 11 > ttywidth:
+            # 10 - length of prompt()
+            # 11 - length of ' skipped ()'
+            l = ttywidth - 10 - 11 - len(REASON)
+            if len(TST) <= l:
+                s = '%-*s' % (l, TST)
+            else:
+                s = '%s...%s' % (TST[:l//2 - 2], TST[-(l//2 - 1):])
+        else:
+            s = '%-*s' % (length, TST)
+        print(f'{prompt()}{s} skipped ({REASON})')
+
+    if testweb or not produce_html:
+        return None
+
+    with openutf8(os.path.join(TSTTRGDIR, f'.{TST}.SKIPPED.html'), 'w') as f:
+        Element('html', {},
+                Element('body', {},
+                        Element('p', {},
+                                Text(f'Skipping test {TST}{EXT} {REASON}')))).write(f, newline=True)
+    target = f'{DISTVER}_{TSTDIR}_body'
+    td = Element('td', {'class': 'header'},
+                 Element('a', {'href': f'.{TST}.src.index.html',
+                               'target': target,
+                               'class': 'black'},
+                         Text(TST)),
+                 Element('br'),
+                 Element('a', {'href': f'.{TST}.SKIPPED.html',
+                               'target': target},
+                         Text('(skipped)')))
+    if f'_{TSTDIR}_BODY_' not in env  or  \
+       not env[f'_{TSTDIR}_BODY_'][0]  or  \
+       not env[f'_{TSTDIR}_BODY_'][1]:
+        env[f'_{TSTDIR}_BODY_'] = [f'.{TST}.SKIPPED.html', F_SKIP]
+    CreateSrcIndex(env, TST, EXT, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+    return td
+
+
+def find_test_dirs(thisdir, recursive=True):
+    thisdir = os.path.realpath(thisdir)
+    dirnme = os.path.basename(thisdir)
+    if not recursive and dirnme != TSTSUFF and os.path.isdir(os.path.join(thisdir, TSTSUFF)):
+        return find_test_dirs(os.path.join(thisdir, TSTSUFF), recursive)
+    testdirs = []
+    dirlst = listdir(thisdir)
+    tstcnt = 0
+    if dirnme == TSTSUFF  and  'All' in dirlst  and  os.path.isfile(os.path.join(thisdir,'All')):
+        try:
+            allf = openutf8(os.path.join(thisdir,'All'))
+        except IOError:
+            pass
+        else:
+            cnt = 0
+            for tc in allf:
+                tc = tc.strip()
+                if tc != '' and not tc.startswith('#'):
+                    cnt += 1
+            if cnt > 0:
+                testdirs.append(os.path.dirname(thisdir))
+                tstcnt += cnt
+            allf.close()
+    if recursive:
+        for d in dirlst:
+            d = os.path.join(thisdir,d)
+            if os.path.isdir(d):
+                tst, cnt = find_test_dirs(d)
+                testdirs.extend(tst)
+                tstcnt += cnt
+    return testdirs, tstcnt
+
+
+def PerformDir(env, testdir, testlist, total_tests):
+    global test_progress
+    global test_errors
+    interrupted = False
+    td = time.time()
+    elem = None
+    FdOut = F_SKIP
+    FdErr = F_SKIP
+    ssout = F_SKIP
+    sserr = F_SKIP
+    if testdir == TSTSRCBASE:
+        TSTDIR = os.curdir
+    else:
+        TSTDIR = testdir[len(TSTSRCBASE + os.sep):]
+    TSTSRCDIR = os.path.normpath(os.path.join(testdir, TSTSUFF))
+    TSTTRGDIR = os.path.normpath(os.path.join(TSTTRGBASE, TSTPREF, TSTDIR))
+
+    TSTDB = TSTPREF + '_' + TSTDIR.replace(os.sep, '_')
+
+    try:
+        # sys.path.insert(0, TSTSRCDIR)
+
+        alltests = []
+        try:
+            with openutf8(os.path.join(TSTSRCDIR, 'All')) as allf:
+                for tc in allf:
+                    if '#' in tc:
+                        # get rid of comment anywhere on line
+                        tc = tc[:tc.index('#')]
+                    tc = tc.strip()
+                    if tc:
+                        if '?' in tc:
+                            cond,tst = tc.split('?')
+                        else:
+                            cond,tst = None,tc
+                        alltests.append((tst,cond))
+        except IOError:
+            pass
+        try:
+            with openutf8(os.path.join(TSTSRCDIR, 'SingleServer')) as f:
+                options = shlex.split(f.read())
+        except IOError:
+            oneserver = False
+            options = []            # not used
+        else:
+            oneserver = not restart
+
+        if testlist:
+            tl = []
+            for tst in testlist:
+                for t, c in alltests:
+                    if t == tst:
+                        tl.append((t, c))
+                        break
+                else:
+                    tl.append((tst,None))
+            testlist = tl
+        else:
+            testlist = alltests
+        if not testlist:
+            Warn("No tests found in '%s`; skipping directory!" % TSTSRCDIR)
+            return TSTDIR, elem, max(FdOut, FdErr), interrupted
+
+        # find length of longest test name
+        length = max([len(tst[0]) for tst in testlist])
+
+        if TSTDIR == os.curdir:
+            RELSRCDIR = os.path.join(os.pardir, env['RELSRCBASE'], TSTSUFF)
+        else:
+            RELSRCDIR = os.path.join(* [os.pardir] * (len(TSTDIR.split(os.sep)) + 1) + [env['RELSRCBASE'], TSTDIR, TSTSUFF])
+        environ = os.environ.copy()
+        environ['TSTDB']     = TSTDB
+        environ['TSTDIR']    = TSTDIR
+        environ['TSTSRCDIR'] = TSTSRCDIR
+        environ['TSTTRGDIR'] = TSTTRGDIR
+        environ['RELSRCDIR'] = RELSRCDIR
+        environ['HAVE_HGE'] = CONDITIONALS['HAVE_HGE']
+        environ['HAVE_SHP'] = CONDITIONALS['HAVE_SHP']
+        environ['TST_BITS'] = env['TST_BITS']
+        if 'TSTDATAPATH' not in environ and TSTDATAPATH:
+            env['TSTDATAPATH'] = TSTDATAPATH
+            environ['TSTDATAPATH'] = TSTDATAPATH
+
+
+        if 'GDK_DBFARM' in env:
+            LogDBdir = os.path.join(env['GDK_DBFARM'],TSTDB)
+            if not env.get('NOCLEAN') and LogDBdir and os.path.exists(LogDBdir):
+                try:
+                    shutil.rmtree(LogDBdir)
+                except KeyboardInterrupt:
+                    raise
+                except:
+                    Warn("database '%s` exists, but destroying it failed; skipping tests in '%s`!" % (TSTDB, TSTSRCDIR))
+                    return TSTDIR, elem, max(FdOut, FdErr), interrupted
+            keyfile = os.path.join(LogDBdir, '.vaultkey')
+            if os.path.isabs(LogDBdir):
+                try:
+                    os.makedirs(LogDBdir, exist_ok=True)
+                except:
+                    Warn("creating database '%s` failed; skipping tests in '%s`!" % (TSTDB, TSTSRCDIR))
+                    return TSTDIR, elem, max(FdOut, FdErr), interrupted
+                else:
+                    if not initdb:
+                        vaultkey = secrets.token_urlsafe(32).encode('ascii')
+                        with open(keyfile, 'wb') as vault:
+                            vault.write(vaultkey)
+                            vault.write(b'\0' * (48 - len(vaultkey)))
+            if initdb:
+                import zipfile
+                try:
+                    z = zipfile.ZipFile(initdb)
+                except IOError:
+                    Warn("initial database '%s` cannot be opened; skipping tests in '%s`!" % (initdb, TSTSRCDIR))
+                    return TSTDIR, elem, max(FdOut, FdErr), interrupted
+                try:
+                    z.extractall(LogDBdir)
+                except KeyboardInterrupt:
+                    raise
+                except:
+                    Warn("initial database '%s` cannot be extracted; skipping tests in '%s`!" % (initdb, TSTSRCDIR))
+                    return TSTDIR, elem, max(FdOut, FdErr), interrupted
+                z.close()
+                if os.path.exists(keyfile):
+                    vaultopt = ['--set', f'monet_vault_key={keyfile}']
+                else:
+                    vaultopt = []
+                if not oneserver:
+                    pSrvr = ServerClass(env['exe']['mserver5'] + [f'--dbpath={LogDBdir}'] + vaultopt + mserver5_opts,
+                                        open(os.devnull, 'w'),
+                                        open(os.devnull, 'w'),
+                                        30 if par['TIMEOUT'] else 0,
+                                        os.path.join(LogDBdir, '.started'),
+                                        TSTDB, dbg=env.get('DBG'))
+                    pSrvr.LaunchIt(env=environ)
+                    pSrvr.terminate()
+        if not os.path.exists(TSTTRGDIR):
+            os.makedirs(TSTTRGDIR, exist_ok=True)
+
+        body_good = []
+        body_bad = []
+        oktests = []
+        if verbose:
+            print('\nRunning in %s' % TSTDIR)
+        alllinks = []
+        pSrvr = None
+        try:
+            for TST,COND in testlist:
+                test_progress += 1
+                if oneserver and (pSrvr is None or pSrvr.poll() is not None):
+                    # restart server
+                    inmem = single_in_memory
+                    opts = []
+                    hasloadmod = False
+                    for o in options:
+                        if o.startswith('--loadmodule'):
+                            hasloadmod = True
+                        elif o.startswith('embedded'):
+                            inmem = False
+                        if o == 'odbc_loader':
+                            orig_odbcsysini = environ.pop('ODBCSYSINI', None)
+                            orig_odbcini = environ.pop('ODBCINI', None)
+                            orig_odbcinstini = environ.pop('ODBCINSTINI', None)
+                            environ['ODBCSYSINI'] = TSTTRGDIR
+                            environ['ODBCINI'] = os.path.join(TSTTRGDIR, 'odbc.ini')
+                        if o != 'nodrop':
+                            opts.append(o)
+                    if inmem:
+                        cmd = env['exe']['mserver5'] + ['--set', f'gdk_dbname={TSTDB}', '--in-memory'] + mserver5_opts + opts
+                        pollfile = None
+                        cmd.append('--set')
+                        cmd.append(f'gdk_dbtrace={os.path.join(LogDBdir, "mdbtrace.log")}')
+                    else:
+                        cmd = env['exe']['mserver5'] + [f'--dbpath={LogDBdir}'] + mserver5_opts + opts
+                        pollfile = os.path.join(LogDBdir, '.started')
+                    if os.path.exists(keyfile):
+                        cmd.extend(['--set', f'monet_vault_key={keyfile}'])
+                    if env.get('MULTIFARM'):
+                        cmd.append('--dbextra=%s' % os.path.join(env['GDK_DBFARM'], TSTPREF + '_transient'))
+                        shutil.rmtree(os.path.join(env['GDK_DBFARM'], TSTPREF + '_transient'),
+                                      ignore_errors = True)
+                        os.makedirs(os.path.join(env['GDK_DBFARM'], TSTPREF + '_transient'))
+                    elif env.get('TRANS_INMEM'):
+                        cmd.append('--dbextra=in-memory')
+                    pSrvr = ServerClass(cmd,
+                                        openutf8(os.path.join(TSTTRGDIR, 'SingleServer.out'), 'a'),
+                                        openutf8(os.path.join(TSTTRGDIR, 'SingleServer.err'), 'a'),
+                                        0,
+                                        pollfile,
+                                        TSTDB,
+                                        inmem=inmem,
+                                        dbg=env.get('DBG'))
+                    pSrvr.LaunchIt(cwd=TSTTRGDIR, env=environ)
+                    if pSrvr.port is None:
+                        if hasloadmod and 'LoaderException' in openutf8(os.path.join(TSTTRGDIR, 'SingleServer.err'), 'r').read():
+                            Warn(f"Missing module in '{TSTSRCDIR}`; skipping directory!")
+                            return TSTDIR, elem, max(FdOut, FdErr), interrupted
+                        print('\nFailed to start server.\n')
+                        FdOut = FdErr = F_FAIL
+                        break
+                    try:
+                        with pymonetdb.connect(username='monetdb',
+                                               password='monetdb',
+                                               hostname=HOST,
+                                               port=int(pSrvr.port),
+                                               database=pSrvr.usock or TSTDB,
+                                               autocommit=True,
+                                               connect_timeout=1.0) as dbh:
+                            dbh.settimeout(10)
+                            with dbh.cursor() as crs:
+                                try:
+                                    crs.execute("call logging.setcomplevel('SQL_EXECUTION', 'INFO')")
+                                    crs.execute("call logging.setcomplevel('BAT', 'INFO')")
+                                except TimeoutError:
+                                    print('\nTimeout setting log level.\n')
+                    except KeyboardInterrupt:
+                        raise
+                    except ConnectionRefusedError:
+                        print('\nConnection refused.\n')
+                        FdOut = FdErr = F_FAIL
+                        break
+                    except:
+                        pass
+                    environ['MAPIPORT'] = pSrvr.port
+                    if pSrvr.usock is not None:
+                        environ['MAPIUSOCK'] = pSrvr.usock
+                    SetExecEnv(env['exe'], pSrvr.port, environ)
+                if global_timeout and start_time + global_timeout < time.time():
+                    if not testweb:
+                        print('\nGlobal testing timeout reached\n')
+                        break
+                    tt, FtOut, FtErr, bodyline, reason = -1,F_SKIP,F_SKIP,None,'as the global timeout has been reached'
+                else:
+                    environ['TST'] = TST
+                    tt, FtOut, FtErr, bodyline, reason, links = RunTest(env, TST, COND, oktests, length, pSrvr, total_tests, options, environ, TSTDB, TSTDIR, TSTSRCDIR, RELSRCDIR, TSTTRGDIR)
+                    alllinks.extend(links)
+                TIMES.append((TSTDIR, TST, tt, FtOut, FtErr, reason))
+                test_errors += (FtOut > F_WARN) or (FtErr > F_WARN)
+                FdOut = max(FdOut,FtOut)
+                FdErr = max(FdErr,FtErr)
+                if bodyline is not None:
+                    if FtOut <= F_OK and FtErr <= F_OK:
+                        body_good.append(bodyline)
+                    else:
+                        body_bad.append(bodyline)
+                if FtOut in (F_OK, F_WARN) and FtErr in (F_OK, F_WARN):
+                    oktests.append(TST)
+                if stop_crash and FtErr in (F_SEGV, F_ABRT):
+                    interrupted = True
+                    break
+        except KeyboardInterrupt:
+            print('\nInterrupted')
+            interrupted = True
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            if pSrvr is not None:
+                pSrvr.sendusr1()
+                pSrvr.checkkeys()
+                pSrvr.terminate()
+                pSrvr = None
+                if produce_html:
+                    for ext in ['out', 'err']:
+                        o = openutf8(os.path.join(TSTTRGDIR, f'SingleServer.{ext}.html'), 'w')
+                        o.write('<html>\n')
+                        o.write(f'<head><title>{TSTDIR} standard {"output" if ext == "out" else "error"}</title></head>\n')
+                        o.write('<body>\n')
+                        empty = True
+                        sigusr1 = False
+                        nfree = 0
+                        nused = 0
+                        ntotal = 0
+                        with openutf8(os.path.join(TSTTRGDIR, f'SingleServer.{ext}')) as fil:
+                            for line in fil:
+                                if empty:
+                                    o.write('<pre>\n')
+                                empty = False
+                                if 'SIGUSR1 info start' in line:
+                                    sigusr1 = True
+                                    line = '#' + line
+                                elif 'SIGUSR1 info end' in line:
+                                    sigusr1 = False
+                                    line = '#' + line
+                                elif sigusr1:
+                                    res = fbre.search(line)
+                                    if res is not None:
+                                        nfree += int(res.group('bats'))
+                                    res = ubre.search(line)
+                                    if res is not None:
+                                        nused += int(res.group('bats'))
+                                    res = tbre.search(line)
+                                    if res is not None:
+                                        ntotal = int(res.group('bats'))
+                                    line = '#' + line
+                                span1 = span2 = ''
+                                if line != '\n' and not line.startswith('#'):
+                                    if ext == 'out':
+                                        ssout = F_ERROR
+                                    else:
+                                        sserr = F_ERROR
+                                    span1 = '<span style="background-color: rgb(100%,0%,0%);">'
+                                    span2 = '</span>\n'
+                                    line = line.rstrip('\n')
+                                o.write(span1 + line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') + span2)
+                        if nused + nfree != ntotal:
+                            o.write(f'<span style="background-color: rgb(100%,0%,0%);">Mismatch in free bats: total bats = {ntotal}, #free = {nfree}, #used = {nused}</span>\n')
+                        o.write(f'{"<p>(nothing to see here)</p>" if empty else "</pre>"}\n</body>\n</html>\n')
+                        o.close()
+                else:
+                    for ext in ['out', 'err']:
+                        sigusr1 = False
+                        with openutf8(os.path.join(TSTTRGDIR, f'SingleServer.{ext}')) as fil:
+                            for line in fil:
+                                if 'SIGUSR1 info start' in line:
+                                    sigusr1 = True
+                                    continue
+                                elif 'SIGUSR1 info end' in line:
+                                    sigusr1 = False
+                                    continue
+                                if not sigusr1 and line != '\n' and not line.startswith('#'):
+                                    if ext == 'out':
+                                        ssout = F_ERROR
+                                    else:
+                                        sserr = F_ERROR
+                                    break
+
+        td = time.time() - td
+        TIMES.append((TSTDIR, '', td, FdOut, FdErr, None))
+        if testweb:
+            for f in alllinks:
+                remove(os.path.join(TSTTRGDIR, f))
+
+        if not testweb and produce_html:
+            body = body_bad + body_good
+            CreateHtmlIndex(env, TSTDIR, TSTTRGDIR, ssout, sserr, *body)
+            elem = AddSubToHtmlIndex(env, TSTDIR, max(FdOut, FdErr, ssout, sserr))
+        if ssout == F_ERROR or sserr == F_ERROR:
+            if not verbose:
+                errors.append(('ERROR', f'in directory {TSTDIR}'))
+            else:
+                prred('ERROR')
+                print(f' in directory {TSTDIR}')
+
+        # remove extra files created by tests
+        for f in listdir(TSTTRGDIR):
+            ff = os.path.join(TSTTRGDIR, f)
+            if os.path.islink(ff):
+                continue
+            if os.path.isdir(ff):
+                continue
+            for pat in ['.index.head.html', '.index.html',
+                        'index.head.html', 'index.html',
+                        'times.lst', 'times.sql',
+                        '.*.nosrc.index.html',
+                        '.*.src.index.head.html', '.*.src.index.html',
+                        '*.FILTERED', '.*.SKIPPED.html',
+                        '*.client.err', '*.client.out',
+                        '*.err.diff.html', '*.err.head.html', '*.err.html',
+                        '*.out.diff.html', '*.out.head.html', '*.out.html',
+                        '*.server.err', '*.server.out',
+                        '*.stable.err*', '*.stable.out*',
+                        '*.test.err', '*.test.out',
+                        'SingleServer.out', 'SingleServer.err',
+                        '*.newtest']:
+                if fnmatch.fnmatch(f, pat):
+                    break
+            else:
+                remove(ff)
+
+        if testweb:
+            try:
+                os.removedirs(TSTTRGDIR)
+            except KeyboardInterrupt:
+                raise
+            except:
+                pass
+
+        return TSTDIR, elem, max(FdOut, FdErr, ssout, sserr), interrupted
+    finally:
+        # del sys.path[0]
+        pass
+
+
+# this function is a slightly modified copy of the posixpath version
+# the differences are the doubling of \'s in the replacement value
+# under a very specific condition: when the variable name starts with
+# a Q and the variable name (with Q prefix) does not occur in the
+# environment and the variable name minus the Q prefix does occur in
+# the environment; and the addition of an extra parameter with default
+# so that the environment which is used to expand can be replace.
+_varprog = re.compile(r'\$(\w+|\{[^}]*\})')
+def expandvars(path, environ=os.environ):
+    '''Expand shell variables of form $var and ${var}.  Unknown variables
+    are left unchanged.'''
+    if '$' not in path:
+        return path
+    i = 0
+    while True:
+        m = _varprog.search(path, i)
+        if not m:
+            break
+        i, j = m.span(0)
+        name = m.group(1)
+        if name.startswith('{') and name.endswith('}'):
+            name = name[1:-1]
+        if name in environ:
+            tail = path[j:]
+            val = environ[name]
+            path = path[:i] + val
+            i = len(path)
+            path += tail
+        elif name.startswith('Q') and name[1:] in environ:
+            tail = path[j:]
+            val = environ[name[1:]].replace('\\', '\\\\')
+            path = path[:i] + val
+            i = len(path)
+            path += tail
+        else:
+            i = j
+    return path
+
+
+def coredumpctl(pid):
+    import tempfile
+    # can't use tempfile.NamedTemporaryFile because it opens the file
+    # exclusively
+    fd, name = tempfile.mkstemp(suffix='.sh')
+    fd2, name2 = tempfile.mkstemp()
+    os.close(fd2)
+    os.write(fd, b'#!/bin/sh\ngdb -nx -batch -ex "thread apply all bt full" "$@" > %s\n' % name2.encode('utf-8'))
+    os.close(fd)
+    os.chmod(name, 0o700)
+    # with a more modern coredumpctl, we could use the
+    # -A/--debugger-arguments option:
+    # coredumpctl -q -A "-batch -ex 'thread apply all bt full'" gdb ...
+    if procdebug:
+        print('Starting: coredumpctl -q --debugger=%s gdb %d' % (name, pid))
+    with process.Popen(['coredumpctl', '-q', '--debugger=%s' % name, 'gdb', str(pid)],
+                       stdout=process.PIPE,
+                       stderr=process.PIPE,
+                       text=True) as p:
+        try:
+            out, err = p.communicate(timeout=60)
+        except process.TimeoutExpired:
+            p.kill()
+            out = err = ''
+    os.unlink(name)
+    s = []
+    for l in out.split('\n'):
+        if not l.startswith('                '):
+            s.append(l)
+    with open(name2) as fil:
+        out = '\n'.join(s) + fil.read()
+    os.unlink(name2)
+    return out, err
+
+
+def returnCode(proc, f=None):
+    '''Interpret the return code of a process.
+    If second arg specified, write a message to it.'''
+    if proc.killed:
+        # don't write for timeout, killProc did that already
+        return 'timeout'
+    if os.name == 'nt':
+        if proc.returncode == 3:
+            # heuristic: abort() causes exit code 3
+            if f is not None:
+                f.write('\nAborted\n')
+                f.flush()
+            return 'abort'
+        if proc.returncode == -1073741819: # 0xC0000005
+            if f is not None:
+                f.write('\nSegmentation fault\n')
+                f.flush()
+            return 'segfault'
+        if proc.returncode == -1073741510: # 0xC000013A
+            if f is not None:
+                f.write('\nInterrupt\n')
+                f.flush()
+            return 'interrupt'  # Interrupt
+        if proc.returncode != 0:
+            return 'error'
+    else:
+        if proc.returncode == -signal.SIGSEGV:
+            if f is not None:
+                f.write('\nSegmentation fault\n')
+                if os.path.exists('/usr/bin/coredumpctl'):
+                    # wait a few seconds for the core to be dumped
+                    time.sleep(10)
+                    out, err = coredumpctl(proc.pid)
+                    if out:
+                        f.write(out)
+                f.flush()
+            return 'segfault'   # Segmentation fault
+        if proc.returncode == -signal.SIGBUS:
+            if f is not None:
+                f.write('\nBus error\n')
+                f.flush()
+            return 'segfault'   # Bus error, treat as segfault
+        if proc.returncode == -signal.SIGABRT:
+            if f is not None:
+                f.write('\nAborted\n')
+                if os.path.exists('/usr/bin/coredumpctl'):
+                    # wait a few seconds for the core to be dumped
+                    time.sleep(10)
+                    out, err = coredumpctl(proc.pid)
+                    if out:
+                        f.write(out)
+                f.flush()
+            return 'abort'      # Aborted
+        if proc.returncode == -signal.SIGINT:
+            if f is not None:
+                f.write('\nInterrupt\n')
+                f.flush()
+            return 'interrupt'  # Interrupt
+        if proc.returncode < 0:
+            if f is not None:
+                f.write('\nSignal %d\n' % -proc.returncode)
+                f.flush()
+            return 'signal'     # some other signal
+        if proc.returncode > 0:
+            return 'error'
+    return None                 # no error
+
+
+def GetBitsAndModsAndThreads(env):
+    rtrn = 0
+    cmd = env['exe']['mserver5'].copy()
+    dbpath = os.path.join(env['GDK_DBFARM'], TSTPREF)
+    try:
+        os.unlink(os.path.join(dbpath, '.started'))
+    except OSError:
+        pass
+    cmd.append(f'--dbpath={dbpath}')
+    os.environ['TSTDB'] = TSTPREF
+    cmd.extend(mserver5_opts)
+    if procdebug:
+        print('GetBitsAndModsAndThreads: starting process "%s" (inpipe, outpipe, errpipe)\n' % '" "'.join(cmd))
+    with process.Popen(cmd, stdin=process.PIPE, stdout=process.PIPE,
+                       stderr=process.PIPE, text=True) as proc:
+        stderr = proc.stderr
+        proc.stdout = process._BufferedPipe(proc.stdout)
+        proc.stderr = process._BufferedPipe(proc.stderr)
+        proc.killed = False
+        proc.onechild = True
+        qOut = qErr = ''
+        mods = []
+        timeout = par['TIMEOUT'] != 0
+        try:
+            starttime = time.time()
+            while not timeout or time.time() < starttime + 30:
+                proc.poll()
+                if proc.returncode is not None:
+                    qOut = proc.stdout.read()
+                    qErr = proc.stderr.read()
+                    break
+                if os.path.exists(os.path.join(dbpath, '.started')):
+                    break
+                time.sleep(0.1)
+            if proc.returncode is None:
+                with open(os.path.join(dbpath, '.conn')) as fil:
+                    connurl = fil.read()
+                res = mapiportre.search(connurl)
+                try:
+                    with pymonetdb.connect(username='monetdb',
+                                           password='monetdb',
+                                           hostname=HOST,
+                                           port=int(res.group('port')),
+                                           database=TSTPREF,
+                                           autocommit=True,
+                                           connect_timeout=1.0) as dbh:
+                        if timeout:
+                            dbh.settimeout(30)
+                        with dbh.cursor() as crs:
+                            try:
+                                crs.execute('select distinct module from sys.malfunctions() order by module')
+                            except TimeoutError:
+                                pass
+                            else:
+                                mods = crs.fetchall()
+                                mods = [x[0] for x in mods]
+                                try:
+                                    mods.remove('user')
+                                except ValueError:
+                                    pass
+                except KeyboardInterrupt:
+                    raise
+                except:
+                    print('Exception caught')
+                    print('Local variables:')
+                    print(locals())
+                    print('Global variables:')
+                    print(globals())
+                    raise
+                proc.terminate()
+                qOut = proc.stdout.read(timeout=5)
+                qErr = proc.stderr.read(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except process.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        finally:
+            if proc.returncode is None:
+                killProc(proc, stderr, cmd)
+                proc.wait()
+            if procdebug:
+                print('GetBitsAndModsAndThreads: process exited "%s" (%s)\n' % ('" "'.join(cmd), proc.returncode))
+    env['TST_MODS'] = mods
+    env['TST_BITS'] = ''
+    env['TST_INT128'] = ''
+    env['TST_SINGLE'] = ''
+    env['TST_THREADS'] = ''
+    env['TST_ARCH'] = ''
+    if qOut:
+        tbos = re.compile('^# Compiled for (?P<arch>[^-]+).*/(?P<bits>[63][42]bit)(?P<int128> with 128bit integers|)', re.MULTILINE)
+        tt = re.compile('^# Serving database .*, using ([0-9]+) threads?', re.MULTILINE)
+        vm1 = re.compile('^# Found ([0-9.]+) ([kMGTPE])iB available main-memory of which we use ([0-9.]+) ([kMGTPE])iB')
+        vm2 = re.compile('^# Virtual memory usage limited to ([0-9.]+) ([kMGTPE])iB')
+        sizes = {'k': 1024,
+                 'M': 1024*1024,
+                 'G': 1024*1024*1024,
+                 'T': 1024*1024*1024*1024,
+                 'P': 1024*1024*1024*1024*1024,
+                 'E': 1024*1024*1024*1024*1024*1024}
+        vmsize = 0
+        for l in qOut.split('\n'):
+            obs = tbos.match(l)
+            if obs is not None:
+                env['TST_BITS'] = obs.group('bits')
+                os.environ['TST_BITS'] = env['TST_BITS']
+                if obs.group('int128') == ' with 128bit integers':
+                    env['TST_INT128'] = 'int128'
+                    os.environ['TST_INT128'] = env['TST_INT128']
+                arch = obs.group('arch')
+                if arch == 'amd64':
+                    arch = 'x86_64' # normalize name
+                env['TST_ARCH'] = arch
+            t = tt.match(l)
+            if t:
+                if t.group(1) == '1':
+                    env['TST_SINGLE'] = 'single'
+                    os.environ['TST_SINGLE'] = env['TST_SINGLE']
+                env['TST_THREADS'] = t.group(1)
+            res = vm1.match(l)
+            if res is not None:
+                vmsize = float(res.group(3)) * sizes[res.group(4)]
+            res = vm2.match(l)
+            if res is not None:
+                vmsize = float(res.group(1)) * sizes[res.group(2)]
+        if vmsize > 0:
+            env['TST_VMSIZE'] = str(int(vmsize))
+        else:
+            ErrMsg("Checking for VM size failed!")
+        if not env['TST_BITS']:
+            ErrMsg('Checking for Bits failed!')
+        if not env['TST_MODS']:
+            ErrMsg('Checking for Modules failed!')
+        if not env['TST_BITS'] or not env['TST_MODS']:
+            print(' '.join(cmd) + '\n\n', file=sys.stderr, end='')
+            print(qOut, file=sys.stderr, end='')
+            print(file=sys.stderr)
+            print(qErr, file=sys.stderr, flush=True)
+            rtrn = 1
+        if 'sql' not in mods:
+            ErrMsg('No sql module available!')
+            rtrn = 1
+    else:
+        rtrn = 1
+        ErrMsg('No output from mserver5 when checking for Bits, Modules & Threads!?')
+        if qErr:
+            print(' '.join(cmd) + '\n\n', file=sys.stderr, end='')
+            print(qErr, file=sys.stderr, flush=True)
+    os.environ['TST_MODS'] = str(env['TST_MODS'])
+    return rtrn
+
+
+def CheckMods(env, TST):
+    missing = []
+    if os.path.isfile(TST + '.modules'):
+        with openutf8(TST + '.modules') as fil:
+            for m in fil:
+                m = m.strip()
+                if m  and  m[0] != '#'  and  m not in env['TST_MODS']:
+                    missing.append(m)
+    return missing
+
+
+def CheckTests(env, TST, oktests):
+    missing = []
+    if not os.path.isfile(TST + '.reqtests'):
+        # no required tests, so none missing
+        return missing
+    if env.get('NOCLEAN'):
+        # we didn't clean up from a previous run, assume tests were done
+        return missing
+
+    with openutf8(TST + '.reqtests') as fil:
+        for test in fil:
+            test = test.strip()
+            if not test or test.startswith('#'):
+                continue
+            if test not in oktests:
+                missing.append(test)
+    return missing
+
+
+def StableOutErr(env,par,TST,SYST,RELEASE,DIST,VERSION,TSTTRGDIR):
+    BITS = env['TST_BITS']
+    INT128 = env['TST_INT128']
+    if INT128:
+        INT128 = r'(\.int128)?'
+    SINGLE = env['TST_SINGLE']
+    if SINGLE:
+        SINGLE = r'(\.single)?'
+    ARCH = env['TST_ARCH']
+    dir,file = os.path.split(TST)
+    outre = re.compile(r'^%s\.stable\.(?P<tp>out|err)(\.(%s(%s)?|%s(%s)?))?(\.(%s|%s))?%s%s$' % (re.escape(file), re.escape(SYST), re.escape(RELEASE), re.escape(DIST), re.escape(VERSION), BITS, ARCH, INT128, SINGLE))
+    bestout = besterr = ''
+    for f in listdir(os.path.join(TSTTRGDIR, dir or os.curdir)):
+        res = outre.match(f)
+        if res is not None:
+            if res.group('tp') == 'out':
+                if len(bestout) < len(f):
+                    bestout = f
+            else:                   # res.group('tp') == 'err'
+                if len(besterr) < len(f):
+                    besterr = f
+    if bestout:
+        STABLEout = os.path.join(dir, bestout)[len(TST):]
+    else:
+        STABLEout = '.stable.out'
+    if besterr:
+        STABLEerr = os.path.join(dir, besterr)[len(TST):]
+    else:
+        STABLEerr = '.stable.err'
+    return STABLEout, STABLEerr
+
+
+relcond = {
+    # upgrade testing conditionals:
+    # key is condition, value is tuple with file name and part of message
+    'PREVREL': ('prevrel.zip', 'previous'),
+    'PREVHGEREL': ('prevhgerel.zip', 'previous hugeint'),
+    'PREVCHAINREL': ('prevchainrel.zip', 'previous chained'),
+    'PREVHGECHAINREL': ('prevhgechainrel.zip', 'previous hugeint chained'),
+    'PREVRELEMPTY': ('prevrelempty.zip', 'previous empty'),
+    'PREVHGERELEMPTY': ('prevhgerelempty.zip', 'previous hugeint empty'),
+    'PREVCHAINRELEMPTY': ('prevchainrelempty.zip', 'previous chained empty'),
+    'PREVHGECHAINRELEMPTY': ('prevhgechainrelempty.zip',
+                             'previous hugeint chained empty'),
+    'LASTREL': ('lastrel.zip', 'last'),
+    'LASTHGEREL': ('lasthgerel.zip', 'last hugeint'),
+    'LASTCHAINREL': ('lastchainrel.zip', 'last chained'),
+    'LASTHGECHAINREL': ('lasthgechainrel.zip', 'last hugeint chained'),
+    'LASTRELEMPTY': ('lastrelempty.zip', 'last empty'),
+    'LASTHGERELEMPTY': ('lasthgerelempty.zip', 'last hugeint empty'),
+    'LASTCHAINRELEMPTY': ('lastchainrelempty.zip', 'last chained empty'),
+    'LASTHGECHAINRELEMPTY': ('lasthgechainrelempty.zip',
+                             'last hugeint chained empty'),
+}
+
+tests = (
+    # file extension  EXT        CALL      SERVER
+    ('.test',         '.test',   'sqltest','SQL'),
+    ('.maltest',      '.maltest','maltest','SQL'),
+    ('.py',           '.py',     'python', ''),
+    ('.SQL.py',       '.SQL.py', 'python', 'SQL'),
+    ('.rb',           '.rb',     'ruby',   'SQL'),
+)
+
+
+def RunTest(env, TST, COND, oktests, length, pSrvr, total_tests, options, environ, TSTDB, TSTDIR, TSTSRCDIR, RELSRCDIR, TSTTRGDIR):
+    Failed = F_SKIP
+    FailedOut = F_SKIP
+    FailedErr = F_SKIP
+    elem = None
+    reason = None               # reason for skipping (if any)
+    links = []                  # symlinks we make
+    threads = None              # set if we override number of threads
+
+    TX = -1
+    EXT = CALL = SERVER = ''
+    x  = isexecutable(os.path.join(TSTSRCDIR, TST))
+    xS = isexecutable(os.path.join(TSTSRCDIR, TST) + '.SQL')
+    if x[0]:
+        EXT = x[1]
+        CALL = 'other'
+    elif xS[0]:
+        EXT = '.SQL'+xS[1]
+        CALL = 'other'
+        SERVER = 'SQL'
+    else:
+        for tst, ext, cll, srv in tests:
+            if os.path.isfile(os.path.join(TSTSRCDIR, TST + tst)) or \
+               os.path.isfile(os.path.join(TSTSRCDIR, TST + tst + '.src')) or \
+               os.path.isfile(os.path.join(TSTSRCDIR, TST + tst + '.in')):
+                EXT = ext
+                CALL = cll
+                SERVER = srv
+                break
+
+    MissingMods = CheckMods(env, os.path.join(TSTSRCDIR, TST))
+    MissingTests = CheckTests(env, os.path.join(TSTSRCDIR, TST), oktests)
+    nomito = os.path.isfile(os.path.join(TSTSRCDIR, TST + '.nomito'))
+    user = None
+    passwd = None
+    odbc = False                # whether to set up odbc.ini file
+
+    if COND and not ignore_conditions:
+        for cond in COND.split('&'):
+            if cond.startswith('!'):
+                negate = True
+                cond = cond[1:]
+            else:
+                negate = False
+            if cond in relcond:
+                if not os.path.exists(os.path.join(env['GDK_DBFARM'], relcond[cond][0])):
+                    reason = 'as %s release database is not available' % relcond[cond][1]
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('THREADS='):
+                if negate:
+                    reason = 'impossible combination of THREADS= and negation'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+                elif env['GDK_NR_THREADS'] == '0' or \
+                   int(env['TST_THREADS']) >= int(cond[8:]):
+                    threads = cond[8:]
+                elif env['TST_THREADS'] != cond[8:]:
+                    reason = 'as number of threads is wrong'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('THREADS<='):
+                if (int(env['TST_THREADS']) <= int(cond[9:])) == negate:
+                    reason = 'as number of threads is too' \
+                        f' {"small" if negate else "large"}'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('THREADS>='):
+                if (int(env['TST_THREADS']) >= int(cond[9:])) == negate:
+                    reason = 'as number of threads is too' \
+                        f' {"large" if negate else "small"}'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('VMSIZE>='):
+                if (int(env['TST_VMSIZE']) >= int(cond[8:])) == negate:
+                    reason = 'as virtual memory size is too' \
+                        f' {"large" if negate else "small"}'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('VMSIZE<='):
+                if (int(env['TST_VMSIZE']) <= int(cond[8:])) == negate:
+                    reason = 'as virtual memory size is too' \
+                        f' {"small" if negate else "large"}'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+            elif cond.startswith('USER='):
+                if negate:
+                    reason = 'impossible combination of USER= and negation'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+                user = cond[5:]
+            elif cond.startswith('PASSWD='):
+                if negate:
+                    reason = 'impossible combination of PASSWD= and negation'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+                passwd = cond[7:]
+            elif cond.startswith('GEOS_VERSION>='):
+                if not geos_version or not geos_version[0]:
+                    reason = 'no geos version information available'
+                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                    break
+                req_vers = cond[14:].split('.')
+                if not negate:
+                    for i in range(len(geos_version)):
+                        if i >= len(req_vers):
+                            break
+                        if int(geos_version[i]) > int(req_vers[i]):
+                            break
+                        if int(geos_version[i]) < int(req_vers[i]):
+                            reason = 'geos version too low'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                else:
+                    for i in range(len(geos_version)):
+                        if i >= len(req_vers):
+                            reason = 'geos version too high'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                        if int(geos_version[i]) < int(req_vers[i]):
+                            break
+                        if int(geos_version[i]) > int(req_vers[i]):
+                            reason = 'geos version too high'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                    else:
+                        reason = 'geos version too high'
+                        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                if reason is not None:
+                    break
+            elif cond.startswith('PYTHON_VERSION>='):
+                req_vers = cond[16:].split('.')
+                if not negate:
+                    for i in range(3):
+                        if i >= len(req_vers):
+                            break
+                        if int(sys.version_info[i]) > int(req_vers[i]):
+                            break
+                        if int(sys.version_info[i]) < int(req_vers[i]):
+                            reason = 'Python version too low'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                else:
+                    for i in range(3):
+                        if i >= len(req_vers):
+                            reason = 'Python version too high'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                        if int(sys.version_info[i]) < int(req_vers[i]):
+                            break
+                        if int(sys.version_info[i]) > int(req_vers[i]):
+                            reason = 'Python version too high'
+                            elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                            break
+                    else:
+                        reason = 'Python version too high'
+                        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                if reason is not None:
+                    break
+            elif cond.startswith('R_VERSION>='):
+                rversion = os.path.join('@LIBR_INCLUDE_DIRS@', 'Rversion.h')
+                if os.path.exists(rversion):
+                    with openutf8(rversion, 'r') as f:
+                        res = re.search(r'#define R_VERSION (?P<rversion>\d+)', f.read())
+                        if res is not None:
+                            r_version = res.group('rversion')
+                            req_version = cond[11:].split('.')
+                            req_version = int(req_version[0]) * 65536 + int(req_version[1]) * 256 + int(req_version[2])
+                            if not negate:
+                                if int(r_version) < req_version:
+                                    reason = 'R version too low'
+                                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                                    break
+                            else:
+                                if int(r_version) >= req_version:
+                                    reason = 'R version too high'
+                                    elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                                    break
+            elif cond not in CONDITIONALS:
+                reason = "as conditional '%s' is unknown." % cond
+                elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                break
+            elif (not CONDITIONALS[cond]) != negate:
+                if negate:
+                    reason = "as conditional '%s' holds." % cond
+                else:
+                    reason = "as conditional '%s' does not hold." % cond
+                elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                break
+            elif cond in ('HAVE_ODBC', 'HAVE_PYODBC'):
+                odbc = True
+    if elem is None and not CALL:
+        if os.name == 'nt':
+            reason = "test missing: '"+os.path.join(TSTSRCDIR,TST)+".(exe|com|bat|cmd|py|sql)`"
+        else:
+            reason = "test missing: '"+os.path.join(TSTSRCDIR,TST)+"[.py|.sql|.rb]`"
+        if verbose:
+            if ttywidth > 0 and length + 10 + 21 >= ttywidth:
+                # 10 - length of prompt()
+                # 21 - length of time plus result
+                l = ttywidth - 10 - 21 - 1
+                if len(TST) <= l:
+                    s = '%-*s ' % (l, TST)
+                else:
+                    s = '%s...%s ' % (TST[:l//2 - 2], TST[l//2+1-l:])
+            else:
+                s = '%-*s ' % (length, TST)
+            print('%s%s' % (prompt(), s), end='')
+            prred('TEST MISSING')
+            print()
+        else:
+            errors.append(('MISSING', os.path.join(TSTDIR, TSTSUFF, TST + EXT)))
+
+        return TX,Failed,Failed,elem,reason,links
+
+    if reason:
+        pass
+    elif MissingTests:
+        reason = "as required test%s '%s' failed." % ('s' if len(MissingTests) != 1 else '', "', '".join(MissingTests))
+        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+    elif CALL == 'ruby' and 'ruby_client' not in env['exe']:
+        reason = 'as ruby is not available.'
+        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+    elif MissingMods:
+        reason = f"as modules '{MissingMods}` are missing."
+        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+    elif skip_timeout and os.path.isfile(os.path.join(TSTSRCDIR, TST+'.timeout')):
+        reason = 'test with timeout'
+        elem = SkipTest(env, TST, EXT, reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+    else:
+        srcdir = os.path.join(TSTTRGDIR, RELSRCDIR)
+        for f in listdir(srcdir):
+            if f.startswith(TST+'.'):
+                try:
+                    SymlinkOrCopy(os.path.join(RELSRCDIR, f), f, TSTTRGDIR)
+                    links.append(os.path.join(TSTTRGDIR, f))
+                except IOError as err:
+                    if not env.get('NOCLEAN'):
+                        ErrMsg("SymlinkOrCopy('%s','%s') in '%s' failed with #%d: '%s'."
+                               % (os.path.join(RELSRCDIR, f), f, TSTTRGDIR, err.errno, err.strerror))
+                except OSError:
+                    if not env.get('NOCLEAN'):
+                        raise
+
+        myenv = env.copy()
+        myenv['TSTDB'] = TSTDB
+        myenv['TSTDIR'] = TSTDIR
+        myenv['TSTSRCDIR'] = TSTSRCDIR
+        myenv['RELSRCDIR'] = RELSRCDIR
+        myenv['TSTTRGDIR'] = TSTTRGDIR
+        for ff in listdir(TSTTRGDIR):
+            if ff.startswith(TST+'.'):
+                if ff.endswith('.src') and not os.path.isfile(os.path.join(TSTTRGDIR, ff[:-4])):
+                    with openutf8(os.path.join(TSTTRGDIR, ff),'r') as f:
+                        TSTSRC = expandvars(path(f.readline().strip()), myenv)
+                    if os.path.isfile(os.path.join(TSTTRGDIR, TSTSRC)):
+                        try:
+                            SymlinkOrCopy(TSTSRC, ff[:-4], TSTTRGDIR)
+                            links.append(ff[:-4])
+                        except IOError as err:
+                            ErrMsg("SymlinkOrCopy('%s','%s') in '%s' failed with #%d: '%s'."
+                                   % (TSTSRC, ff[:-4], TSTTRGDIR, err.errno, err.strerror))
+                    elif ff == TST+EXT+'.src':
+                        reason = "as source file '%s` is missing." % TSTSRC
+                        elem = SkipTest(env, TST, EXT+'.src', reason, length, TSTDIR, TSTTRGDIR, TSTSRCDIR)
+                        return TX,Failed,Failed,elem,reason,links
+                    else:
+                        Warn("source file '"+TSTSRC+"` is missing.")
+                elif ff.endswith('.in') and not ff.endswith('.test.in') and not os.path.isfile(os.path.join(TSTTRGDIR, ff[:-3])):
+                    with openutf8(os.path.join(TSTTRGDIR, ff[:-3]),'w') as f, \
+                         openutf8(os.path.join(TSTTRGDIR, ff)) as fil:
+                        for l in fil:
+                            f.write(expandvars(l, myenv))
+
+        if odbc:
+            with openutf8(os.path.join(TSTTRGDIR, 'odbcinst.ini'), 'w') as f:
+                f.write(f'''\
+[MonetDB]
+Description = Test MonetDB Data Source
+Driver = {env["LIBDIR"]}/libMonetODBC.so
+Setup = {env["LIBDIR"]}/libMonetODBCs.so
+''')
+            with openutf8(os.path.join(TSTTRGDIR, 'odbc.ini'), 'w') as f:
+                f.write(f'''\
+[MonetDB-Test]
+Description = Test MonetDB Data Source
+Driver = MonetDB
+Host = localhost
+Port = {pSrvr.port}
+Database = {TSTDB}
+User = {user or "monetdb"}
+Password = {passwd or "monetdb"}
+Debug =
+
+[MonetDB-Test-Wrong]
+Description = Wrong values for Database, Uid and Pwd
+Driver = MonetDB
+Host = localhost
+Port = {pSrvr.port}
+Database = {TSTDB}
+User = {user or "monetdb"}-Wrong
+Password = {passwd or "monetdb"}-Wrong
+''')
+            orig_odbcsysini = environ.pop('ODBCSYSINI', None)
+            orig_odbcini = environ.pop('ODBCINI', None)
+            orig_odbcinstini = environ.pop('ODBCINSTINI', None)
+            environ['ODBCSYSINI'] = TSTTRGDIR
+            environ['ODBCINI'] = os.path.join(TSTTRGDIR, 'odbc.ini')
+
+        STABLEout,STABLEerr = StableOutErr(env,par,TST,SYST,RELEASE,DIST,VERSION,TSTTRGDIR)
+        TIMEOUT = par['TIMEOUT']
+        if os.path.isfile(os.path.join(TSTTRGDIR, TST+'.timeout')):
+            with openutf8(os.path.join(TSTTRGDIR, TST+'.timeout')) as fil:
+                for f in fil:
+                    TOf = float(f.strip())
+                    if TOf > 0:
+                        TIMEOUT = int(TIMEOUT * TOf)
+                    if TIMEOUT < 1 and par['TIMEOUT'] > 0:
+                        TIMEOUT = 1
+
+        ME = ''
+
+        TestOutFile = TST+'.test.out'
+        TestErrFile = TST+'.test.err'
+        openutf8(os.path.join(TSTTRGDIR, TestOutFile), 'w').close()
+        openutf8(os.path.join(TSTTRGDIR, TestErrFile), 'w').close()
+
+        t0 = time.time()
+        tres = DoIt(env, SERVER, CALL, TST, EXT, TestOutFile, TestErrFile,
+                    TIMEOUT, ME, length, nomito, threads, user, passwd, COND,
+                    pSrvr, total_tests, options, TSTDB, TSTDIR, TSTTRGDIR,
+                    TSTSRCDIR, environ)
+        t1 = time.time()
+        TX = t1 - t0
+        if verbose:
+            print(f' {TX:7.3f}s ', end='')
+
+        if odbc:
+            if orig_odbcsysini is not None:
+                environ['ODBCSYSINI'] = orig_odbcsysini
+            else:
+                del environ['ODBCSYSINI']
+            if orig_odbcini is not None:
+                environ['ODBCINI'] = orig_odbcini
+            if orig_odbcinstini is not None:
+                environ['ODBCINSTINI'] = orig_odbcinstini
+
+
+        if tres == 'timeout':
+            errcode = F_TIME
+        elif tres == 'recursion':
+            errcode = F_RECU
+        elif tres == 'segfault':
+            errcode = F_SEGV
+        elif tres == 'abort':
+            errcode = F_ABRT
+        elif tres == 'socket':
+            errcode = F_SOCK
+        elif tres == 'error':
+            errcode = F_WARN
+        elif tres is not None:
+            errcode = F_ERROR
+        else:
+            errcode = F_OK
+
+        if pSrvr is not None:
+            if pSrvr.poll() is None:
+                sockerr = F_OK
+            else:
+                sres = returnCode(pSrvr.proc, openutf8(os.path.join(TSTTRGDIR, TestErrFile), 'a'))
+                if sres == 'segfault':
+                    sockerr = F_SEGV
+                elif sres == 'abort':
+                    sockerr = F_ABRT
+                else:
+                    sockerr = F_ERROR
+        else:
+            sockerr = F_OK
+
+        if tres == 'socket':
+            if not verbose and not produce_html:
+                errors.append(('SOCKET', TST))
+
+        if tres == 'timeout':
+            if not verbose and not produce_html:
+                errors.append(('TIMEOUT', TST))
+
+        if tres == 'recursion':
+            if not verbose and not produce_html:
+                errors.append(('RECURSION', TST))
+
+        if tres == 'segfault':
+            if not verbose and not produce_html:
+                errors.append(('CRASHED', TST))
+
+        if tres == 'signal':
+            if not verbose and not produce_html:
+                errors.append(('SIGNALED', TST))
+
+        try:
+            print('', end='', flush=True)
+        except IOError as err:
+            Warn("Flushing STDOUT in RunTest failed with #%d: '%s'." % (err.errno, err.strerror))
+
+        if REV:
+            d = '%s%s/%s' % (URLPREFIX, url(TSTDIR), TSTSUFF)
+            if os.path.isfile(os.path.join(TSTTRGDIR, TST + EXT + '.src')):
+                with openutf8(os.path.join(TSTTRGDIR, TST + EXT + '.src')) as fil:
+                    f = fil.readline().strip()
+                if f.startswith('$RELSRCDIR/'):
+                    f = f[11:]
+                    while f.startswith('../'):
+                        f = f[3:]
+                        d = d[:d.rindex('/')]
+                f = '%s/%s' % (d, f)
+            elif os.path.isfile(os.path.join(TSTTRGDIR, TST + EXT + '.in')):
+                f = '%s/%s%s.in' % (d, TST, EXT)
+            else:
+                f = '%s/%s%s' % (d, TST, EXT)
+            if testweb:
+                # splice in a link to the bug report if we recognize a
+                # reference
+                res = bugre.search(TST)
+                if res is not None:
+                    bugno = res.group('bugno')
+                    tst = '%s<a target="_blank" href="https://github.com/MonetDB/MonetDB/issues/%s">%s</a>%s' % (TST[:res.start(0)+1], bugno, res.group(0)[1:], TST[res.end(0):])
+                else:
+                    tst = TST
+        with openutf8(os.path.join(TSTTRGDIR, '%s.test.out' % TST)) as fil:
+            out = fil.read()
+        if out and [x for x in out.splitlines() if not x.startswith('#')]:
+            FailedOut = F_ERROR
+        else:
+            FailedOut = F_OK
+        with openutf8(os.path.join(TSTTRGDIR, '%s.test.err' % TST)) as fil:
+            err = fil.read()
+        if err and [x for x in err.splitlines() if not x.startswith('#')]:
+            if max(sockerr, errcode) in (F_SOCK, F_TIME, F_RECU, F_ABRT, F_SEGV):
+                FailedErr = max(sockerr, errcode)
+            else:
+                FailedErr = F_ERROR
+        else:
+            FailedErr = F_OK
+        if produce_html:
+            with openutf8(os.path.join(TSTTRGDIR, '%s.out.diff.html' % TST),'w') as diff_html:
+                Element('html', None,
+#                         Element('head', None,
+#                                 Element('style', None,
+#                                         Text('''
+# .neutral { color: black; }
+# .deleted { color: red; }
+# .added   { color: green; }
+# '''))),
+                        Element('body', None,
+                                Element('pre', None,
+                                        Text(out)))).write(diff_html, True)
+                if FailedOut == F_ERROR:
+                    diff_html.write('<!--MajorDiffs-->\n')
+                else:
+                    diff_html.write('<!--NoDiffs-->\n')
+            with openutf8(os.path.join(TSTTRGDIR, '%s.err.diff.html' % TST),'w') as diff_html:
+                Element('html', None,
+#                         Element('head', None,
+#                                 Element('style', None,
+#                                         Text('''
+# .neutral { color: black; }
+# .deleted { color: red; }
+# .added   { color: green; }
+# '''))),
+                        Element('body', None,
+                                Element('pre', None,
+                                        Text(err)))).write(diff_html, True)
+                if FailedErr == F_ERROR:
+                    diff_html.write('<!--MajorDiffs-->\n')
+                else:
+                    diff_html.write('<!--NoDiffs-->\n')
+
+            if not verbose and (FailedOut > F_WARN or FailedErr > F_WARN):
+                errors.append(({'socket':'SOCKET',
+                                'timeout':'TIMEOUT',
+                                'recursion':'RECURSION',
+                                'segfault':'CRASHED',
+                                'abort':'ABORTED',
+                                'signal':'SIGNALED'}.get(tres, 'ERROR'),
+                               os.path.join(TSTDIR, TSTSUFF, TST + EXT)))
+            elif verbose:
+                if tres == 'socket':
+                    prpurple('SOCKET')
+                elif tres == 'timeout':
+                    prpurple('TIMEOUT')
+                elif tres == 'recursion':
+                    prpurple('RECURSION')
+                elif tres == 'segfault':
+                    prpurple('CRASHED')
+                elif tres == 'abort':
+                    prpurple('ABORTED')
+                elif tres == 'signal':
+                    prpurple('SIGNALED')
+                elif FailedOut == F_OK and FailedErr == F_OK:
+                    prgreen('OK')
+                elif FailedOut <= F_WARN and FailedErr <= F_WARN:
+                    prgreen('minor')
+                else:
+                    prred('ERROR')
+                print()
+        elif FailedOut > F_WARN or FailedErr > F_WARN:
+            print()
+            print('========================================')
+            prred('ERROR: ')
+            print(os.path.join(TSTDIR, TSTSUFF, TST + EXT))
+            print('========================================')
+            with openutf8(os.path.join(TSTTRGDIR, TestErrFile), 'r') as f:
+                print(f.read())
+            print()
+
+        if FailedOut == F_OK and FailedErr == F_OK and testweb:
+            for f in ['%s.out.diff.html' % TST, '%s.test.out' % TST,
+                      '%s.server.out' % TST, '%s.client.out' % TST,
+                      '%s.test.out.FILTERED' % TST,
+                      '%s%s.FILTERED' % (TST, STABLEout),
+                      '%s.err.diff.html' % TST, '%s.test.err' % TST,
+                      '%s.server.err' % TST, '%s.client.err' % TST,
+                      '%s.test.err.FILTERED' % TST,
+                      '%s%s.FILTERED' % (TST, STABLEerr)]:
+                remove(os.path.join(TSTTRGDIR, f))
+
+        if not testweb and produce_html:
+            elem = AddTstToHtmlIndex(env, TST, STABLEout, STABLEerr, EXT,
+                                     FailedOut, FailedErr, TSTDIR, TSTTRGDIR, TSTSRCDIR, RELSRCDIR)
+
+    return TX,FailedOut,FailedErr,elem,reason,links
+
+
+def prompt():
+    return time.strftime('%H:%M:%S> ',time.localtime(time.time()))
+
+
+def getkids():
+    # return a dictionary with process IDs as key and a list of child
+    # processes as value
+    with process.Popen(['ps', '-lu', os.getenv('USER')],
+                       stdout=process.PIPE, stderr=process.PIPE,
+                       text=True) as p:
+        out, err = p.communicate()
+    if err:
+        return {}
+    lines = out.split('\n')
+    line0 = lines[0].split()
+    del lines[0]
+    del lines[-1]
+    pidcol = ppidcol = None
+    for i in range(len(line0)):
+        if line0[i] == 'PID':
+            pidcol = i
+        elif line0[i] == 'PPID':
+            ppidcol = i
+    if pidcol is None or ppidcol is None:
+        return {}
+    procs = {}
+    for line in lines:
+        line = line.split()
+        try:
+            pid = int(line[pidcol])
+            ppid = int(line[ppidcol])
+        except (ValueError, IndexError):
+            continue
+        if ppid not in procs:
+            procs[ppid] = []
+        procs[ppid].append(pid)
+    return procs
+
+
+def killchildren(pid, procs=None):
+    # not called on Windows
+    # kill the specified process ID and all its children
+    if procs is None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            return
+        except AttributeError:
+            try:
+                os.kill(-pid, signal.SIGKILL)
+                return
+            except OSError:
+                pass
+        except OSError:
+            pass
+        procs = getkids()
+    for kid in procs.get(pid, []):
+        killchildren(kid, procs)
+    if procdebug:
+        print('killing process %d' % pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        if procdebug:
+            print('killing process %d failed' % pid)
+
+
+def stacktrace(proc, outfile):
+    out = ''
+    if os.name == 'nt':
+        sym = ''
+        cdb = r'c:\Program Files\Debugging Tools for Windows (x64)\cdb.exe'
+        if os.path.exists(cdb):
+            if os.path.exists(r'c:\Symbols'):
+                sym = r'c:\Symbols;'
+        else:
+            cdb = r'c:\Program Files\Debugging Tools for Windows (x86)\cdb.exe'
+            if os.path.exists(cdb):
+                if os.path.exists(r'c:\WINDOWS\Symbols'):
+                    sym = r'c:\WINDOWS\Symbols;'
+            else:
+                cdb = None
+        if cdb is not None:
+            with process.Popen([cdb, '-pv', '-p', str(proc.pid),
+                                '-y', f'{sym}cache*;srv*http://msdl.microsoft.com/download/symbols',
+                                '-lines', '-c', '~*kP;!locks;q'],
+                               stdout=process.PIPE, text=True) as p:
+                try:
+                    out, err = p.communicate(timeout=60)
+                except process.TimeoutExpired:
+                    p.kill()
+    elif platform.system() == 'Darwin':
+        try:
+            with process.Popen(['lldb', '--attach-pid', str(proc.pid),
+                                '--batch', '--one-line', 'bt all'],
+                               stdout=process.PIPE, text=True) as p:
+                try:
+                    out, err = p.communicate(timeout=60)
+                except process.TimeoutExpired:
+                    p.kill()
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+    else:
+        try:
+            with process.Popen(['gdb', '-n', '-p', str(proc.pid),
+                                '-batch', '-ex', 'thread apply all bt full'],
+                               stdout=process.PIPE, text=True) as p:
+                try:
+                    out, err = p.communicate(timeout=600)
+                except process.TimeoutExpired:
+                    # gdb sometimes hangs when trying to get the stack
+                    # trace: kill it mercilessly if it does
+                    p.kill()
+                    p.wait()
+                    out = ''
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+    if outfile is not None and out:
+        try:
+            outfile.write(f'\n{out}\n')
+        except (ValueError, IOError):
+            print('cannot write stack trace')
+            print(out)
+
+
+def killProc(proc, outfile=None, cmd=None, psrvr=None):
+    if type(cmd) is type([]):
+        cmd = ' '.join(cmd)
+    if procdebug:
+        print('timeout for process %d (%s)' % (proc.pid, cmd))
+    if outfile is not None and cmd is not None:
+        try:
+            outfile.write('\n!Mtimeout: Timeout: %s\n' % cmd)
+        except (ValueError, IOError):
+            print('cannot write timeout message ' + cmd)
+    stacktrace(proc, outfile)
+    proc.killed = True
+    if proc.onechild:
+        if psrvr is not None and psrvr.proc is proc:
+            if procdebug:
+                print(f'killProc: calling psrvr.terminate() on PID {proc.pid}')
+            psrvr.terminate()
+        else:
+            if procdebug:
+                print(f'killProc: calling proc.kill() on PID {proc.pid}')
+            proc.kill()
+    elif os.name == 'nt':
+        if procdebug:
+            print('killProc: starting process "taskkill" "/F" "/T" "/PID" "%s"\n' % str(proc.pid))
+        with process.Popen(['taskkill','/F','/T','/PID',str(proc.pid)],
+                           stdout=process.PIPE, stderr=process.PIPE,
+                           text=True) as p:
+            out, err = p.communicate()
+        if procdebug:
+            print('killProc: process exited "taskkill" "/F" "/T" "/PID" "%s" (%s)\n' % (str(proc.pid), proc.returncode))
+        proc.kill()
+    else:
+        killchildren(proc.pid)
+
+
+sys_pkeys = [
+    ('schemas', 'id'),
+    ('_tables', 'id'),
+    ('tables', 'id'),
+    ('_columns', 'id'),
+    ('columns', 'id'),
+    ('functions', 'id'),
+    ('args', 'id'),
+    ('types', 'id'),
+    ('objects', 'id, nr'),
+    ('keys', 'id'),
+    ('idxs', 'id'),
+    ('triggers', 'id'),
+    ('sequences', 'id'),
+    ('dependency_types', 'dependency_type_id'),
+    ('dependencies', 'id, depend_id'),
+    ('auths', 'id'),
+    ('users', 'name'),
+    ('user_role', 'login_id, role_id'),
+    ('privileges', 'obj_id, auth_id, privileges'),
+    ('querylog_catalog', 'id'),
+    ('querylog_calls', 'id'),
+    ('querylog_history', 'id'),
+    ('optimizers', 'name'),
+    ('environment', 'name'),
+    ('db_user_info', 'name'),
+    ('statistics', 'column_id'),
+    ('"storage"()', 'schema, "table", "column"'),
+    ('storagemodelinput', 'schema, "table", "column"'),
+
+    ('rejects', 'rowid'),
+
+    ('keywords', 'keyword'),
+    ('table_types', 'table_type_id'),
+
+    ('function_languages', 'language_id'),
+    ('function_types', 'function_type_id'),
+    ('index_types', 'index_type_id'),
+    ('key_types', 'key_type_id'),
+    ('privilege_codes', 'privilege_code_id'),
+
+    ('comments', 'id'),
+    ('ids', 'id'),
+    ('var_values', 'var_name'),
+
+    ('table_partitions', 'id'),
+    ('range_partitions', 'table_id'),
+    ('value_partitions', 'table_id, partition_id, "value"'),
+
+    ('queue', 'tag'),
+    ('sessions', 'sessionid'),
+
+    ('fkey_actions', 'action_id'),
+    ('fkeys', 'id'),
+]
+
+sys_akeys = [
+    ('schemas', 'name'),
+    ('_tables', 'schema_id, name'),
+    ('tables', 'schema_id, name'),
+    ('_columns', 'table_id, name'),
+    ('columns', 'table_id, name'),
+    ('_columns', 'table_id, number'),
+    ('columns', 'table_id, number'),
+
+    ('(SELECT id FROM sys.schemas UNION ALL SELECT id FROM sys._tables UNION ALL SELECT id FROM sys._columns UNION ALL SELECT id FROM sys.functions) as T', 'T.id'),
+    ('(SELECT id FROM sys.schemas UNION ALL SELECT id FROM sys.tables UNION ALL SELECT id FROM sys.columns UNION ALL SELECT id FROM sys.functions) as T', 'T.id'),
+
+    ('functions f join sys.args a on f.id=a.func_id', 'schema_id, f.name, func, mod, language, f.type, side_effect, varres, vararg, a.id'),
+    ('args', 'func_id, name, inout'),
+    ('types', 'schema_id, systemname, sqlname'),
+    ('objects', 'id, name'),
+    ('keys', 'table_id, name'),
+    ('idxs', 'table_id, name'),
+    ('triggers', 'table_id, name'),
+    ('sequences', 'schema_id, name'),
+    ('dependency_types', 'dependency_type_name'),
+    ('auths', 'name'),
+    ('optimizers', 'def'),
+
+    ('table_types', 'table_type_name'),
+    ('function_types', 'function_type_name'),
+    ('function_languages', 'language_name'),
+    ('index_types', 'index_type_name'),
+    ('key_types', 'key_type_name'),
+    ('privilege_codes', 'privilege_code_name'),
+    ('comments', 'id'),
+
+    ('table_partitions WHERE column_id IS NOT NULL', 'table_id, column_id'),
+    ('table_partitions WHERE "expression" IS NOT NULL', 'table_id, "expression"'),
+
+    ('fkey_actions', 'action_name'),
+    ('fkeys', 'table_id, name'),
+]
+
+sys_fkeys = [
+    ('schemas', 'authorization', '', 'id', 'auths'),
+    ('schemas', 'owner', '', 'id', 'auths'),
+    ('_tables', 'schema_id', '', 'id', 'schemas'),
+    ('tables', 'schema_id', '', 'id', 'schemas'),
+    ('_tables', '"type"', '', 'table_type_id', 'table_types'),
+    ('tables', 'type', '', 'table_type_id', 'table_types'),
+    ('_columns', 'table_id', '', 'id', '_tables'),
+    ('columns', 'table_id', '', 'id', 'tables'),
+    ('_columns', '"type"', '', 'sqlname', 'types'),
+    ('columns', '"type"', '', 'sqlname', 'types'),
+    ('functions', 'schema_id', '', 'id', 'schemas'),
+    ('functions', '"type"', '', 'function_type_id', 'function_types'),
+    ('functions', 'language', '', 'language_id', 'function_languages'),
+
+    ('functions', 'schema_id', 'system', 'id', 'schemas WHERE system'),
+    ('args', 'func_id', '', 'id', 'functions'),
+    ('args', '"type"', '', 'sqlname', 'types'),
+    ('types', 'schema_id', '', 'id', 'schemas'),
+
+    ('objects', 'id', '', 'id', 'ids'),
+    ('ids', 'id', "obj_type IN ('key', 'index')", 'id', 'objects'),
+    ('keys', 'id', '', 'id', 'objects'),
+    ('keys', 'table_id', '', 'id', '_tables'),
+    ('keys', 'table_id', '', 'id', 'tables'),
+    ('keys', '"type"', '', 'key_type_id', 'key_types'),
+    ('keys', 'rkey', 'rkey <> -1', 'id', 'keys'),
+
+    ('idxs', 'id', '', 'id', 'objects'),
+    ('idxs', 'table_id', '', 'id', '_tables'),
+    ('idxs', 'table_id', '', 'id', 'tables'),
+    ('idxs', '"type"', '', 'index_type_id', 'index_types'),
+    ('sequences', 'schema_id', '', 'id', 'schemas'),
+    ('triggers', 'table_id', '', 'id', '_tables'),
+    ('triggers', 'table_id', '', 'id', 'tables'),
+    ('comments', 'id', '', 'id', 'ids'),
+    # ('dependencies', 'id', '', 'id', 'ids'),
+    # ('dependencies', 'depend_id', '', 'id', 'ids'),
+    # ('dependencies', 'depend_type', '', 'dependency_type_id', 'dependency_types'),
+    # ('dependencies', 'id, depend_id, depend_type', '', 'v.id, v.used_by_id, v.depend_type', 'dependencies_vw v'),
+    ('auths', 'grantor', 'grantor > 0', 'id', 'auths'),
+    ('users', 'name', '', 'name', 'auths'),
+    ('users', 'default_schema', '', 'id', 'schemas'),
+    ('users', 'optimizer', '', 'name', 'optimizers'),
+    ('users', 'default_role', '', 'id', 'auths'),
+    ('db_user_info', 'name', '', 'name', 'auths'),
+    ('db_user_info', 'default_schema', '', 'id', 'schemas'),
+    ('db_user_info', 'optimizer', '', 'name', 'optimizers'),
+    ('db_user_info', 'default_role', '', 'id', 'auths'),
+    ('user_role', 'login_id', '', 'id', 'auths'),
+    ('user_role', 'login_id', '', 'a.id', 'auths a WHERE a.name IN (SELECT u.name FROM sys.users u)'),
+    ('user_role', 'role_id', '', 'id', 'auths'),
+    ('user_role', 'role_id', '', 'id', 'roles'),
+    ('privileges', 'obj_id', '(obj_id <> 0 OR auth_id NOT IN (SELECT id FROM sys.auths))', 'id', '(SELECT id FROM sys.schemas UNION ALL SELECT id FROM sys._tables UNION ALL SELECT id FROM sys._columns UNION ALL SELECT id FROM sys.functions) as t'),
+    ('privileges', 'auth_id', '', 'id', 'auths'),
+    ('privileges', 'grantor', ' grantor > 0', 'id', 'auths'),
+    ('privileges', 'privileges', '', 'privilege_code_id', 'privilege_codes'),
+    ('querylog_catalog', 'owner', '', 'name', 'users'),
+    ('querylog_catalog', 'pipe', '', 'name', 'optimizers'),
+    ('querylog_calls', 'id', '', 'id', 'querylog_catalog'),
+    ('querylog_history', 'id', '', 'id', 'querylog_catalog'),
+    ('querylog_history', 'owner', '', 'name', 'users'),
+    ('querylog_history', 'pipe', '', 'name', 'optimizers'),
+    ('remote_user_info', 'table_id', '', 'id', '_tables'),
+    ('sessions', '"username"', '', 'name', 'users'),
+    ('sessions', 'optimizer', '', 'name', 'optimizers'),
+    ('statistics', 'column_id', '', 'id', '(SELECT id FROM sys._columns UNION ALL SELECT id FROM tmp._columns) as c'),
+    ('statistics', '"type"', '', 'sqlname', 'types'),
+    ('storage()', '"schema"', '', 'name', 'schemas'),
+    ('storage()', '"table"', '', 'name', '(SELECT name FROM sys._tables UNION ALL SELECT name FROM tmp._tables) as t'),
+    ('storage()', '"schema", "table"', '', 'sname, tname', '(SELECT sch.name as sname, tbl.name as tname FROM sys.schemas AS sch JOIN sys.tables AS tbl ON sch.id = tbl.schema_id) as t'),
+    ('storage()', '"column"', '', 'name', '(SELECT name FROM sys._columns UNION ALL SELECT name FROM tmp._columns UNION ALL SELECT name FROM sys.keys UNION ALL SELECT name FROM tmp.keys UNION ALL SELECT name FROM sys.idxs UNION ALL SELECT name FROM tmp.idxs) as c'),
+    ('storage()', '"type"', '', 'sqlname', 'types'),
+    ('storage', '"schema"', '', 'name', 'schemas'),
+    ('storage', '"table"', '', 'name', '(SELECT name FROM sys._tables UNION ALL SELECT name FROM tmp._tables) as t'),
+    ('storage', '"schema", "table"', '', 'sname, tname', '(SELECT sch.name as sname, tbl.name as tname FROM sys.schemas AS sch JOIN sys.tables AS tbl ON sch.id = tbl.schema_id) as t'),
+    ('storage', '"column"', '', 'name', '(SELECT name FROM sys._columns UNION ALL SELECT name FROM tmp._columns UNION ALL SELECT name FROM sys.keys UNION ALL SELECT name FROM tmp.keys UNION ALL SELECT name FROM sys.idxs UNION ALL SELECT name FROM tmp.idxs) as c'),
+    ('storage', '"type"', '', 'sqlname', 'types'),
+
+    ('schemastorage', '"schema"', '', 'name', 'schemas'),
+    ('tablestorage', '"schema"', '', 'name', 'schemas'),
+    ('tablestorage', '"table"', '', 'name', '(SELECT name FROM sys._tables UNION ALL SELECT name FROM tmp._tables) as t'),
+    ('tablestorage', '"schema", "table"', '', 'sname, tname', '(SELECT sch.name as sname, tbl.name as tname FROM sys.schemas AS sch JOIN sys.tables AS tbl ON sch.id = tbl.schema_id) as t'),
+    ('table_partitions', 'table_id', '', 'id', '_tables'),
+    ('table_partitions', 'column_id', 'column_id IS NOT NULL', 'id', '_columns'),
+    ('range_partitions', 'table_id', '', 'id', '_tables'),
+    ('range_partitions', 'partition_id', '', 'id', 'table_partitions'),
+    ('value_partitions', 'table_id', '', 'id', '_tables'),
+    ('value_partitions', 'partition_id', '', 'id', 'table_partitions'),
+
+    ('keys', 'cast(((action >> 8) & 255) as smallint)', 'action >= 0', 'action_id', 'fkey_actions'),
+    ('keys', 'cast((action & 255) as smallint)', 'action >= 0', 'action_id', 'fkey_actions'),
+    ('fkeys', 'id, table_id, "type", name, rkey', '', 'id, table_id, "type", name, rkey', 'keys'),
+    ('fkeys', 'update_action_id', '', 'action_id', 'fkey_actions'),
+    ('fkeys', 'delete_action_id', '', 'action_id', 'fkey_actions'),
+]
+
+
+class ServerClass:
+    def __init__(self, cmd, TestOut, TestErr, TimeOut, pollfile, dbname, inmem=False, dbg=None):
+        self.proc = None
+        self.timer = None
+        self.outfile = TestOut
+        self.errfile = TestErr
+        self.code = None
+        self.started = False
+        self.cmd = cmd
+        self.timeout = TimeOut
+        self.pollfile = pollfile
+        self.inmem = inmem
+        self.dbg = dbg
+        self.dbname = dbname
+        self.lock = threading.Lock()
+
+    def poll(self):
+        return self.proc.poll()
+
+    def terminate(self):
+        if self.proc.stdin is not None:
+            self.proc.stdin.close()
+        if os.name == 'nt':
+            self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=30)
+        except process.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.code = returnCode(self.proc, self.errfile)
+        if self.pollfile is None:
+            self.outfile.write(self.proc.stdout.read())
+        self.outfile.close()
+        self.errfile.close()
+
+    def start(self, timeout):
+        if timeout:
+            self.timer = threading.Timer(timeout, self.stopsessions, [])
+            self.timer.start()
+
+    def stop(self):
+        if self.lock.acquire():
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+            self.lock.release()
+
+    def sendusr1(self):
+        if os.name != 'nt':
+            if procdebug:
+                print(f'sendusr1: sending USR1 signal to {self.proc.pid}')
+            self.proc.send_signal(signal.SIGUSR1)
+            time.sleep(1)
+
+    def stacktrace(self):
+        stacktrace(self.proc, self.outfile)
+        self.sendusr1()
+
+    def checkkeys(self):
+        if not checkkeys or self.port is None:
+            return
+        self.outfile.flush()
+        try:
+            with pymonetdb.connect(username='monetdb',
+                                   password='monetdb',
+                                   hostname=HOST,
+                                   port=int(self.port),
+                                   database=self.dbname,
+                                   connect_timeout=5.0) as dbh:
+                dbh.settimeout(60)
+                with dbh.cursor() as crs:
+                    for table, columns in sys_pkeys + sys_akeys:
+                        qtable = table.replace('"', '')
+                        schema = 'sys.' if not table.startswith('(') else ''
+                        query = f"select count(*), {columns} " \
+                            f"from {schema}{table} " \
+                            f"group by {columns} having count(*) > 1"
+                        crs.execute(query)
+                        rows = crs.fetchall()
+                        for row in rows:  # should be empty
+                            print(f'duplicates in {qtable}', row, query,
+                                  file=self.outfile)
+                    for table, columns, where, ref_columns, ref_table in sys_fkeys:
+                        if where:
+                            where += ' AND '
+                        schema = '' if '.' in ref_table else 'sys.'
+                        qtable = table.split(' ')[0]
+                        qcolumns = columns.replace('"', '')
+                        query = f"select {columns}, * from sys.{table} " \
+                            f"where {where}({columns}) not in " \
+                            f"(select {ref_columns} from {schema}{ref_table})"
+                        crs.execute(query)
+                        rows = crs.fetchall()
+                        for row in rows:  # should be empty
+                            print(f'missing reference in {qtable} {qcolumns}', row,
+                                  query, file=self.outfile)
+        except TimeoutError:
+            print('timeout during checkkeys', file=self.outfile)
+        self.outfile.flush()
+
+    def stopsessions(self):
+        if self.lock.acquire(blocking=False):
+            try:
+                if self.timer is not None:
+                    self.stacktrace()
+                    try:
+                        with pymonetdb.connect(username='monetdb',
+                                               password='monetdb',
+                                               hostname=HOST,
+                                               port=int(self.port),
+                                               database=self.dbname,
+                                               connect_timeout=1.0) as dbh:
+                            dbh.settimeout(20)
+                            with dbh.cursor() as crs:
+                                crs.execute('select sessionid from sys.sessions() where sessionid <> sys.current_sessionid()')
+                                ids = crs.fetchall()
+                                dbh.settimeout(10)
+                                for x in ids:
+                                    if procdebug:
+                                        print(f'stopping session {x[0]}')
+                                        crs.execute(f'call sys.stopsession({x[0]})')
+                                if procdebug and not ids:
+                                    print('no sessions to stop')
+                    except TimeoutError:
+                        self.proc.kill()
+                    self.timer = None
+            finally:
+                self.lock.release()
+
+    def LaunchIt(self, cwd=None, env=os.environ):
+        cmd = self.cmd
+        if procdebug:
+            print('LaunchIt: starting process "%s" (inpipe)\n' % '" "'.join(cmd))
+
+        stdin = process.DEVNULL
+        stdout = self.outfile
+        stderr = self.errfile
+        if self.inmem:
+            stdout = process.PIPE
+            self.pollfile = None
+        elif self.pollfile:
+            try:
+                os.unlink(self.pollfile)
+            except OSError:
+                pass
+            if self.dbg:
+                stdin = stdout = stderr = None
+                if 'gdb' in self.dbg:
+                    cmd = shlex.split(self.dbg) + ['--args'] + cmd
+                else:
+                    cmd = shlex.split(self.dbg) + cmd
+
+        else:
+            stdout = process.PIPE
+        print(f'# Launching {cmd}', file=self.outfile)
+        if cwd is not None:
+            print(f'# in directory {cwd}', file=self.outfile)
+        print(f'# Environment: {env}', file=self.outfile)
+        self.outfile.flush()
+        self.errfile.flush()
+        if os.name == 'nt':
+            proc = process.Popen(cmd, stdin=stdin, stdout=stdout,
+                                 stderr=stderr, text=True, cwd=cwd, env=env,
+                                 creationflags=process.CREATE_NEW_PROCESS_GROUP)
+        else:
+            proc = process.Popen(cmd, stdin=stdin, stdout=stdout,
+                                 stderr=stderr, text=True, cwd=cwd, env=env)
+        # maybe buffer output as it comes to avoid deadlock
+        if stdout == process.PIPE:
+            proc.stdout = process._BufferedPipe(proc.stdout)
+        if self.errfile == process.PIPE:
+            proc.stderr = process._BufferedPipe(proc.stderr)
+        proc.killed = False
+        proc.onechild = True
+        starttime = time.time()
+        self.proc = proc
+
+        port = None
+        self.port = None
+        self.usock = None
+        if self.pollfile:
+            while True:
+                proc.poll()
+                if proc.returncode is not None:
+                    # exited
+                    if procdebug:
+                        print(f'server exited during startup with code {proc.returncode}')
+                    return
+                if os.path.exists(self.pollfile):
+                    break
+                # wait at most 30 seconds for the server to start
+                if self.timeout and time.time() > starttime + 30:
+                    if procdebug:
+                        print('timeout starting server')
+                    if os.name == 'nt':
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    else:
+                        proc.terminate()
+                    try:
+                        # wait 5 seconds for termination
+                        proc.communicate(timeout=5)
+                    except process.TimeoutExpired:
+                        # really kill
+                        proc.kill()
+                        proc.wait()
+                    return
+                time.sleep(0.1)
+            with open(os.path.join(os.path.split(self.pollfile)[0], '.conn')) as fil:
+                connurls = fil.readlines()
+            for connurl in connurls:
+                connurl = connurl.strip()
+                res = mapiportre.search(connurl)
+                if res is not None:
+                    port = res.group('port')
+                elif not usetcp:
+                    if connurl.startswith('mapi:monetdb:///') or \
+                       (connurl.startswith('monetdb://') and 'sock=' in connurl):
+                        self.usock = connurl
+        else:
+            loadedseen = False
+            endtime = time.time() + 30
+            while port is None or not loadedseen:
+                curtime = time.time()
+                if curtime >= endtime:
+                    break
+                line = proc.stdout.readline(timeout=endtime - curtime if self.timeout else None)
+                if not line:
+                    break
+                self.outfile.write(line)
+                if 'MonetDB/SQL module loaded' in line:
+                    loadedseen = True
+                res = mapiportre.search(line)
+                if res is not None:
+                    port = res.group('port')
+        if port is not None and not mapi_ping(int(port)):
+            # check whether we can connect
+            if os.name == 'nt':
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                proc.terminate()
+            proc.wait()
+            return
+        self.started = True
+        self.port = port
+
+
+def RunIt(cmd, onechild, TestIn, TestOut, TestErr, TimeOut, pSrvr, TSTTRGDIR, environ):
+    if type(TestIn) is type(''):
+        TestInput = TestIn
+        TestIn = process.PIPE
+    else:
+        TestInput = None
+    TestOut.flush()
+    TestErr.flush()
+    if procdebug:
+        print('RunIt: starting process "%s"\n' % '" "'.join(cmd))
+    if TimeOut:
+        environ['TIMEOUT'] = str(TimeOut)
+    executable = None
+    if os.name == 'nt' and isinstance(cmd, list):
+        executable = os.path.join(TSTTRGDIR, cmd[0])
+        if not os.path.exists(executable):
+            executable = None
+    with process.Popen(cmd, stdin=TestIn, stdout=TestOut,
+                       stderr=TestErr, text=True,
+                       cwd=TSTTRGDIR, env=environ,
+                       executable=executable) as proc:
+        proc.killed = False
+        proc.onechild = onechild
+        try:
+            # since both stdout and stderr are redirected to files,
+            # communicate will not return any useful data
+            try:
+                proc.communicate(input=TestInput, timeout=TimeOut if TimeOut else None)
+            except process.TimeoutExpired:
+                killProc(proc, TestErr, cmd)
+                proc.wait()
+            if procdebug:
+                print('RunIt: process exited "%s" (%s)\n' % ('" "'.join(cmd), proc.returncode))
+        except KeyboardInterrupt:
+            killProc(proc, TestErr, cmd)
+            proc.wait()
+            if procdebug:
+                print('RunIt: process killed "%s"\n' % '" "'.join(cmd))
+            raise
+    rc = returnCode(proc, TestErr)
+    if rc == 'interrupt':
+        raise KeyboardInterrupt
+    return rc
+
+
+def recv_all(sock: socket.socket, nbytes):
+    data = sock.recv(nbytes)
+    while len(data) < nbytes:
+        more_data = sock.recv(nbytes - len(data))
+        data += more_data
+    return data
+
+
+def mapi_ping(port, host='localhost', tries=3):
+    retry = 0
+    wait = 1
+    while True:
+        retry += 1
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect((host, port))
+                flag = recv_all(sock, 2)
+                unpacked = struct.unpack( '<H', flag )[0]  # little endian short
+                len = ( unpacked >> 1 )     # get length
+                data = recv_all(sock, len)
+            # we don't send
+            return True
+        except OSError:
+            pass
+        if retry >= tries:
+            break
+        time.sleep(wait)
+    return False
+
+
+threadids = {}
+
+
+def progress(count, errors, total, test, spaces=' '*(ttywidth or 100)):
+    errs = '\r'
+    if use_esc:
+        tid = threading.get_ident()
+        if tid not in threadids:
+            threadids[tid] = len(threadids)
+            nl = '\n'
+        else:
+            nl = ''
+        line = len(threadids) - threadids[tid]
+        if errors:
+            errs = f'\r{errors} error{"" if errors == 1 else "s"}'
+        up = f'\033[{line}A' if line > 1 else '\033[A'
+        down = f'\033[{line}B' if line > 1 else '\033[B'
+    else:
+        nl = up = down = ''
+    perc = int(count*100/total) if total and count else 0
+    width = len(str(total))
+    s = f'[{count:{width}}/{total}] ({perc:2}%)    {test}'
+    if len(s) > ttywidth:
+        test = test[len(s)-ttywidth:]
+        s = f'[{count:{width}}/{total}] ({perc:2}%)    {test}'
+    sys.stdout.write(nl + '\r' + up + spaces + '\r' + s + down + errs)
+
+
+def DoIt(env, SERVER, CALL, TST, EXT, TestOutFile, TestErrFile, TIMEOUT, ME, length, nomito, threads, user, passwd, COND, PSRVR, total_tests, options, TSTDB, TSTDIR, TSTTRGDIR, TSTSRCDIR, environ):
+    ATJOB2 = ''
+    print(file=sys.stderr, end='', flush=True)
+    if not verbose:
+        progress(test_progress, test_errors, total_tests, os.path.join(TSTDIR, TST + EXT))
+    else:
+        if ttywidth > 0 and length + 10 + 21 >= ttywidth:
+            # 10 - length of prompt()
+            # 21 - length of time plus result
+            l = ttywidth - 10 - 21 - 1
+            if len(TST) <= l:
+                s = '%-*s ' % (l, TST)
+            else:
+                s = '%s...%s ' % (TST[:l//2 - 2], TST[l//2+1-l:])
+        else:
+            s = '%-*s ' % (length, TST)
+        print('%s%s' % (prompt(), s), end='')
+        if isatty and TIMEOUT > 0:
+            s = '(<=%d)' % TIMEOUT
+            print(s + '\b' * len(s), end='')
+
+    try:
+        print(end='', flush=True)
+    except IOError as err:
+        Warn("Flushing STDOUT in DoIt failed with #%d: '%s'." % (err.errno, err.strerror))
+    exe = env['exe']
+
+    returncode = None
+    pSrvr = PSRVR
+    issqllogictest = False
+    logicerror = False
+    if 'nodrop' in options:
+        options = options[:]
+        options.remove('nodrop')
+        nodrop = True
+    else:
+        nodrop = False
+    try:
+        if SERVER == 'SQL':
+            SrvrOutFile = TST+'.server.out'
+            SrvrErrFile = TST+'.server.err'
+            SrvrOut = openutf8(os.path.join(TSTTRGDIR, SrvrOutFile),'w')
+            SrvrErr = openutf8(os.path.join(TSTTRGDIR, SrvrErrFile),'w')
+            ClntOutFile = TST+'.client.out'
+            ClntErrFile = TST+'.client.err'
+            ClntOut = openutf8(os.path.join(TSTTRGDIR, ClntOutFile),'w')
+            ClntErr = openutf8(os.path.join(TSTTRGDIR, ClntErrFile),'w')
+
+            if PSRVR is None:
+                Srvr = exe['mserver5'].copy()
+                if nomito:
+                    try:
+                        Srvr.remove('--forcemito')
+                    except ValueError:
+                        pass
+                    Srvr.append(f'-d{1 << 24}') # NOSYNCMASK
+                if threads is not None:
+                    for i in range(len(Srvr)):
+                        if Srvr[i].startswith('gdk_nr_threads='):
+                            Srvr[i] = 'gdk_nr_threads=%s' % threads
+                            break
+                dbpath = os.path.join(env['GDK_DBFARM'], TSTDB)
+                Srvr.append('--dbpath=%s' % dbpath)
+                if os.path.exists(os.path.join(dbpath, '.vaultkey')):
+                    Srvr.extend(['--set',
+                                 f'monet_vault_key={os.path.join(dbpath, ".vaultkey")}'])
+                if env.get('MULTIFARM'):
+                    Srvr.append('--dbextra=%s' % os.path.join(env['GDK_DBFARM'], TSTDB + '_transient'))
+                    shutil.rmtree(os.path.join(env['GDK_DBFARM'], TSTDB + '_transient'),
+                                  ignore_errors = True)
+                    os.makedirs(os.path.join(env['GDK_DBFARM'], TSTDB + '_transient'))
+                elif env.get('TRANS_INMEM'):
+                    Srvr.append('--dbextra=in-memory')
+                if os.path.isfile(os.path.join(TSTTRGDIR, TST + '.options5')):
+                    with openutf8(os.path.join(TSTTRGDIR, TST + '.options5')) as fil:
+                        Srvr.extend(fil.read().split())
+                Srvr.extend(mserver5_opts)
+                Srvr.extend(options)
+                pSrvr = ServerClass(Srvr, SrvrOut, SrvrErr, TIMEOUT, os.path.join(dbpath, '.started'), TSTDB, dbg=env.get('DBG'))
+                pSrvr.LaunchIt(cwd=TSTTRGDIR, env=environ)
+                if pSrvr.port is None:
+                    print('\nFailed to start server.\n', file=pSrvr.errfile)
+                    print('\nFailed to start server.\n')
+                    return 'serverfail'
+                environ['MAPIPORT'] = pSrvr.port
+                SetExecEnv(exe, pSrvr.port, environ)
+            else:
+                PSRVR.start(TIMEOUT)
+        else:
+            ClntOut = openutf8(os.path.join(TSTTRGDIR, TestOutFile), 'a')
+            ClntErr = openutf8(os.path.join(TSTTRGDIR, TestErrFile), 'a')
+
+        if SERVER != 'SQL' or pSrvr.started:
+            if   CALL == 'other':
+                cmd = [os.path.join('.', TST + EXT), TST]
+                returncode = RunIt(cmd, False, '', ClntOut, ClntErr, TIMEOUT, pSrvr, TSTTRGDIR, environ)
+            elif CALL == 'python':
+                # do clean up between tests if no dependent tests
+                # borrow clean up function from sqllogictest
+                if not nodrop and not os.path.exists(os.path.join(TSTTRGDIR, TST+'.reqtests')) and pSrvr is not None:
+                    import MonetDBtesting.sqllogictest as sqllogictest
+                    with sqllogictest.SQLLogic(out=ClntErr) as sql:
+                        try:
+                            sql.connect(username=user or 'monetdb',
+                                        password=passwd or 'monetdb',
+                                        hostname=HOST,
+                                        port=int(pSrvr.port),
+                                        database=TSTDB,
+                                        usock=pSrvr.usock,
+                                        language='sql',
+                                        timeout=TIMEOUT,
+                                        alltests=CONDITIONALS['KNOWNFAIL'])
+                        except KeyboardInterrupt:
+                            raise
+                        except TimeoutError:
+                            returncode = 'timeout'
+                        except:
+                            returncode = 'error'
+                        else:
+                            try:
+                                sql.drop()
+                            except KeyboardInterrupt:
+                                raise
+                            except TimeoutError:
+                                returncode = 'timeout'
+                            except:
+                                pass
+                if returncode is None:
+                    cmd = [sys.executable, TST + EXT, TST]
+                    returncode = RunIt(cmd, False, '', ClntOut, ClntErr, TIMEOUT, pSrvr, TSTTRGDIR, environ)
+            elif CALL == 'sqltest' or CALL == 'maltest':
+                issqllogictest = True
+                import MonetDBtesting.sqllogictest as sqllogictest
+                with sqllogictest.SQLLogic(out=ClntErr, srcdir=TSTSRCDIR) as sql:
+                    if CALL == 'sqltest':
+                        lang = 'sql'
+                    else:
+                        lang = 'mal'
+                    try:
+                        sql.connect(username=user or 'monetdb',
+                                    password=passwd or 'monetdb',
+                                    hostname=HOST,
+                                    port=int(pSrvr.port),
+                                    database=TSTDB,
+                                    usock=pSrvr.usock,
+                                    language=lang,
+                                    timeout=TIMEOUT,
+                                    threshold=threshold,
+                                    alltests=CONDITIONALS['KNOWNFAIL'])
+                    except KeyboardInterrupt:
+                        raise
+                    except TimeoutError:
+                        returncode = 'timeout'
+                    except:
+                        returncode = 'error'
+                    else:
+                        if not nodrop and not os.path.exists(os.path.join(TSTTRGDIR, TST+'.reqtests')):
+                            try:
+                                sql.drop()
+                            except KeyboardInterrupt:
+                                raise
+                            except TimeoutError:
+                                returncode = 'timeout'
+                            except:
+                                pass
+                        if returncode is None:
+                            defines = []
+                            testfile = TST+EXT
+                            if lang == 'sql' and os.path.exists(os.path.join(TSTTRGDIR, TST+'.test.in')):
+                                bs = '\\'
+                                testfile = TST+'.test.in'
+                                if TSTDATAPATH:
+                                    defines.append(f'QTSTDATAPATH={TSTDATAPATH.replace(bs,bs+bs)}')
+                                    defines.append(f'TSTDATAPATH={TSTDATAPATH}')
+                                defines.append(f'UTSTSRCDIR=file://{url(TSTSRCDIR)}')
+                                defines.append(f'QTSTSRCDIR={TSTSRCDIR.replace(bs,bs+bs)}')
+                                defines.append(f'TSTSRCDIR={TSTSRCDIR}')
+                                defines.append(f'QTSTTRGDIR={TSTTRGDIR.replace(bs,bs+bs)}')
+                                defines.append(f'TSTTRGDIR={TSTTRGDIR}')
+                                defines.append(f'TSTSRCBASE={TSTSRCBASE}')
+                                defines.append(f'TSTDB={TSTDB}')
+                                defines.append(f'MAPIPORT={pSrvr.port}')
+                                if pSrvr.usock is not None:
+                                    defines.append(f'MAPIUSOCK={pSrvr.usock}')
+                            try:
+                                sql.parse(os.path.join(TSTTRGDIR, testfile), approve=open(os.path.join(TSTTRGDIR, TST+'.newtest'),'w') if approve else None, defines=defines)
+                            except KeyboardInterrupt:
+                                raise
+                            except sqllogictest.SQLLogicSyntaxError:
+                                pass
+                            except TimeoutError:
+                                returncode = 'timeout'
+                            except BrokenPipeError:
+                                # server timeout
+                                pass
+                            except ConnectionResetError:
+                                # server crash?
+                                pass
+                            except:
+                                # something went wrong, we don't know what
+                                # print a stack trace and continue
+                                sys.excepthook(*sys.exc_info())
+                            else:
+                                if sql.seenerr:
+                                    returncode = 'error'
+                                elif sql.timedout:
+                                    returncode = 'timeout'
+                                if approve and replace and not sql.timedout:
+                                    with openutf8(os.path.join(TSTTRGDIR, TST+'.newtest')) as fin, \
+                                         openutf8(os.path.join(TSTSRCDIR, testfile + 'new'), 'w') as fout:
+                                        fout.write(fin.read())
+                                        fout.flush()
+                                    os.replace(os.path.join(TSTSRCDIR, testfile + 'new'), os.path.join(TSTSRCDIR, testfile))
+            elif CALL == 'sql':
+                TSTs = []
+                test = re.compile('^'+TST+EXT+'$', re.MULTILINE)
+                d = listdir(TSTTRGDIR)
+                d.sort()
+                for f in d:
+                    if test.match(f):
+                        TSTs.append(f)
+
+                Clnt = exe['SQL_Client'].copy()
+                for i in range(len(Clnt)):
+                    Clnt[i] = Clnt[i].replace('${PORT}', pSrvr.port)
+                if user:
+                    Clnt.append(f'-u{user}')
+                if passwd:
+                    Clnt.append(f'-P{passwd}')
+                if pSrvr.usock:
+                    Clnt.append(f'-d{pSrvr.usock}')
+                for f in TSTs:
+                    returncode = RunIt(Clnt, True, openutf8(os.path.join(TSTTRGDIR, f)), ClntOut, ClntErr, TIMEOUT, pSrvr, TSTTRGDIR, environ)
+                    if returncode:
+                        break
+            elif CALL == 'ruby':
+                Clnt = exe['ruby_client'].copy()
+                for i in range(len(Clnt)):
+                    Clnt[i] = Clnt[i].replace('${PORT}', pSrvr.port)
+                Clnt.extend([TST + EXT])
+                Clnt[2], Clnt[1] = Clnt[1], Clnt[2]
+                Clnt.append(TSTDB)
+
+                RunIt(Clnt, True, '', ClntOut, ClntErr, TIMEOUT, pSrvr, TSTTRGDIR, environ)
+        else:
+            for fp in ClntOut,ClntErr:
+                fp.write('\n\n! Server not ready; skipping attempt to start client!\n\n')
+        ClntOut.close()
+        ClntErr.close()
+    finally:
+        if PSRVR is not None:
+            PSRVR.stop()
+        if SERVER == 'SQL' and pSrvr is not None:
+            if PSRVR is None and pSrvr.started:
+                pSrvr.terminate()
+                if procdebug:
+                    print('DoIt: process exited "%s" (%s)\n' % ('" "'.join(Srvr), pSrvr.code))
+
+            AllOut = [SrvrOut, ClntOutFile]
+            AllErr = [SrvrErr, ClntErrFile]
+            TestOut = openutf8(os.path.join(TSTTRGDIR, TestOutFile), 'a')
+            for q in AllOut:
+                if type(q) is type(''):
+                    n = q
+                else:
+                    n = q.name
+                    q.close()
+                q = openutf8(os.path.join(TSTTRGDIR, n), 'r')
+                try:
+                    TestOut.write(q.read())
+                except IOError as err:
+                    Warn("Reading from input '%s' or writing to output '%s' failed with #%d: '%s'." % (q.name, TestOut.name, err.errno, err.strerror))
+                except MemoryError:
+                    Warn("Reading from input '%s' or writing to output '%s' failed with 'MemoryError'." % (q.name, TestOut.name))
+                TestOut.flush()
+                q.close()
+            TestErr = openutf8(os.path.join(TSTTRGDIR, TestErrFile), 'a')
+            for q in AllErr:
+                if type(q) is type(''):
+                    n = q
+                else:
+                    n = q.name
+                    q.close()
+                q = openutf8(os.path.join(TSTTRGDIR, n),'r')
+                data = q.read()
+                TestErr.write(data)
+                TestErr.flush()
+                q.close()
+                if issqllogictest and n.endswith('.client.err') and data:
+                    logicerror = True
+                else:
+                    logicerror = False
+        else:
+            TestOut = try_open(os.path.join(TSTTRGDIR, TestOutFile), 'a')
+            TestErr = try_open(os.path.join(TSTTRGDIR, TestErrFile), 'a')
+
+        if TestOut is not None:
+            TestOut.close()
+        if TestErr is not None:
+            TestErr.close()
+
+    if returncode is None and pSrvr is not None:
+        returncode = pSrvr.code # can still be None
+    if returncode is not None:
+        # something failed
+        if returncode == 'interrupt':
+            raise KeyboardInterrupt
+        for err in ('timeout', 'segfault', 'abort', 'signal', 'error'):
+            if returncode == err:
+                return err
+        return returncode       # remaining error (shouldn't get here)
+
+    if CALL not in ('python', 'other', 'ruby'):
+        # running mserver/mclient directly, so we know they didn't fail
+        if logicerror:
+            return 'logicerror'
+        return None
+
+    # Try to detect segfaults and the like
+    # Try to detect aborts due to too deep recursion
+    for (regexp, msg) in [('(^(|[^#]*[\t ])((Memory|Segmentation) [Ff]ault|Bus [Ee]rror|Aborted|Assertion (|.* )failed[:.]|!FATAL: BATSIGabort:)([ \t]|$))',
+                           'segfault'),
+                          ('aborted too deep recursion',
+                           'recursion'),
+                          (r'mal_mapi\.listen:operation failed: bind to stream socket port',
+                           'socket')]:
+        TO = re.compile(regexp, re.MULTILINE)
+        # FIXME: this begs for a much nicer solution (100% copy of below)
+        for f in (TestErrFile, TestOutFile):
+            if os.path.isfile(os.path.join(TSTTRGDIR, f)):
+                with openutf8(os.path.join(TSTTRGDIR, f)) as fil:
+                    for l in fil:
+                        if TO.search(l):
+                            return msg
+
+    return None
+
+
+def CheckClassPath():
+    if 'CLASSPATH' in os.environ:
+        cp = os.environ['CLASSPATH']
+        cpx = cp + os.pathsep
+    else:
+        cp = ''
+        cpx = ''
+    JARS = {
+        'HAVE_MONETDBJDBC_JAR' : re.compile(r'^monetdb-jdbc-[0-9][0-9]?\.[0-9]+(-[a-f0-9]{12})?\.jre[0-9]+\.jar$'),
+        'HAVE_JDBCCLIENT_JAR'  : re.compile(r'^jdbcclient\.jre[0-9]+\.jar$'),
+        'HAVE_JDBCTESTS_JAR'   : re.compile(r'^jdbctests\.jar$'),
+    }
+    # check for known JARs in CLASSPATH files
+    for p in cp.split(os.pathsep):
+        if os.path.isdir(p):
+            for f in os.listdir(p):
+                if not f.endswith('.jar'):
+                    continue
+                for C in JARS:
+                    if JARS[C].match(f):
+                        CONDITIONALS[C] = True
+                        cp = os.path.join(p, f) + os.pathsep + cp
+                        break
+        elif os.path.isfile(p):
+            f = os.path.basename(p)
+            for C in JARS:
+                if JARS[C].match(f):
+                    CONDITIONALS[C] = True
+                    break
+    # check for known JARs in CLASSPATH directories
+    # + fall-back using pkgdatadir/lib
+    cpx += os.path.join('@QXdatadir@','monetdb','lib')
+    for d in cpx.split(os.pathsep):
+        if os.path.isdir(d):
+            for f in listdir(d):
+                p = os.path.join(d,f)
+                if os.path.isfile(p):
+                    C = 'HAVE_%s' % f.upper().replace('.','_')
+                    if C not in JARS:
+                        C = 'HAVE_MONETDBJDBC_JAR'
+                    if not CONDITIONALS.get(C) and JARS[C].match(f):
+                        cp = cp + os.pathsep + p
+                        CONDITIONALS[C] = True
+    if cp:
+        os.environ['CLASSPATH'] = cp
+    if CONDITIONALS.get('HAVE_MONETDBJDBC_JAR') and \
+       CONDITIONALS.get('HAVE_JDBCTESTS_JAR'):
+        CONDITIONALS['HAVE_JDBCTESTS'] = True
+
+
+def SetExecEnv(exe, port, environ):
+    for v in exe.keys():
+        if v == 'mserver5':
+            V = 'MSERVER'
+        else:
+            V = v.upper()
+        environ[V] = ' '.join(exe[v]).replace('${PORT}', port)
+
+
+def DummyTlsTester():
+    class DummyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+        def handle(self):
+            self.requestline = ''
+            self.request_version = ''
+            self.command = ''
+            self.send_error(http.HTTPStatus.INTERNAL_SERVER_ERROR, f"{sys.argv[0]} is not running TLSTestter because the 'cryptography' module is not present")
+    server = http.server.HTTPServer(('localhost', 0), DummyHTTPRequestHandler)
+    port = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    return port
+
+
+def StartTlsTester():
+    try:
+        import cryptography
+    except:
+        # Start a dummy server that only returns errors.
+        return DummyTlsTester()
+    from MonetDBtesting import tlstester
+    hostnames = ['localhost']
+    certs = tlstester.Certs(hostnames)
+    server = tlstester.TLSTester(
+        certs=certs,
+        listen_addr='localhost',
+        preassigned={},
+        sequential=False,
+        hostnames=hostnames)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    return server.get_port('base')
+
+
+THISFILE = os.path.basename(sys.argv[0])
+if THISFILE == 'Mz.py':
+    produce_html = False
+THISPATH = os.path.realpath(os.path.dirname(sys.argv[0]))
+TSTDBG = '2'
+TSTTHREADS = '0'
+dftTSTPREF = 'mTests'
+TSTSUFF = 'Tests'
+
+if os.name != 'nt' and hasattr(os, 'symlink'):
+    def SymlinkOrCopy(src, dst, dstdir):
+        os.symlink(src, os.path.join(dstdir, dst))
+    listdir = os.listdir
+else:
+    def SymlinkOrCopy(src, dst, dstdir):
+        shutil.copy(os.path.normpath(os.path.join(dstdir, src)), os.path.join(dstdir, dst))
+    def listdir(d):
+        return os.listdir(os.path.abspath(d))
+
+HOST = 'localhost'
+os.environ['HOST'] = HOST
+os.environ['MAPIHOST'] = HOST
+
+if os.name == 'nt':
+    SYST    = 'Windows'
+    RELEASE = '5.0'
+    r = re.compile(r'^Microsoft Windows (.*)\[Version ([0-9]+\.[0-9]+)([^\[0-9].*)\]$')
+    if procdebug:
+        print('starting process "cmd" "/c" "ver" (inpipe,outpipe)\n')
+    with process.Popen('cmd /c ver', stdin=process.PIPE,
+                       stdout=process.PIPE, stderr=process.PIPE,
+                       text=True) as proc:
+        qOut, qErr = proc.communicate()
+    if procdebug:
+        print('process exited "cmd" "/c" "ver" (%s)\n' % proc.returncode)
+    for l in qOut.split('\n'):
+        m = r.match(l.strip())
+        if m and m.group(2):
+            RELEASE = m.group(2)
+else:
+    SYST    = os.uname()[0].split('_NT-', 1)[0].replace('-','')
+    if SYST == 'AIX':
+        RELEASE = os.uname()[3]+'.'+os.uname()[2]
+    else:
+        RELEASE = os.uname()[2].split('(', 1)[0]
+        MAJOR = RELEASE.split('.', 1)[0]
+        if 'A' <= MAJOR and MAJOR <= 'Z':
+            RELEASE = RELEASE.split('.', 1)[1]
+
+# see if we can use UNIX sockets
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as server:
+        pass
+except (OSError, AttributeError):
+    # apparently not
+    SOCK = False
+else:
+    server.close()
+    SOCK = True
+
+if SYST == 'Linux':
+    #  Please keep this aligned / in sync with configure.ag !
+    LINUX_DIST=''
+    if os.path.isfile('/etc/os-release'):
+        with open('/etc/os-release') as fil:
+            l = fil.read()
+        x0 = re.search('^NAME=[\'"]?([^\'"\n]*)[\'"]?$', l, re.MULTILINE)
+        if x0:
+            x0 = x0.group(1)
+        x1 = re.search('^VERSION_ID=[\'"]?([^\'"\n]*)[\'"]?$', l, re.MULTILINE)
+        if x1:
+            x1 = x1.group(1)
+        LINUX_DIST = '%s:%s' % (x0 or 'Linux', x1 or '')
+    elif os.path.isfile('/etc/fedora-release'):
+        with open('/etc/fedora-release') as fil:
+            l = fil.readline()
+        x = re.match('^.*(Fedora).* release ([0-9][^ \n]*)( .*)*$', l)
+        if x:
+            LINUX_DIST = '%s:%s' % (x.group(1),x.group(2))
+    elif os.path.isfile('/etc/centos-release'):
+        with open('/etc/centos-release') as fil:
+            l = fil.readline()
+        x = re.match('^(CentOS).* release ([0-9][^ \n]*)( .*)*$', l)
+        if x:
+            LINUX_DIST = '%s:%s' % (x.group(1),x.group(2))
+    elif os.path.isfile('/etc/yellowdog-release'):
+        with open('/etc/yellowdog-release') as fil:
+            l = fil.readline()
+        x = re.match('^(Yellow) Dog Linux release ([0-9][^ \n]*)( .*)*$', l)
+        if x:
+            LINUX_DIST = '%s:%s' % (x.group(1),x.group(2))
+    elif os.path.isfile('/etc/redhat-release'):
+        with open('/etc/redhat-release') as fil:
+            l = fil.readline()
+        x0 = re.match('^.*(Red) (Hat).* Linux *([A-Z]*) release ([0-9][^ \n]*)( .*)*$', l)
+        x1 = re.match('^Red Hat Enterprise Linux ([AW]S) release ([0-9][^ \n]*)( .*)*$', l)
+        x2 = re.match('^(CentOS).* release ([0-9][^ \n]*)( .*)*$', l)
+        x3 = re.match('^(Scientific) Linux SL release ([0-9][^ \n]*)( .*)*$', l)
+        if x0:
+            LINUX_DIST = '%s%s:%s%s' % (x0.group(1),x0.group(2),x0.group(4),x0.group(3))
+        elif x1:
+            LINUX_DIST = 'RHEL:%s%s' % (x1.group(2),x1.group(1))
+        elif x2:
+            LINUX_DIST = '%s:%s' % (x2.group(1),x2.group(2))
+        elif x3:
+            LINUX_DIST = '%s:%s' % (x3.group(1),x3.group(2))
+    elif os.path.isfile('/etc/SuSE-release'):
+        with open('/etc/SuSE-release') as fil:
+            l = fil.readline()
+        x0 = re.match('^.*(S[Uu]SE) LINUX Enterprise ([SD])[ervsktop]* ([0-9][^ \n]*)( .*)*$', l)
+        x1 = re.match('^S[Uu]SE LINUX Enterprise ([SD])[ervsktop]* ([0-9][^ \n]*)( .*)*$', l)
+        x2 = re.match('^.*(S[Uu]SE) [Ll][Ii][Nn][Uu][Xx].* ([0-9][^ \n]*)( .*)*$', l)
+        x3 = re.match('^open(S[Uu]SE) ([0-9][^ \n]*)( .*)*$', l)
+        if x0:
+            LINUX_DIST = '%s:%sE%s' % (x0.group(1),x0.group(3),x0.group(2))
+        elif x1:
+            LINUX_DIST = 'SLE%s:%s' % (x1.group(1),x1.group(2))
+        elif x2:
+            LINUX_DIST = '%s:%s' % (x2.group(1),x2.group(2))
+        elif x3:
+            LINUX_DIST = '%s:%s' % (x3.group(1),x3.group(2))
+    elif os.path.isfile('/etc/gentoo-release'):
+        with open('/etc/gentoo-release') as fil:
+            l = fil.readline()
+        x = re.match('^.*(Gentoo) Base System.* [versionrelease]* ([0-9][^ \n]*)( .*)*$', l)
+        if x:
+            LINUX_DIST = '%s:%s' % (x.group(1),x.group(2))
+    elif os.path.isfile('/etc/lsb-release'):
+        x0 = x1 = None
+        with open('/etc/lsb-release') as fil:
+            for l in fil:
+                if not x0:
+                    x0 = re.match('^DISTRIB_ID=([^ \n]*)( .*)*$', l)
+                if not x1:
+                    x1 = re.match('^DISTRIB_RELEASE=([^ \n]*)( .*)*$', l)
+        if x0 and x1:
+            LINUX_DIST = '%s:%s' % (x0.group(1),x1.group(1))
+    elif os.path.isfile('/etc/debian_version'):
+        with open('/etc/debian_version') as fil:
+            LINUX_DIST = 'Debian:'+fil.readline().strip()
+    if not LINUX_DIST:
+        LINUX_DIST = SYST+':'+re.match(r'^([0-9.]*)([^0-9.].*)$', RELEASE).group(1)
+    DIST,VERSION = LINUX_DIST.split(':', 1)
+elif SYST == 'SunOS' and os.path.isfile('/etc/release'):
+    with open('/etc/release') as fil:
+        (DIST,VERSION,rest) = fil.readline().strip().split(' ',2)
+else:
+    DIST = SYST
+    VERSION = RELEASE
+
+SYSTVER = SYST+RELEASE
+DISTVER = DIST+VERSION
+os.environ['SYST'] = SYST
+os.environ['SYSTVER'] = SYSTVER
+os.environ['RELEASE'] = RELEASE
+os.environ['DIST'] = DIST
+os.environ['DISTVER'] = DISTVER
+os.environ['VERSION'] = VERSION
+
+if 'HTMLTITLE' in os.environ:
+    HTMLTITLE = os.environ['HTMLTITLE']
+else:
+    HTMLTITLE = f'{THISFILE} results on {HOST} ({DISTVER})'
+
+URLPREFIX = 'https://www.monetdb.org/hg/MonetDB/file/'
+
+par = {}
+dft = {}
+
+
+class OrAction(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        super(OrAction, self).__init__(option_strings, dest, **kwargs)
+    def __call__(self, parser, namespace, values, option_string=None):
+        # if first time, override (default) value, otherwise bitwise OR values
+        if '__seen_option_' + self.dest in namespace:
+            setattr(namespace, self.dest, getattr(namespace, self.dest) | values)
+        else:
+            setattr(namespace, self.dest, values)
+        setattr(namespace, '__seen_option_' + self.dest, True)
+
+
+def main():
+    global global_timeout
+    global ignore_conditions
+
+    VARS = ['TSTSRCBASE', 'TSTTRGBASE', 'MALCLIENT', 'SQLCLIENT', 'SQLDUMP']    #, 'MONETDB_MOD_PATH' ]
+
+    env = {}
+
+    # most intuitive (?) default settings
+    dft['TSTSRCBASE']     = r"'@QXSOURCE@'"
+    dft['TSTTRGBASE']     = r"'@QXprefix@'"   # or os.getcwd() ?
+    dft['GDK_DEBUG']      = 'TSTDBG'
+    dft['GDK_NR_THREADS'] = 'TSTTHREADS'
+    dft['MONETDB_MOD_PATH'] = "''"
+    dft['setMONETDB_MOD_PATH'] = "'--set \"monet_mod_path='+env['MONETDB_MOD_PATH']+'\"'"
+    dft['MALCLIENT']      = "'mclient -lmal -ftest -tnone -Eutf-8'"
+    dft['SQLCLIENT']      = "'mclient -lsql -ftest -tnone -Eutf-8'"
+    dft['SQLDUMP']        = "'msqldump -q'"
+
+    # commandline options overrule environment
+    parser = argparse.ArgumentParser(usage='%(prog)s [options] ( [<dir>] [<tests>] | [<dirs>] )', epilog='See %s for details about %s.' % (os.path.join('@QXSOURCE@','testing','README'), THISFILE))
+    parser.add_argument('--version', action='version', version='@VERSION@')
+    parser.add_argument('--recursive', '-r', action='store_true', dest='recursive', help="recurse into subdirectories (implies 'All')")
+    parser.add_argument('--revision', action='store', dest='revision', metavar='<hgid>', help='use given revision as the HG short hash')
+    parser.add_argument('--TSTSRCBASE', action='store', dest='TSTSRCBASE', metavar='<path>', help='default: "%s"' % '@QXSOURCE@')
+    parser.add_argument('--TSTTRGBASE', action='store', dest='TSTTRGBASE', metavar='<path>', help='default: "%s"' % '@QXprefix@')
+    parser.add_argument('--verbose', '-v', action='store_true', dest='verbose', default=0, help='more verbose test output')
+    parser.add_argument('--procdebug', action='store_true', dest='procdebug', help='process debugging (Mtest developers only)')
+    parser.add_argument('--urlprefix', action='store', help='URL prefix to the MonetDB Mercurial repository')
+
+    parser.add_argument('-t', action='store', dest='timeout', metavar='<sec>', type=int, default=60, help='timeout: kill (hanging) tests after <sec> seconds;\n-t0 means no timeout (default: -t60)')
+    parser.add_argument('--debug', '-d', action=OrAction, dest='debug', metavar='<num>', type=int, default=int(TSTDBG), help="debug value to be used by mserver5, multiple -d options are ORed together (default: -d%s)\n(see `mserver5 --help' for details)" % TSTDBG)
+    parser.add_argument('--nr_threads', '-n', action='store', dest='nr_threads', metavar='<num>', type=int, default=int(TSTTHREADS), help='number of threads for mserver5 (default: -n%s)\n-n0 => mserver5 automatically determines the number of CPU cores' % TSTTHREADS)
+    parser.add_argument('--pipeline', action='store_true', dest='pipeline', help='run with pipeline processing enabled')
+    parser.add_argument('--monet_mod_path', action='store', dest='monet_mod_path', metavar='<pathlist>', help="override mserver5's default module search path")
+    parser.add_argument('--dbfarm', action='store', dest='gdk_dbfarm', default=os.path.join('@QXlocalstatedir@','MonetDB'), metavar='<directory>', help='override default location of database directory')
+    parser.add_argument('--MALCLIENT', action='store', dest='MALCLIENT', metavar='<mal-client program>', help='default: %s' % dft['MALCLIENT'])
+    parser.add_argument('--SQLCLIENT', action='store', dest='SQLCLIENT', metavar='<sql-client program>', help='default: %s' % dft['SQLCLIENT'])
+    parser.add_argument('--SQLDUMP', action='store', dest='SQLDUMP', metavar='<sql-dump program>', help='default: %s' % dft['SQLDUMP'])
+    parser.add_argument('--dbg', action='store', dest='dbg', metavar='<debugger/valgrind>', help='debugger to start before each server')
+    parser.add_argument('--mserver_set', action='append', dest='mserver_set', metavar='<mserver5_option>', help='This passes a single set to the server')
+    parser.add_argument('--loadmodule', action='append', dest='loadmodule', metavar='<module_name>', help='Pass on loadmodule to mserver5')
+    parser.add_argument('--no-clean', action='store_true', dest='no_clean', help='Do not clean up before test')
+    parser.add_argument('--testweb', action='store_true', dest='testweb', help='Optimize testing for testweb')
+    parser.add_argument('--releaserun', action='store_true', dest='releaserun', help='run tests as if for a release test')
+    parser.add_argument('--multifarm', action='store_true', dest='multifarm', help='use multiple dbfarms (developers only)')
+    parser.add_argument('--transient-inmemory', action='store_true', dest='inmemory', help="don't write transient data to disk")
+    parser.add_argument('--nomito', action='store_true', dest='nomito', help='Do not pass --forcemito to server')
+    parser.add_argument('--restart', action='store_true', dest='restart', help='Restart server after each test')
+    parser.add_argument('--addreqs', action='store_true', dest='addreqs', help='automatically add required tests when testing individual tests')
+    parser.add_argument('--global_timeout', '-T', action='store', dest='global_timeout', type=int, default=global_timeout, metavar='<sec>', help='global timeout')
+    parser.add_argument('--data_path', '-D', action='store', dest='data_path', metavar='<path>', help='Path to the root directory of the data files needed for testing (default: TSTDATAPATH environment variable)')
+    parser.add_argument('--alltests', action='store_true', dest='alltests', help='also run tests that are known to fail')
+    parser.add_argument('--initdb', action='store', dest='initdb', metavar='<zipfile>', help='zip file with contents for initial database')
+    parser.add_argument('--single-in-memory', action='store_true', dest='single_in_memory', help='use --in-memory for SingleServer directories')
+    parser.add_argument('--approve', action='store_true', help='produce .newtest file in testing directory with calculated content')
+    parser.add_argument('--approve+replace', action='store_true', dest='approve_replace', help='produce new .test file in source directory with calculated content')
+    parser.add_argument('--threshold', action='store', type=int, help='hash-threshold for .test files when approving')
+    parser.add_argument('--ignore-conditions', action='store_true', dest='ignore_conditions', help='ignore conditions in All file')
+    parser.add_argument('--skip-test-with-timeout', action='store_true', help='skip tests that have a .timeout file')
+    parser.add_argument('--stop-at-crash', action='store_true', dest='stop_crash', help='stop testing when the server crashes')
+    parser.add_argument('--ci', action='store_true', dest='ci', help='special handling for continuous integration (no error return unless serious problem)')
+    parser.add_argument('--parallel', action='store', type=int, default=1, metavar='<directories>', help='run multiple directories in parallel')
+    parser.add_argument('--checkkeys', action='store_true', help='at end of directory check all system keys')
+    parser.add_argument('--use-tcp', action='store_true', help='do not use UNIX domain sockets')
+    global produce_html
+    if produce_html:
+        parser.add_argument('--no-html', action='store_false', dest='produce_html', help='do not produce HTML files')
+    else:
+        parser.add_argument('--produce-html', action='store_true', dest='produce_html', help='produce HTML files')
+    parser.add_argument('--loglevel', action='store', help='log level')
+
+    parser.add_argument('tests', nargs='*', help='The positional arguments are either a list of one or more directories to be tested, or a single directory followed by a list of tests within that directory.')
+    opts = parser.parse_args()
+    args = opts.tests
+
+    CONDITIONALS['HAVE_SQLITE3ODBC'] = os.path.exists('/usr/lib64/libsqlite3odbc.so')
+
+    #par = {}
+    # get current environment
+    env['HOST'] = os.environ['HOST']
+    for v in VARS:
+        if v in os.environ:
+            env[v] = os.environ[v]
+
+    if opts.loglevel:
+        import logging
+        try:
+            level = getattr(logging, opts.loglevel.upper())
+        except:
+            print(f'unknown log level {opts.loglevel}', file=sys.stderr)
+            sys.exit(1)
+        logging.basicConfig(level=level)
+
+    if opts.parallel < 1:
+        opts.parallel = 1
+    recursive = opts.recursive
+    global verbose
+    verbose = opts.verbose
+    global procdebug
+    procdebug = opts.procdebug
+    global approve
+    global replace
+    global threshold
+    approve = opts.approve or opts.approve_replace
+    if opts.approve_replace:
+        replace = True
+    if approve:
+        os.environ['MTEST_APPROVE'] = 'REPLACE' if replace else 'TRUE'
+    if opts.threshold:
+        threshold = opts.threshold
+    global stop_crash
+    stop_crash = opts.stop_crash
+    ignore_conditions = opts.ignore_conditions
+    global skip_timeout
+    skip_timeout = opts.skip_test_with_timeout
+    produce_html = opts.produce_html
+    addreqs = False
+    global testweb
+    testweb = opts.testweb
+    CONDITIONALS['RELEASERUN'] = opts.releaserun
+    nomito = opts.nomito
+    global restart
+    restart = opts.restart
+    if opts.alltests:
+        CONDITIONALS['KNOWNFAIL'] = True
+    if opts.pipeline:
+        CONDITIONALS['PIPELINE'] = True
+        mserver5_opts.append(f'--debug={1<<19}')
+    global checkkeys
+    checkkeys = opts.checkkeys
+    global usetcp
+    usetcp = opts.use_tcp
+    process.no_unix_sockets = opts.use_tcp
+    par['TIMEOUT'] = opts.timeout
+    env['GDK_DEBUG'] = str(opts.debug)
+    env['GDK_NR_THREADS'] = str(opts.nr_threads)
+    a = opts.monet_mod_path
+    if a is not None:
+        env['MONETDB_MOD_PATH'] = a
+    a = opts.gdk_dbfarm
+    if a is not None:
+        env['GDK_DBFARM'] = os.path.abspath(a)
+    a = opts.dbg
+    if a is not None:
+        env['DBG'] = a
+    if opts.mserver_set:
+        for a in opts.mserver_set:
+            mserver5_opts.extend(['--set', a])
+            if a == 'sql_debug=128':
+                CONDITIONALS['NOWAL'] = True
+                os.environ['NOWAL'] = 'True'
+    if opts.loadmodule:
+        for a in opts.loadmodule:
+            mserver5_opts.extend(['--loadmodule', a])
+    a = opts.no_clean
+    if a:
+        env['NOCLEAN'] = a
+    a = opts.multifarm
+    if a:
+        env['MULTIFARM'] = 'True'
+    a = opts.inmemory
+    if a:
+        env['TRANS_INMEM'] = 'True'
+    if opts.multifarm and opts.inmemory:
+        ErrXit('Cannot have both --multifarm and --transient-inmemory')
+    addreqs = opts.addreqs
+    a = opts.global_timeout
+    if a:
+        global_timeout = a
+    a = opts.data_path
+    if a is not None:
+        env['TSTDATAPATH'] = a
+    elif os.getenv('TSTDATAPATH'):
+        env['TSTDATAPATH'] = os.getenv('TSTDATAPATH')
+    global initdb
+    initdb = opts.initdb
+    global single_in_memory
+    single_in_memory = opts.single_in_memory
+    for v in VARS:
+        a = vars(opts).get(v)
+        if a is not None:
+            env[v] = a
+
+    # display par's
+    print(file=sys.stderr, end='', flush=True)
+    print(end='', flush=True)
+    #env['par'] = par
+
+    # unknown at compile time, as Mtest.py is compiled with MonetDB;
+    # hence, we set them at runtime.
+    # X == true   =>  @X_TRUE@='',  @X_FALSE@='#'
+    # X == false  =>  @X_TRUE@='#', @X_FALSE@=''
+    os.environ['PYTHON'] = sys.executable
+
+    if CONDITIONALS['HAVE_ODBC']:
+        if CONDITIONALS['NOT_WIN32']:
+            # only enable HAVE_PYODBC if we have ODBC support
+            try:
+                import pyodbc
+            except ImportError:
+                CONDITIONALS['HAVE_PYODBC'] = False
+            else:
+                CONDITIONALS['HAVE_PYODBC'] = True
+        else:
+            # for now, no ODBC testing on Windows
+            CONDITIONALS['HAVE_ODBC'] = False
+
+    try:
+        import lz4
+    except ImportError:
+        CONDITIONALS['HAVE_PYTHON_LZ4'] = False
+    else:
+        CONDITIONALS['HAVE_PYTHON_LZ4'] = True
+
+    try:
+        import monetdbe
+    except ImportError:
+        CONDITIONALS['HAVE_MONETDBE'] = False
+    else:
+        CONDITIONALS['HAVE_MONETDBE'] = True
+
+    try:
+        import scipy
+    except ImportError:
+        CONDITIONALS['HAVE_LIBSCIPY3'] = False
+    else:
+        CONDITIONALS['HAVE_LIBSCIPY3'] = True
+
+    try:
+        import cryptography
+    except ImportError:
+        CONDITIONALS['HAVE_CRYPTOGRAPHY'] = False
+    else:
+        CONDITIONALS['HAVE_CRYPTOGRAPHY'] = True
+
+    if env.get('TSTDATAPATH'):
+        CONDITIONALS['HAVE_DATA_PATH'] = True
+
+    if CheckExec('ruby'):
+        # also check ruby version; we require >= 1.9 for "require_relative"
+        with process.Popen(['ruby', '--version'],
+                           stdout=process.PIPE, stderr=process.PIPE,
+                           text=True) as proc:
+            ruby_out, ruby_err = proc.communicate()
+        ruby_reg = re.compile(r'^[^ ]* ([0-9]+)\.([0-9]+)[^0-9].*$', re.MULTILINE)
+        ruby_ver = ruby_reg.match(ruby_out)
+        if ruby_ver and \
+           100 * int(ruby_ver.group(1)) + int(ruby_ver.group(2)) >= 109:
+            # now check whether the monetdb-ruby gem is available
+            with process.Popen(['ruby', '-e', "require 'MonetDB'"],
+                               stdout=process.PIPE, stderr=process.PIPE,
+                               text=True) as proc:
+                ruby_out, ruby_err = proc.communicate()
+            if proc.returncode == 0:
+                CONDITIONALS['HAVE_RUBY'] = True
+            else:
+                print('Ruby available, but MonetDB gem not available')
+    CheckClassPath()
+
+    if CheckExec('c++'):
+        with process.Popen(['c++', '--version'],
+                           stdout=process.PIPE, stderr=process.PIPE,
+                           text=True) as proc:
+            cpp_out, cpp_err = proc.communicate()
+        if proc.returncode == 0:
+            CONDITIONALS['HAVE_CPP'] = True
+
+    # tidy-up and fall-back to defaults where necessary
+    vars_ = VARS + ['GDK_DEBUG', 'GDK_NR_THREADS', 'MONETDB_MOD_PATH']
+    for v in vars_:
+        if v not in env:
+            env[v] = eval(dft[v])
+    if env['MONETDB_MOD_PATH']:
+        env['setMONETDB_MOD_PATH'] = eval(dft['setMONETDB_MOD_PATH'])
+    else:
+        env['setMONETDB_MOD_PATH'] = ''
+
+    # ensure consistent TSTSRCBASE
+    if os.path.basename(env['TSTSRCBASE']) == TSTSUFF and \
+            os.path.isfile(os.path.join(env['TSTSRCBASE'], 'All')):
+        ErrXit('TSTSRCBASE itself must not be a test-directory, i.e., called "%s" and contain an "All" file!' % TSTSUFF)
+
+    # make TSTxxxBASE absolute physical paths
+    for p in 'TSTSRCBASE', 'TSTTRGBASE':
+        if os.path.isdir(env[p]):
+            rp = os.path.realpath(env[p])
+            env[p] = rp
+        else:
+            ErrXit('Illegal '+p+": directory '"+env[p]+"' does not exist!")
+
+
+    global TSTTRGBASE
+    TSTTRGBASE = env['TSTTRGBASE']
+    global TSTSRCBASE
+    TSTSRCBASE = env['TSTSRCBASE']
+    global TSTDATAPATH
+    TSTDATAPATH = env.get('TSTDATAPATH')
+
+    env['TSTPREF'] = dftTSTPREF
+    global TSTPREF
+    TSTPREF = env['TSTPREF']
+
+    # check whether we have a Mercurial clone
+    try:
+        with process.Popen(['hg', 'root'],
+                           stdout=process.PIPE, stderr=process.PIPE,
+                           cwd=TSTSRCBASE,
+                           text=True) as proc:
+            out, err = proc.communicate()
+        if proc.returncode == 0:
+            CONDITIONALS['MERCURIAL'] = True
+        proc = None
+    except KeyboardInterrupt:
+        raise
+    except:
+        pass
+
+    # check whether our hostname makes sense
+    if os.environ['HOST'] == 'localhost':
+        CONDITIONALS['BAD_HOSTNAME'] = True
+    else:
+        try:
+            socket.getaddrinfo(socket.gethostname(), None)
+        except KeyboardInterrupt:
+            raise
+        except:
+            CONDITIONALS['BAD_HOSTNAME'] = True
+
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(('::1', 0))
+    except OSError as err:
+        CONDITIONALS['HAVE_IPV6'] = False
+    else:
+        CONDITIONALS['HAVE_IPV6'] = True
+
+    # some relative path's for relocatable HTML output
+    RELSRCBASE = os.path.relpath(TSTSRCBASE, TSTTRGBASE)
+    env['RELSRCBASE'] = RELSRCBASE
+
+    env['BINDIR'] = '@QXbindir@'
+    vars_.append('BINDIR')
+    env['LIBDIR'] = '@QXlibdir@'
+    vars_.append('LIBDIR')
+
+    # start tlstester
+    if not env.get('TST_TLSTESTERPORT'):
+        tlstester_port = StartTlsTester()
+        if tlstester_port:
+            env['TST_TLSTESTERPORT'] = str(tlstester_port)
+    if env.get('TST_TLSTESTERPORT'):
+        vars_.append('TST_TLSTESTERPORT')
+
+    # export and display env
+    print(file=sys.stderr, end='', flush=True)
+    vars_ = vars_ + ['GDK_DBFARM']
+    vars_ = vars_ + ['setMONETDB_MOD_PATH']
+    vars_ = vars_ + ['TSTDATAPATH']
+    for v in vars_:
+        if v in env:
+            os.environ[v] = env[v]
+    if testweb:
+        print('%s = %s' % ('PATH', os.environ['PATH']))
+        if 'PYTHONPATH' in os.environ:
+            print('%s = %s' % ('PYTHONPATH', os.environ['PYTHONPATH']))
+        if 'CLASSPATH' in os.environ:
+            print('%s = %s' % ('CLASSPATH', os.environ['CLASSPATH']))
+        for v in ['BINDIR']:
+            if v in os.environ:
+                print('%s = %s' % (v, os.environ[v]))
+        print(end='', flush=True)
+
+    # add QUIET par to env
+    env['QUIET'] = not verbose
+
+    if not startswithpath(os.getcwd() + os.sep, TSTSRCBASE + os.sep):
+        Warn('Current directory %s is no descendant of TSTSRCBASE=%s;' % (os.getcwd(), TSTSRCBASE))
+        Warn('changing to TSTSRCBASE=%s, now.' % TSTSRCBASE)
+        os.chdir(TSTSRCBASE)
+
+    global REV
+    global URLPREFIX
+    if opts.urlprefix:
+        URLPREFIX = opts.urlprefix
+        if not URLPREFIX.endswith('/'):
+            URLPREFIX += '/'
+        if not URLPREFIX.endswith('/file/'):
+            URLPREFIX += 'file/'
+    else:
+        try:
+            with process.Popen(['hg', 'config', 'paths.default'],
+                               stdout=process.PIPE,
+                               stderr=process.PIPE,
+                               cwd=TSTSRCBASE,
+                               text=True) as proc:
+                out, err = proc.communicate()
+                if proc.returncode == 0:
+                    out = out.strip()
+                    out = out.rstrip('/')
+                    if out.startswith('ssh://hg@monetdb/'):
+                        URLPREFIX = f'https://www.monetdb.org/hg/{out[17:]}/file/'
+                    elif not out.startswith('https://'):
+                        URLPREFIX = f'{out}/file/'
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+    REV = opts.revision
+    if produce_html and CONDITIONALS['MERCURIAL']:
+        if REV is None:             # no --revision option: try to find out
+            try:
+                with process.Popen(['hg', 'id', '-i'],
+                                   stdout=process.PIPE,
+                                   stderr=process.PIPE,
+                                   cwd=TSTSRCBASE,
+                                   text=True) as proc:
+                    out, err = proc.communicate()
+                if proc.returncode == 0:
+                    REV = out.strip()
+                proc = None
+            except KeyboardInterrupt:
+                raise
+            except:
+                pass
+        # fix up URLPREFIX
+        if REV:
+            URLPREFIX += '%s/' % REV.split()[0].rstrip('+')
+        else:
+            # if no revision known, can't refer to repository
+            URLPREFIX = None
+    if REV:
+        os.environ['REVISION'] = REV
+
+    global SOCK, HOST
+    try:                        # try/finally to clean up sockdir
+        # check for executables, set their standard options and export them
+        if SOCK:
+            # we cannot put the UNIX socket in the mtest root, because that
+            # makes the UNIX socket too long on most platforms, so use
+            # /tmp/mtest and try not to forget to clean that up
+            sockdir = f'/tmp/mtest-{os.getpid()}'
+            try:
+                os.mkdir(sockdir)
+                SOCK = f'--set mapi_usock={sockdir}/.s.monetdb.${{PORT}}'
+                HOST = sockdir
+                os.environ['MAPIHOST'] = HOST
+            except KeyboardInterrupt:
+                raise
+            except:
+                SOCK = ''
+        else:
+            SOCK = ''
+
+        exe = {}
+        if CheckExec('mserver5'):
+            exe['mserver5'] = ['mserver5', f'--debug={env["GDK_DEBUG"]}', '--debug=256', '--set', f'gdk_nr_threads={env["GDK_NR_THREADS"]}'] + shlex.split(env['setMONETDB_MOD_PATH']) + ['--set', 'mapi_listenaddr=all', '--set', 'mapi_port=0'] + shlex.split(SOCK)
+            if not nomito:
+                exe['mserver5'].append('--forcemito')
+            else:
+                exe['mserver5'].append(f'-d{1 << 24}')  # NOSYNCMASK
+        else:
+            ErrXit('cannot find mserver5 executable')
+        if CheckExec('ruby'):
+            exe['ruby_client'] = ['ruby', '${PORT}']
+        if CheckExec(env['MALCLIENT'].split(None, 1)[0]):
+            exe['MAL_Client'] = shlex.split(env['MALCLIENT']) + [f'--host={HOST}', '--port=${PORT}']
+        if CheckExec(env['SQLCLIENT'].split(None, 1)[0]):
+            exe['SQL_Client'] = shlex.split(env['SQLCLIENT']) + ['-i', '-e', f'--host={HOST}', '--port=${PORT}']
+        if CheckExec(env['SQLDUMP'].split(None, 1)[0]):
+            exe['SQL_Dump'] = shlex.split(env['SQLDUMP']) + [f'--host={HOST}', '--port=${PORT}']
+        env['exe'] = exe
+
+        # parse commandline arguments
+        testdirs = []
+        testlist = []
+        dirlist = []
+        cli_test_count = 0
+        if len(args) == 1 and not os.path.isdir(args[0]):
+            head, tail = os.path.split(args[0])
+            if os.path.isfile(args[0]):
+                head, tst = os.path.split(head)
+                if tst != 'Tests':
+                    ErrXit('%s: not a valid test name' % args[0])
+                args = [head]
+                if tail != 'All':
+                    ignore_conditions = True
+                    for ext in [x[0] for x in tests] + ['']:
+                        # extensions .in and .src are never combined
+                        if tail.endswith(ext + '.in'):
+                            args.append(tail[:-len(ext + '.in')])
+                            break
+                        if tail.endswith(ext + '.src'):
+                            args.append(tail[:-len(ext + '.src')])
+                            break
+                        if tail.endswith(ext):
+                            args.append(tail[:-len(ext)])
+                            break
+                    else:
+                        ErrXit('%s: not a valid test name' % args[0])
+            elif head and tail and os.path.isdir(head) and tail != 'Tests' and os.path.isdir(os.path.join(head, 'Tests')):
+                args = [head, tail]
+
+        if len(args) == 1:
+            if os.path.isdir(args[0]):
+                d = os.path.realpath(args[0])
+                if startswithpath(d + os.sep, TSTSRCBASE + os.sep):
+                    dirlist.append(d)
+            elif os.sep in args[0]:
+                ErrXit("'%s` is neither a valid directory in %s nor a valid test-name!" % (args[0], os.getcwd()))
+            elif args[0] != 'All':
+                testlist.append(args[0])
+        elif len(args) > 1:
+            i = 0
+            while i < len(args)  and  os.path.isdir(args[i]):
+                d = os.path.realpath(args[i])
+                if startswithpath(d + os.sep, TSTSRCBASE + os.sep):
+                    dirlist.append(os.path.realpath(args[i]))
+                i = i + 1
+            if len(dirlist) == 1  and  i < len(args)  and  args[i] != 'All':
+                ignore_conditions = True
+                while i < len(args):
+                    if os.sep not in args[i]:
+                        testlist.append(args[i])
+                    i = i + 1
+                cli_test_count = len(testlist)
+            else:
+                if i < len(args)  and  args[i] == 'All':
+                    i = i + 1
+        else:
+            # len(args) == 0: no explicit tests specified so do all
+            recursive = True
+
+        if not dirlist:
+            dirlist.append(os.getcwd())
+        if recursive:
+            testlist = []
+            for d in dirlist:
+                test_dirs, test_count = find_test_dirs(d)
+                test_dirs.sort()
+                for t in test_dirs:
+                    if t not in testdirs:
+                        testdirs.append(t)
+        else:
+            test_count = 0
+            for d in dirlist:
+                test_dirs, cnt = find_test_dirs(d, recursive=False)
+                if cnt == 0:
+                    Warn("No tests found in '%s`; skipping directory!" % d)
+                else:
+                    testdirs.extend(test_dirs)
+                    test_count += cnt
+            if cli_test_count:
+                test_count = cli_test_count
+
+        if len(testdirs) > 1  and  testlist:
+            testlist = []
+        if not testdirs:
+            Warn('No tests found in %s!' % ', '.join(dirlist))
+            sys.exit(1)
+
+        if len(testdirs) == 1 and len(testlist) > 0 and addreqs:
+            added = True
+            while added:
+                added = False
+                i = 0
+                while i < len(testlist):
+                    if os.path.exists(os.path.join(testdirs[0], 'Tests', testlist[i] + '.reqtests')):
+                        with openutf8(os.path.join(testdirs[0], 'Tests', testlist[i] + '.reqtests')) as fil:
+                            for t in fil:
+                                t = t[:-1] # remove newline
+                                if t not in testlist[:i]:
+                                    testlist.insert(i, t)
+                                    i = i + 1
+                                    added = True
+                                #elif t in testlist:
+                                    # WARNING: tests in wrong order
+                    i = i + 1
+            test_count = len(testlist)
+
+        if not env.get('NOCLEAN') and os.path.exists(os.path.join(TSTTRGBASE, TSTPREF)):
+            try:
+                shutil.rmtree(os.path.join(TSTTRGBASE, TSTPREF))
+            except KeyboardInterrupt:
+                raise
+            except:
+                ErrXit('Failed to remove %s' % os.path.join(TSTTRGBASE, TSTPREF))
+        os.makedirs(env['GDK_DBFARM'], exist_ok=True)
+
+        if not env.get('NOCLEAN') and os.path.exists(os.path.join(env['GDK_DBFARM'], TSTPREF)):
+            try:
+                shutil.rmtree(os.path.join(env['GDK_DBFARM'], TSTPREF))
+            except KeyboardInterrupt:
+                raise
+            except:
+                ErrXit('Failed to remove %s' % os.path.join(env['GDK_DBFARM'], TSTPREF))
+        try:
+            os.makedirs(os.path.join(env['GDK_DBFARM'], TSTPREF))
+        except os.error:
+            if not env.get('NOCLEAN'):
+                ErrXit('Failed to create %s' % os.path.join(env['GDK_DBFARM'], TSTPREF))
+
+        try:
+            os.makedirs(os.path.join(TSTTRGBASE, TSTPREF))
+        except os.error:
+            if not env.get('NOCLEAN'):
+                ErrXit('Failed to create %s' % os.path.join(TSTTRGBASE, TSTPREF))
+
+        # write .monetdb file for mclient to do authentication with
+        dotmonetdbfile = os.path.join(TSTTRGBASE, '.monetdb')
+        with openutf8(dotmonetdbfile, 'w') as dotmonetdb:
+            dotmonetdb.write('user=monetdb\n')
+            dotmonetdb.write('password=monetdb\n')
+        # and make mclient find it
+        os.environ['DOTMONETDBFILE'] = dotmonetdbfile
+
+        env['TST_MODS'] = []
+        env['TST_BITS'] = ''
+        env['TST_INT128'] = ''
+        env['TST_SINGLE'] = ''
+        env['TST_THREADS'] = ''
+        env['TST_ARCH'] = ''
+        if GetBitsAndModsAndThreads(env):
+            sys.exit(1)
+        print(file=sys.stderr, end='', flush=True)
+        print(end='', flush=True)
+
+        env['SYST'] = os.environ['SYST']
+        env['RELEASE'] = os.environ['RELEASE']
+        env['DIST'] = os.environ['DIST']
+        env['VERSION'] = os.environ['VERSION']
+
+        CONDITIONALS['ARCH_BITS32'] = (env['TST_BITS'] == '32bit')
+
+        if CONDITIONALS['HAVE_GEOM'] and 'geom' not in env['TST_MODS']:
+            CONDITIONALS['HAVE_GEOM'] = False
+
+        if procdebug:
+            for k in sorted(os.environ):
+                print(f'{k}={os.environ[k]}')
+        print(file=sys.stderr, end='', flush=True)
+        t_ = 0
+        t0 = time.time()
+        body_good = []
+        body_bad = []
+        errseen = False
+        try:
+            if len(testdirs) == 1:
+                if testlist:
+                    tsts = 'tests ' + ', '.join(testlist)
+                else:
+                    tsts = 'all tests'
+                tdir, elem, diff, interrupted = PerformDir(env, testdirs[0], testlist, test_count)
+                if elem is not None:
+                    if diff <= F_OK:
+                        body_good.append((tdir, elem))
+                    else:
+                        body_bad.append((tdir, elem))
+                if not errseen and diff > F_WARN:
+                    errseen = True
+            else:
+                td = []
+                for d in testdirs:
+                    try:
+                        with openutf8(os.path.join(d, TSTSUFF, 'prio')) as f:
+                            prio = int(f.read())
+                    except:
+                        prio = 1000
+                    td.append((prio, d))
+                testdirs = [d for (prio, d) in sorted(td)]
+                tp = None
+                try:
+                    if opts.parallel > 1 and len(testdirs) > 1:
+                        tp = concurrent.futures.ThreadPoolExecutor(max_workers=opts.parallel)
+                        futures = {tp.submit(PerformDir, env, d, [], test_count): d for d in testdirs}
+                        iter = concurrent.futures.as_completed(futures)
+                    else:
+                        iter = testdirs
+                    for d in iter:
+                        if tp is not None:
+                            future = d
+                            d = futures[future]
+                            tdir, elem, diff, interrupted = future.result()
+                        else:
+                            tdir, elem, diff, interrupted = PerformDir(env, d, [], test_count)
+                        if elem is not None:
+                            if diff <= F_OK:
+                                body_good.append((tdir, elem))
+                            else:
+                                body_bad.append((tdir, elem))
+                        if not errseen and diff > F_WARN:
+                            errseen = True
+                        if interrupted:
+                            break
+                        if not testweb:
+                            if global_timeout and start_time + global_timeout < time.time():
+                                print('\nGlobal testing timeout reached\n')
+                                break
+                            if produce_html:
+                                # after a directory has been tested, create
+                                # the index file so that we can look at test
+                                # results while the tests are running
+                                body = [elem for (tdir, elem) in sorted(body_bad)] + [elem for (tdir, elem) in sorted(body_good)]
+                                CreateHtmlIndex(env, '', os.path.join(TSTTRGBASE, TSTPREF), F_SKIP, F_SKIP, *body)
+                except KeyboardInterrupt:
+                    if tp is not None:
+                        tp.shutdown(cancel_futures=True)
+                        tp = None
+                    raise
+                finally:
+                    if tp is not None:
+                        tp.shutdown(wait=True)
+                        tp = None
+            if not verbose:
+                print()
+                for msg in warnings:
+                    print(msg)
+                for (err, msg) in errors:
+                    if err in ('ERROR', 'MISSING'):
+                        prred(err)
+                    else:
+                        prpurple(err)
+                    print(':', msg)
+        except KeyboardInterrupt:
+            # if we get interrupted between directories, we still want output
+            pass
+        t_ = time.time() - t0
+        body = [elem for (tdir, elem) in sorted(body_bad)] + [elem for (tdir, elem) in sorted(body_good)]
+
+        if not os.path.exists(os.path.join(TSTTRGBASE, TSTPREF)):
+            os.mkdir(os.path.join(TSTTRGBASE, TSTPREF))
+        with openutf8(os.path.join(TSTTRGBASE, TSTPREF, 'times.lst'),'w') as fl:
+            Failure = [[] for i in FAILURES]
+            for TSTDIR, TST, ms, FtOut, FtErr, reason in TIMES:
+                fl.write('%s:\t%s\t%s\t%s\t%s\n' % (url(os.path.join(TSTDIR, TST)),
+                                                    f'{ms:7.3f}' if ms >= 0 else '  -.---',
+                                                    FAILURES[FtOut][0],
+                                                    FAILURES[FtErr][0],
+                                                    reason or ''))
+                if TST != '':
+                    Failure[max(FtOut,FtErr)].append(os.path.join(TSTDIR,TST))
+            fl.write(f':\t{t_:7.3f}\t\n')
+
+        host = socket.gethostname()
+        product = os.path.split(TSTSRCBASE)[-1]
+
+        compiler = ''
+
+        # start of times.sql output preparation
+        now = f"timestamp '{datetime.datetime.now()}'"
+
+        if env['TST_INT128'] != '':
+            isInt128 = 'true'
+        else:
+            isInt128 = 'false'
+
+        if env['TST_SINGLE'] != '':
+            isSingle = 'true'
+        else:
+            isSingle = 'false'
+
+        # ok, we're not prepared for the 128 bits world yet
+        bits = env['TST_BITS'][:2]
+
+        # we write in SQL the same codes as testweb uses in the HTML
+        # pages, for readability
+
+        # we are not interested in the compiler, nor its path, nor its
+        # options.  We do store the options separately, though
+        hasSpace = compiler.find(' ')
+        if hasSpace != -1:
+            ccname = os.path.split(compiler[:hasSpace])[-1]
+            ccopts = compiler[hasSpace + 1:]
+        else:
+            ccname = os.path.split(compiler)[-1]
+            ccopts = ''
+
+        with openutf8(os.path.join(TSTTRGBASE, TSTPREF, 'times.sql'),'w') as fl:
+            for TSTDIR, TST, ms, FtOut, FtErr, reason in TIMES:
+                tms = f'{ms}' if ms >= 0 else 'NULL'
+
+                if TST != '':
+                    # target is a platform and compilation options etc
+                    fl.write(f"""\
+INSERT INTO mtest (\"date\", \"machine\", \"os\", \"release\", \
+\"compiler\", \"compiler_opts\", \"bits\", \"oid\", \"int128\", \"single\", \
+\"static\", \"product\", \"dir\", \"test\", \"time\", \"stdout\", \"stderr\") \
+VALUES ({now}, '{host}', '{env['SYST']}', '{env['RELEASE']}', \
+'{ccname}', '{ccopts}', {bits}, {bits}, {isInt128}, {isSingle}, false, \
+'{product}', '{TSTDIR}', '{TST}', \
+{tms}, '{FAILURES[FtOut][1]}', '{FAILURES[FtErr][1]}');
+""")
+
+        if not testweb and produce_html:
+            CreateHtmlIndex(env, '', os.path.join(TSTTRGBASE, TSTPREF), F_SKIP, F_SKIP, *body)
+
+        Failed = 0
+        for f in [F_SOCK, F_TIME, F_ABRT, F_SEGV, F_RECU, F_ERROR]:
+            Failed += len(Failure[f])
+        num_tests = 0
+        for f in Failure:
+            num_tests += len(f)
+        print(file=sys.stderr, end='', flush=True)
+        if not testweb:
+            nskip = len(Failure[F_SKIP])
+            print(f'Ran {num_tests - nskip} tests in {t_:.3f}s', end='')
+            if nskip > 0:
+                print(f', skipped {nskip} test{"" if nskip == 1 else "s"}',
+                      end='')
+            print(', ', end='')
+            if Failed > 0:
+                prred(f'{Failed} test{"" if Failed == 1 else "s"} failed')
+            else:
+                prgreen('no failures')
+            print()
+            if produce_html and (Failed or errseen):
+                f = os.path.join(TSTTRGBASE, TSTPREF, "index.html")
+                if sys.version_info[1] >= 14:
+                    u = urllib.request.pathname2url(f, add_scheme=True)
+                else:
+                    u = urllib.parse.urlunsplit(("file", "", urllib.request.pathname2url(f), "", ""))
+                print(f'see {u}')
+        elif Failed:
+            how = ''
+            what = ''
+            for x, y, z in [(F_SKIP, 'could not be executed', ''),
+                            (F_WARN, 'produced slightly different output', 'slightly'),
+                            (F_SOCK, 'did not properly release socket(s)', 'SIGNIFICANTLY'),
+                            (F_TIME, 'ran into timeout', 'SIGNIFICANTLY'),
+                            (F_ABRT, 'caused an abort (assertion failure)', 'SIGNIFICANTLY'),
+                            (F_SEGV, 'resulted in a crash', 'SIGNIFICANTLY'),
+                            (F_RECU, 'ran into too deep recursion', 'SIGNIFICANTLY'),
+                            (F_ERROR, 'produced SIGNIFICANTLY different output', 'SIGNIFICANTLY')]:
+                if Failure[x]:
+                    how = z
+                    what += f' {len(Failure[x])} out of {num_tests} tests {y}\n'
+                    for f in Failure[x]:
+                        what += f'        {f}\n'
+            print(f'''\
+
+ !ERROR:  Testing FAILED {how} ({Failed} out of {num_tests} tests failed)
+
+{what}
+''')
+        elif errseen:
+            print('''
+ !ERROR:  Testing FAILED in some directories
+''')
+        elif verbose:
+            print('No differences encountered during testing.')
+        sys.exit(1 if not opts.ci and (Failed or errseen) else 0)
+
+    finally:
+        # cleanup the place where we put our UNIX sockets
+        try:
+            shutil.rmtree(sockdir)
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+
+
+if __name__ == '__main__':
+    if '--debug' in sys.argv:
+        sys.argv.remove('--debug')
+        import pdb
+        pdb.run('main()')
+    else:
+        main()

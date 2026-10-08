@@ -1,0 +1,31 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/*
+ * (author) M Kersten, N Nes
+ */
+#ifndef _SQL_TRANSACTION_H
+#define _SQL_TRANSACTION_H
+
+#include "sql_monet_backend.h"
+#include "mal_backend.h"
+#include "sql_atom.h"
+#include "sql_statement.h"
+#include "sql_env.h"
+#include "sql_mvc.h"
+#include "mal_function.h"
+
+extern str SQLtransaction_begin(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci) ;
+extern str SQLtransaction_release(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci) ;
+extern str SQLtransaction_commit(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci) ;
+extern str SQLtransaction_rollback(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci) ;
+
+#endif /* _SQL_TRANSACTION_H */
+

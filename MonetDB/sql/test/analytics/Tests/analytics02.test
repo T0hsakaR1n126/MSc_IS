@@ -1,0 +1,1533 @@
+statement ok
+create table analytics (aa int, bb int, cc bigint)
+
+statement ok
+start transaction
+
+statement ok
+insert into analytics values (15, 3, 15), (3, 1, 3), (2, 1, 2), (5, 3, 5), (NULL, 2, NULL), (3, 2, 3), (4, 1, 4), (6, 3, 6), (8, 2, 8), (NULL, 4, NULL)
+
+statement ok
+create table stressme (aa varchar(64), bb int)
+
+statement ok
+insert into stressme values ('one', 1), ('another', 1), ('stress', 1), (NULL, 2), ('ok', 2), ('check', 3), ('me', 3), ('please', 3), (NULL, 4)
+
+query I nosort
+select cast(sum(aa) over (order by aa nulls first rows between 5 preceding and 0 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+5
+8
+12
+17
+23
+29
+41
+
+query I nosort
+select cast(sum(aa) over (order by aa nulls first rows between 5 preceding and 2 following) as bigint) from analytics order by 1 nulls first
+----
+2
+5
+8
+12
+17
+23
+31
+41
+44
+46
+
+query I nosort
+select cast(sum(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+5
+9
+11
+11
+26
+
+query I nosort
+select cast(sum(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+9
+9
+9
+11
+11
+11
+26
+26
+26
+
+query I nosort
+select cast(prod(aa) over (order by aa nulls first rows between 5 preceding and 0 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+6
+18
+72
+360
+2160
+8640
+43200
+
+query I nosort
+select cast(prod(aa) over (order by aa nulls first rows between 5 preceding and 2 following) as bigint) from analytics order by 1 nulls first
+----
+2
+6
+18
+72
+360
+2160
+17280
+43200
+129600
+259200
+
+query I nosort
+select cast(prod(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+6
+24
+24
+30
+450
+
+query I nosort
+select cast(prod(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) as bigint) from analytics order by 1 nulls first
+----
+NULL
+24
+24
+24
+24
+24
+24
+450
+450
+450
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+2.667
+3.000
+3.400
+3.833
+4.833
+6.833
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+2.000
+2.500
+2.667
+3.000
+3.400
+3.833
+4.429
+5.750
+6.286
+6.833
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+3.000
+3.000
+5.000
+5.500
+5.500
+8.667
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+NULL
+3.000
+3.000
+3.000
+5.500
+5.500
+5.500
+8.667
+8.667
+8.667
+
+query I nosort
+select min(aa) over (order by aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+2
+2
+2
+3
+3
+
+query I nosort
+select min(aa) over (order by aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+2
+2
+2
+2
+2
+2
+2
+2
+3
+3
+
+query I nosort
+select min(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+3
+3
+5
+5
+5
+
+query I nosort
+select min(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+NULL
+2
+2
+2
+3
+3
+3
+5
+5
+5
+
+query I nosort
+select max(aa) over (order by aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select max(aa) over (order by aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+2
+3
+3
+4
+5
+6
+8
+15
+15
+15
+
+query I nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) from analytics order by 1 nulls first
+----
+NULL
+4
+4
+4
+8
+8
+8
+15
+15
+15
+
+query I nosort
+select min(bb) over (order by bb rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+1
+1
+1
+1
+1
+1
+1
+2
+2
+
+query I nosort
+select min(bb) over (order by bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+1
+1
+1
+1
+1
+1
+1
+2
+2
+
+query I nosort
+select min(bb) over (partition by aa order by aa nulls first, bb rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+1
+1
+1
+2
+2
+2
+3
+3
+3
+
+query I nosort
+select min(bb) over (partition by aa order by aa nulls first, bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+1
+1
+1
+2
+2
+2
+3
+3
+3
+
+query I nosort
+select max(bb) over (order by bb rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+1
+1
+2
+2
+2
+3
+3
+3
+4
+
+query I nosort
+select max(bb) over (order by bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+2
+2
+2
+3
+3
+3
+4
+4
+4
+
+query I nosort
+select max(bb) over (partition by aa order by aa nulls first, bb rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+1
+1
+2
+2
+2
+3
+3
+3
+4
+
+query I nosort
+select max(bb) over (partition by aa order by aa nulls first, bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+1
+2
+2
+2
+3
+3
+3
+4
+4
+
+query I nosort
+select count(*) over (rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+2
+3
+4
+5
+6
+6
+6
+6
+6
+
+query I nosort
+select count(*) over (rows between 5 preceding and 2 following) from analytics order by 1
+----
+3
+4
+5
+6
+6
+7
+7
+8
+8
+8
+
+query I nosort
+select count(*) over (partition by bb order by bb rows between 5 preceding and 0 following) from analytics order by bb, 1
+----
+1
+2
+3
+1
+2
+3
+1
+2
+3
+1
+
+query I nosort
+select count(*) over (partition by bb order by bb rows between 5 preceding and 2 following) from analytics order by bb
+----
+3
+3
+3
+3
+3
+3
+3
+3
+3
+1
+
+query I nosort
+select count(aa) over (order by aa nulls first rows between 5 preceding and 0 following) from analytics order by 1
+----
+0
+0
+1
+2
+3
+4
+5
+6
+6
+6
+
+query I nosort
+select count(aa) over (order by aa nulls first rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+2
+3
+4
+5
+6
+6
+7
+7
+8
+
+query I nosort
+select count(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from analytics order by 1
+----
+0
+0
+1
+1
+1
+2
+2
+2
+3
+3
+
+query I nosort
+select count(aa) over (partition by bb order by bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+0
+2
+2
+2
+3
+3
+3
+3
+3
+3
+
+query I nosort
+select count(bb) over (order by bb rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+2
+3
+4
+5
+6
+6
+6
+6
+6
+
+query I nosort
+select count(bb) over (order by bb rows between 5 preceding and 2 following) from analytics order by 1
+----
+3
+4
+5
+6
+6
+7
+7
+8
+8
+8
+
+query I nosort
+select count(bb) over (partition by aa order by aa rows between 5 preceding and 0 following) from analytics order by 1
+----
+1
+1
+1
+1
+1
+1
+1
+1
+2
+2
+
+query I nosort
+select count(bb) over (partition by aa order by aa rows between 5 preceding and 2 following) from analytics order by 1
+----
+1
+1
+1
+1
+1
+1
+2
+2
+2
+2
+
+query I nosort
+select count(*) over (rows between unbounded preceding and unbounded following) from analytics
+----
+10
+10
+10
+10
+10
+10
+10
+10
+10
+10
+
+query I nosort
+select count(*) over (partition by bb order by bb rows between unbounded preceding and unbounded following) from analytics order by 1
+----
+1
+3
+3
+3
+3
+3
+3
+3
+3
+3
+
+query I nosort
+select count(aa) over (rows between unbounded preceding and unbounded following) from analytics
+----
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+
+query I nosort
+select count(aa) over (partition by bb order by bb rows between unbounded preceding and unbounded following) from analytics order by 1
+----
+0
+2
+2
+2
+3
+3
+3
+3
+3
+3
+
+query I nosort
+select count(bb) over (rows between unbounded preceding and unbounded following) from analytics
+----
+10
+10
+10
+10
+10
+10
+10
+10
+10
+10
+
+query I nosort
+select count(bb) over (partition by aa order by aa rows between unbounded preceding and unbounded following) from analytics order by 1
+----
+1
+1
+1
+1
+1
+1
+2
+2
+2
+2
+
+query I nosort
+select count(*) over (rows unbounded preceding)
+----
+1
+
+query I nosort
+select count(*) over (rows 200 preceding)
+----
+1
+
+query I nosort
+select count(*) over (rows between 5 preceding and 0 following)
+----
+1
+
+query I nosort
+select min(aa) over (order by aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+2
+2
+2
+2
+2
+
+query I nosort
+select min(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+3
+3
+5
+5
+5
+
+query I nosort
+select max(aa) over (order by aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select cast(sum(aa) over (order by aa nulls first rows unbounded preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+5
+8
+12
+17
+23
+31
+46
+
+query I nosort
+select cast(sum(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+5
+9
+11
+11
+26
+
+query I nosort
+select cast(prod(aa) over (order by aa nulls first rows unbounded preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+6
+18
+72
+360
+2160
+17280
+259200
+
+query I nosort
+select cast(prod(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+6
+24
+24
+30
+450
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+2.667
+3.000
+3.400
+3.833
+4.429
+5.750
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+3.000
+3.000
+5.000
+5.500
+5.500
+8.667
+
+query I nosort
+select count(*) over (rows unbounded preceding) from analytics order by 1
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+query I nosort
+select count(*) over (partition by bb order by bb rows unbounded preceding) from analytics order by 1
+----
+1
+1
+1
+1
+2
+2
+2
+3
+3
+3
+
+query I nosort
+select count(aa) over (order by bb, aa nulls first rows unbounded preceding) from analytics order by 1 nulls first
+----
+1
+2
+3
+3
+4
+5
+6
+7
+8
+8
+
+query I nosort
+select count(aa) over (partition by bb order by bb, aa nulls first rows unbounded preceding) from analytics order by bb, aa nulls first
+----
+1
+2
+3
+0
+1
+2
+1
+2
+3
+0
+
+query I nosort
+select min(aa) over (order by aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+3
+3
+4
+5
+6
+
+query I nosort
+select min(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+2
+2
+3
+3
+5
+5
+5
+
+query I nosort
+select max(aa) over (order by aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+3
+4
+5
+6
+8
+15
+
+query I nosort
+select cast(sum(aa) over (order by aa nulls first rows 2 preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+5
+8
+10
+12
+15
+19
+29
+
+query I nosort
+select cast(sum(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+5
+9
+11
+11
+26
+
+query I nosort
+select cast(prod(aa) over (order by aa nulls first rows 2 preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+6
+18
+36
+60
+120
+240
+720
+
+query I nosort
+select cast(prod(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) as bigint) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2
+3
+5
+6
+24
+24
+30
+450
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+2.667
+3.333
+4.000
+5.000
+6.333
+9.667
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) from analytics order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+3.000
+3.000
+5.000
+5.500
+5.500
+8.667
+
+query I nosort
+select count(*) over (rows 2 preceding) from analytics order by 1
+----
+1
+2
+3
+3
+3
+3
+3
+3
+3
+3
+
+query I nosort
+select count(*) over (partition by bb order by bb rows 2 preceding) from analytics order by bb, 1
+----
+1
+2
+3
+1
+2
+3
+1
+2
+3
+1
+
+query I nosort
+select count(aa) over (order by aa nulls first rows 2 preceding) from analytics order by 1
+----
+0
+0
+1
+2
+3
+3
+3
+3
+3
+3
+
+query I nosort
+select count(aa) over (partition by bb order by bb, aa nulls first rows 2 preceding) from analytics order by bb, 1
+----
+1
+2
+3
+0
+1
+2
+1
+2
+3
+0
+
+query R nosort
+select avg(bb) over (order by bb rows between 5 preceding and 0 following) from stressme order by 1
+----
+1.000
+1.000
+1.000
+1.250
+1.400
+1.667
+2.000
+2.333
+2.833
+
+query R nosort
+select avg(bb) over (order by bb rows between 5 preceding and 2 following) from stressme order by 1
+----
+1.000
+1.250
+1.400
+1.667
+1.857
+2.000
+2.375
+2.571
+2.833
+
+query R nosort
+select avg(bb) over (partition by bb order by bb rows between 5 preceding and 0 following) from stressme order by 1
+----
+1.000
+1.000
+1.000
+2.000
+2.000
+3.000
+3.000
+3.000
+4.000
+
+query R nosort
+select avg(bb) over (partition by bb order by bb rows between 5 preceding and 2 following) from stressme order by 1
+----
+1.000
+1.000
+1.000
+2.000
+2.000
+3.000
+3.000
+3.000
+4.000
+
+query T nosort
+select min(aa) over (order by bb, aa nulls first rows between 5 preceding and 0 following) from stressme order by 1
+----
+another
+another
+another
+another
+another
+another
+check
+check
+check
+
+query T nosort
+select min(aa) over (order by bb, aa nulls first rows between 5 preceding and 2 following) from stressme order by 1
+----
+another
+another
+another
+another
+another
+another
+check
+check
+check
+
+query T nosort
+select min(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from stressme order by bb, aa nulls first
+----
+another
+another
+another
+NULL
+ok
+check
+check
+check
+NULL
+
+query T nosort
+select min(aa) over (partition by bb order by bb rows between 5 preceding and 2 following) from stressme order by bb, 1
+----
+another
+another
+another
+ok
+ok
+check
+check
+check
+NULL
+
+query T nosort
+select max(aa) over (rows between 5 preceding and 0 following) from stressme order by 1 nulls first
+----
+one
+one
+please
+stress
+stress
+stress
+stress
+stress
+stress
+
+query T nosort
+select max(aa) over (order by bb, aa nulls first rows between 5 preceding and 2 following) from stressme order by 1
+----
+please
+stress
+stress
+stress
+stress
+stress
+stress
+stress
+stress
+
+query T nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from stressme order by 1 nulls first
+----
+NULL
+NULL
+another
+check
+me
+ok
+one
+please
+stress
+
+query T nosort
+select max(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 2 following) from stressme order by 1 nulls first
+----
+NULL
+ok
+ok
+please
+please
+please
+stress
+stress
+stress
+
+query I nosort
+select count(aa) over (order by bb, aa nulls first rows between 5 preceding and 0 following) from stressme order by 1
+----
+1
+2
+3
+3
+4
+4
+5
+5
+5
+
+query I nosort
+select count(aa) over (order by bb, aa nulls first rows between 5 preceding and 2 following) from stressme order by 1
+----
+3
+3
+4
+4
+5
+5
+6
+6
+7
+
+query I nosort
+select count(aa) over (partition by bb order by bb, aa nulls first rows between 5 preceding and 0 following) from stressme order by bb, 1
+----
+1
+2
+3
+0
+1
+1
+2
+3
+0
+
+query I nosort
+select count(aa) over (partition by bb order by bb rows between 5 preceding and 2 following) from stressme order by bb
+----
+3
+3
+3
+1
+1
+3
+3
+3
+0
+
+query I nosort
+select count(aa) over (rows between unbounded preceding and unbounded following) from stressme
+----
+7
+7
+7
+7
+7
+7
+7
+7
+7
+
+query I nosort
+select count(aa) over (partition by bb order by bb rows between unbounded preceding and unbounded following) from stressme order by bb
+----
+3
+3
+3
+1
+1
+3
+3
+3
+0
+
+statement ok
+create table debugme (aa real, bb int)
+
+statement ok
+insert into debugme values (15, 3), (3, 1), (2, 1), (5, 3), (NULL, 2), (3, 2), (4, 1), (6, 3), (8, 2), (NULL, 4)
+
+query R nosort
+select sum(aa) over (order by aa nulls first rows between 2 preceding and 0 following) from debugme order by 1 nulls first
+----
+NULL
+NULL
+2.000
+5.000
+8.000
+10.000
+12.000
+15.000
+19.000
+29.000
+
+query R nosort
+select sum(aa) over (order by aa nulls first rows between 2 preceding and 2 following) from debugme order by 1
+----
+2.000
+5.000
+8.000
+12.000
+17.000
+21.000
+26.000
+29.000
+34.000
+38.000
+
+query R nosort
+select sum(aa) over (partition by bb order by bb, aa nulls first rows between 2 preceding and 0 following) from debugme order by bb, 1 nulls first
+----
+2.000
+5.000
+9.000
+NULL
+3.000
+11.000
+5.000
+11.000
+26.000
+NULL
+
+query R nosort
+select sum(aa) over (partition by bb order by bb rows between 2 preceding and 2 following) from debugme order by 1 nulls first
+----
+NULL
+9.000
+9.000
+9.000
+11.000
+11.000
+11.000
+26.000
+26.000
+26.000
+
+query R nosort
+select prod(aa) over (order by aa nulls first rows between 2 preceding and 0 following) from debugme order by 1 nulls first
+----
+NULL
+NULL
+2.000
+6.000
+18.000
+36.000
+60.000
+120.000
+240.000
+720.000
+
+query R nosort
+select prod(aa) over (order by aa nulls first rows between 2 preceding and 2 following) from debugme order by aa, 1 nulls first
+----
+2.000
+6.000
+18.000
+72.000
+360.000
+1080.000
+2880.000
+14400.000
+3600.000
+720.000
+
+query R nosort
+select prod(aa) over (partition by bb order by bb, aa nulls first rows between 2 preceding and 0 following) from debugme order by bb, 1 nulls first
+----
+2.000
+6.000
+24.000
+NULL
+3.000
+24.000
+5.000
+30.000
+450.000
+NULL
+
+query R nosort
+select prod(aa) over (partition by bb order by bb, aa rows between 2 preceding and 2 following) from debugme order by bb, 1
+----
+24.000
+24.000
+24.000
+24.000
+24.000
+24.000
+450.000
+450.000
+450.000
+NULL
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows between 2 preceding and 0 following) from debugme order by 1 nulls first
+----
+NULL
+NULL
+2.000
+2.500
+2.667
+3.333
+4.000
+5.000
+6.333
+9.667
+
+query R nosort
+select avg(aa) over (order by aa nulls first rows between 2 preceding and 2 following) from debugme order by 1
+----
+2.000
+2.500
+2.667
+3.000
+3.400
+4.200
+5.200
+7.600
+8.500
+9.667
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa nulls first rows between 2 preceding and 0 following) from debugme order by bb, 1 nulls first
+----
+2.000
+2.500
+3.000
+NULL
+3.000
+5.500
+5.000
+5.500
+8.667
+NULL
+
+query R nosort
+select avg(aa) over (partition by bb order by bb, aa rows between 2 preceding and 2 following) from debugme order by 1 nulls first
+----
+NULL
+3.000
+3.000
+3.000
+5.500
+5.500
+5.500
+8.667
+8.667
+8.667
+
+statement ok
+create table overflowme (a int)
+
+statement ok
+insert into overflowme values (2147483644), (2147483645), (2147483646)
+
+query R nosort
+select floor(avg(a) over (order by a rows between 2 preceding and 0 following)) from overflowme order by 1
+----
+2147483644.000
+2147483644.000
+2147483645.000
+
+query R nosort
+select floor(avg(a) over (rows between 2 preceding and 2 following)) from overflowme
+----
+2147483645.000
+2147483645.000
+2147483645.000
+
+statement ok
+rollback
+
+statement error
+select rank() over (rows unbounded preceding) from analytics
+
+statement error
+select dense_rank() over (rows 200 preceding) from analytics
+
+statement error
+select ntile(1) over (rows 200 preceding) from analytics
+
+statement error
+select lead(aa) over (partition by bb order by bb rows between 2 preceding and 0 following) from analytics
+
+statement error
+select sum(1) over (order by x range between 2 preceding and 3 following) from (values ('a'), ('x')) x(x)
+
+statement error
+select last_value() over () from analytics
+
+statement error
+prepare select count(*) over (partition by ?) from analytics
+
+statement ok
+drop table analytics
+
+query T nosort
+select min(a) over () from (values (uuid 'AEE1A538-ACA1-381B-D9F4-8C29EF3F5F34'), (uuid 'AEE1A538-ACA1-381B-D9F4-8C29EF3F5F35')) as a(a)
+----
+aee1a538-aca1-381b-d9f4-8c29ef3f5f34
+aee1a538-aca1-381b-d9f4-8c29ef3f5f34
+
+query T nosort
+select min(a) over (order by a range between current row and unbounded following) from (values (uuid 'AEE1A538-ACA1-381B-D9F4-8C29EF3F5F34'), (uuid 'AEE1A538-ACA1-381B-D9F4-8C29EF3F5F35')) as a(a) order by 1
+----
+aee1a538-aca1-381b-d9f4-8c29ef3f5f34
+aee1a538-aca1-381b-d9f4-8c29ef3f5f35
+

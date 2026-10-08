@@ -1,0 +1,9 @@
+statement ok
+start transaction
+
+statement error
+SELECT generate_series(1,4)
+
+statement ok
+rollback
+

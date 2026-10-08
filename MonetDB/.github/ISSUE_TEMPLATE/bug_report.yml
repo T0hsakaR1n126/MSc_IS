@@ -1,0 +1,91 @@
+name: Bug report
+description: Template for bug report
+labels: ["needs triage"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Describe the bug
+      description: |
+        Clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: |
+        Create a setting with minimal input for an external user to demonstrate the buggy behavior.
+        This includes the relevant part of the database schema description.
+        Performance trace of the rogue query (using the TRACE command).
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: |
+        Clear and concise description of what you expected to happen.
+    validations:
+      required: false
+  - type: input
+    id: mdbversion
+    attributes:
+      label: MonetDB release
+      placeholder: e.g., Dec2023_SP1, 11.49.1
+    validations:
+      required: true
+  - type: dropdown
+    id: binsource
+    attributes:
+      label: Executables source
+      options:
+        - "Release packages"
+        - "Self compiled and installed"
+    validations:
+      required: true
+  - type: input
+    id: osversion
+    attributes:
+      label: Operating System
+      placeholder: e.g., Fedora Linux 39 (Workstation Edition)
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: |
+        Add any other context or screenshots about the problem here.
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: "Identity Disclosure:"
+  - type: input
+    attributes:
+      label: "Full Name:"
+      placeholder: e.g., Jane Doe
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: "Affiliation:"
+      placeholder: e.g., FooBar Corp
+    validations:
+      required: true
+  - type: checkboxes
+    attributes:
+      label: Please indicate if any LLM tools were used in preparing this report.
+      options:
+        - label: LLM generated
+        - label: LLM assisted
+        - label: None
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        If we find the above answers questionable and it is not obvious from your GitHub profile page,
+        we reserve the right to close your issue without further review. Please refer to the
+        [reasoning behind this rule](https://berthub.eu/articles/posts/anonymous-help/) if you have questions.

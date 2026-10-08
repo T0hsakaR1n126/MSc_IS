@@ -1,0 +1,76 @@
+statement ok
+START TRANSACTION
+
+statement ok
+CREATE TABLE dbg (a INT, b INT)
+
+statement ok
+INSERT INTO dbg (a,b) VALUES (10,10)
+
+skipif knownfail
+query T nosort
+EXPLAIN SHOW DETAILS
+SELECT a as d, MIN(b), (2 * (MIN(b) / (SELECT 2))) as f FROM dbg GROUP BY d
+----
+project (
+| project (
+| | group by (
+| | | table("sys"."dbg") [ "dbg"."a" NOT NULL UNIQUE, "dbg"."b" NOT NULL UNIQUE ]
+| | ) [ "dbg"."a" NOT NULL UNIQUE as "d" ] [ "d" NOT NULL UNIQUE, "sys"."min" no nil ("dbg"."b" NOT NULL UNIQUE) NOT NULL as "%1"."%1" ]
+| ) [ "d" NOT NULL UNIQUE, "%1"."%1" NOT NULL, tinyint(2) "2" as "%3"."%3" ]
+) [ "d" NOT NULL UNIQUE, "%1"."%1" NOT NULL, "sys"."sql_mul"(tinyint(2) "2", "sys"."sql_div"("%1"."%1" NOT NULL, "%3"."%3" NOT NULL) NOT NULL) NOT NULL as "f" ]
+
+statement ok
+set optimizer = 'sequential_pipe'
+
+statement ok
+set optimizer = 'default_pipe'
+
+query III rowsort
+SELECT a as d, MIN(b), (2 * (MIN(b) / (SELECT 2))) as f FROM dbg GROUP BY d
+----
+10
+10
+10
+
+statement ok
+ROLLBACK
+
+statement ok
+START TRANSACTION
+
+statement ok
+CREATE TABLE dbg (a INT, b INT)
+
+statement ok
+INSERT INTO dbg (a,b) VALUES (10,10)
+
+skipif knownfail
+query T nosort
+EXPLAIN SHOW DETAILS
+SELECT a as d, MIN(b) as e, (2 * (MIN(b) / (SELECT 2))) as f FROM dbg GROUP BY d
+----
+project (
+| project (
+| | group by (
+| | | table("sys"."dbg") [ "dbg"."a" NOT NULL UNIQUE, "dbg"."b" NOT NULL UNIQUE ]
+| | ) [ "dbg"."a" NOT NULL UNIQUE as "d" ] [ "d" NOT NULL UNIQUE, "sys"."min" no nil ("dbg"."b" NOT NULL UNIQUE) NOT NULL as "%1"."%1" ]
+| ) [ "d" NOT NULL UNIQUE, "%1"."%1" NOT NULL, tinyint(2) "2" as "%3"."%3" ]
+) [ "d" NOT NULL UNIQUE, "%1"."%1" NOT NULL as "e", "sys"."sql_mul"(tinyint(2) "2", "sys"."sql_div"("%1"."%1" NOT NULL, "%3"."%3" NOT NULL) NOT NULL) NOT NULL as "f" ]
+
+statement ok
+set optimizer = 'sequential_pipe'
+
+statement ok
+set optimizer = 'default_pipe'
+
+query III rowsort
+SELECT a as d, MIN(b) as e, (2 * (MIN(b) / (SELECT 2))) as f FROM dbg GROUP BY d
+----
+10
+10
+10
+
+statement ok
+ROLLBACK
+

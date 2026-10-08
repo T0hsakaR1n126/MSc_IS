@@ -1,0 +1,333 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#include "monetdb_config.h"
+
+#include "sql_partition.h"
+#include "rel_rel.h"
+#include "rel_basetable.h"
+#include "rel_exp.h"
+#include "sql_mvc.h"
+#include "sql_catalog.h"
+#include "sql_relation.h"
+#include "rel_updates.h"
+#include "mal_exception.h"
+
+list *
+partition_find_mergetables(mvc *sql, sql_table *t)
+{
+	sql_trans *tr = sql->session->tr;
+	list *res = NULL;
+	sql_part *pt = NULL;
+
+	for (; t; t = pt?pt->t:NULL) {
+		if ((pt=partition_find_part(tr, t, NULL))) {
+			if (!res)
+				res = sa_list(sql->sa);
+			list_append(res, pt);
+		}
+	}
+	return res;
+}
+
+static int
+key_column_colnr(sql_kc *pkey)
+{
+	return pkey->c->colnr;
+}
+
+static int
+table_column_colnr(int *colnr)
+{
+	return *colnr;
+}
+
+str
+sql_partition_validate_key(mvc *sql, sql_table *nt, sql_key *k, const char* op)
+{
+	if (k->type != fkey && k->type != ckey) {
+		const char *keys = (k->type == pkey) ? "primary" : k->type == unndkey ? "nndunique" :  "unique";
+		assert(k->type == pkey || k->type == ukey || k->type == unndkey);
+
+		if (isPartitionedByColumnTable(nt)) {
+			assert(nt->part.pcol);
+			if (list_length(k->columns) != 1) {
+				throw(SQL, "sql.partition", SQLSTATE(42000) "%s TABLE: %s.%s: in a partitioned table, the %s key's "
+					  "columns must match the columns used in the partition definition", op, nt->s->base.name,
+					  nt->base.name, keys);
+			} else {
+				sql_kc *kcol = k->columns->h->data;
+				if (kcol->c->colnr != nt->part.pcol->colnr)
+					throw(SQL, "sql.partition", SQLSTATE(42000) "%s TABLE: %s.%s: in a partitioned table, the %s key's "
+						  "columns must match the columns used in the partition definition", op, nt->s->base.name,
+						  nt->base.name, keys);
+			}
+		} else if (isPartitionedByExpressionTable(nt)) {
+			list *kcols, *pcols;
+			allocator *p1, *p2;
+
+			assert(nt->part.pexp->cols);
+			if (list_length(k->columns) != list_length(nt->part.pexp->cols))
+				throw(SQL, "sql.partition", SQLSTATE(42000) "%s TABLE: %s.%s: in a partitioned table, the %s key's "
+					  "columns must match the columns used in the partition definition", op, nt->s->base.name,
+					  nt->base.name, keys);
+
+			p1 = k->columns->sa; /* save the original sql allocators */
+			p2 = nt->part.pexp->cols->sa;
+			k->columns->sa = sql->sa;
+			nt->part.pexp->cols->sa = sql->sa;
+			kcols = list_sort(k->columns, (fkeyvalue)&key_column_colnr, NULL);
+			pcols = list_sort(nt->part.pexp->cols, (fkeyvalue)&table_column_colnr, NULL);
+			k->columns->sa = p1;
+			nt->part.pexp->cols->sa = p2;
+
+			for (node *nn = kcols->h, *mm = pcols->h; nn && mm; nn = nn->next, mm = mm->next) {
+				sql_kc *kcol = nn->data;
+				int *colnr = mm->data;
+				if (kcol->c->colnr != *colnr)
+					throw(SQL, "sql.partition", SQLSTATE(42000) "%s TABLE: %s.%s: in a partitioned table, the %s key's "
+						  "columns must match the columns used in the partition definition", op, nt->s->base.name,
+						  nt->base.name, keys);
+			}
+		}
+	}
+	return NULL;
+}
+
+static void exp_find_table_columns(mvc *sql, sql_exp *e, sql_table *t, list *cols);
+
+static void
+rel_find_table_columns(mvc* sql, sql_rel* rel, sql_table *t, list *cols)
+{
+	if (mvc_highwater(sql)) {
+		(void) sql_error(sql, 10, SQLSTATE(42000) "Query too complex: running out of stack space");
+		return;
+	}
+
+	if (!rel)
+		return;
+
+	if (rel->exps)
+		for (node *n = rel->exps->h ; n ; n = n->next)
+			exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+
+	switch (rel->op) {
+		case op_basetable:
+		case op_truncate:
+			break;
+		case op_table:
+			if (IS_TABLE_PROD_FUNC(rel->flag) || rel->flag == TABLE_FROM_RELATION) {
+				if (rel->l)
+					rel_find_table_columns(sql, rel->l, t, cols);
+			}
+			break;
+		case op_join:
+		case op_left:
+		case op_right:
+		case op_full:
+		case op_inter:
+		case op_except:
+			if (rel->l)
+				rel_find_table_columns(sql, rel->l, t, cols);
+			if (rel->r)
+				rel_find_table_columns(sql, rel->r, t, cols);
+			break;
+		case op_munion:
+			for (node *n = ((list*)rel->l)->h; n; n = n->next)
+				rel_find_table_columns(sql, n->data, t, cols);
+			break;
+		case op_semi:
+		case op_anti:
+		case op_groupby:
+		case op_project:
+		case op_select:
+		case op_topn:
+		case op_sample:
+			if (rel->l)
+				rel_find_table_columns(sql, rel->l, t, cols);
+			break;
+		case op_insert:
+		case op_update:
+		case op_delete:
+			if (rel->r)
+				rel_find_table_columns(sql, rel->r, t, cols);
+			break;
+		case op_ddl:
+			if (rel->flag == ddl_output || rel->flag == ddl_create_seq || rel->flag == ddl_alter_seq || rel->flag == ddl_alter_table || rel->flag == ddl_create_table || rel->flag == ddl_create_view) {
+				if (rel->l)
+					rel_find_table_columns(sql, rel->l, t, cols);
+			} else if (rel->flag == ddl_list || rel->flag == ddl_exception) {
+				if (rel->l)
+					rel_find_table_columns(sql, rel->l, t, cols);
+				if (rel->r)
+					rel_find_table_columns(sql, rel->r, t, cols);
+			}
+			break;
+		case op_buildhash:
+		case op_probehash:
+		case op_partition:
+			(void) sql_error(sql, 10, SQLSTATE(42000) "physical operator unexpected");
+			break;
+	}
+}
+
+static void
+exp_find_table_columns(mvc *sql, sql_exp *e, sql_table *t, list *cols)
+{
+	if (mvc_highwater(sql)) {
+		(void) sql_error(sql, 10, SQLSTATE(42000) "Query too complex: running out of stack space");
+		return;
+	}
+
+	if (!e)
+		return;
+	switch (e->type) {
+		case e_psm: {
+			if (e->flag & PSM_RETURN) {
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			} else if (e->flag & PSM_WHILE) {
+				exp_find_table_columns(sql, e->l, t, cols);
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			} else if (e->flag & PSM_IF) {
+				exp_find_table_columns(sql, e->l, t, cols);
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+				if (e->f)
+					for (node *n = ((list*)e->f)->h ; n ; n = n->next)
+						exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			} else if (e->flag & PSM_REL) {
+				rel_find_table_columns(sql, e->l, t, cols);
+			} else if (e->flag & PSM_EXCEPTION) {
+				exp_find_table_columns(sql, e->l, t, cols);
+			}
+		} break;
+		case e_convert: {
+			exp_find_table_columns(sql, e->l, t, cols);
+		} break;
+		case e_atom: {
+			if (e->f)
+				for (node *n = ((list*)e->f)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+		} break;
+		case e_aggr:
+		case e_func: {
+			if (e->l)
+				for (node *n = ((list*)e->l)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			if (e->type == e_func && e->r)
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+		} break;
+		case e_column: {
+			if (!strcmp(e->l, t->base.name)) {
+				sql_column *col = find_sql_column(t, e->r);
+				if (col) {
+					int *cnr = SA_NEW(cols->sa, int);
+					*cnr = col->colnr;
+					list_append(cols, cnr);
+				}
+			}
+		} break;
+		case e_cmp: {
+			if (e->flag == cmp_in || e->flag == cmp_notin) {
+				exp_find_table_columns(sql, e->l, t, cols);
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			} else if (e->flag == cmp_filter) {
+				for (node *n = ((list*)e->l)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+				for (node *n = ((list*)e->r)->h ; n ; n = n->next)
+					exp_find_table_columns(sql, (sql_exp*) n->data, t, cols);
+			} else {
+				if (e->l)
+					exp_find_table_columns(sql, e->l, t, cols);
+				if (e->r)
+					exp_find_table_columns(sql, e->r, t, cols);
+				if (e->f)
+					exp_find_table_columns(sql, e->f, t, cols);
+			}
+		} break;
+	}
+}
+
+str
+bootstrap_partition_expression(mvc *sql, sql_table *mt, int instantiate)
+{
+	sql_exp *exp;
+	char *query, *msg = NULL;
+	sql_class sql_ec;
+	sql_rel *r;
+
+	assert(isPartitionedByExpressionTable(mt));
+
+	if (sql->emode == m_prepare)
+		throw(SQL,"sql.partition", SQLSTATE(42000) "Partition expressions not compilable with prepared statements");
+
+	r = rel_basetable(sql, mt, mt->base.name);
+	query = mt->part.pexp->exp;
+	if (!(exp = rel_parse_val(sql, mt->s, query, NULL, sql->emode, r))) {
+		if (*sql->errstr) {
+			if (strlen(sql->errstr) > 6 && sql->errstr[5] == '!')
+				throw(SQL, "sql.partition", "%s", sql->errstr);
+			else
+				throw(SQL, "sql.partition", SQLSTATE(42000) "%s", sql->errstr);
+		}
+		throw(SQL,"sql.partition", SQLSTATE(42000) "Incorrect expression '%s'", query);
+	}
+
+	assert(mt->part.pexp->cols);
+	exp_find_table_columns(sql, exp, mt, mt->part.pexp->cols);
+
+	mt->part.pexp->type = *exp_subtype(exp);
+	sql_ec = mt->part.pexp->type.type->eclass;
+	if (!(sql_ec == EC_BIT || EC_VARCHAR(sql_ec) || EC_TEMP(sql_ec) || sql_ec == EC_POS || sql_ec == EC_NUM ||
+		 EC_INTERVAL(sql_ec)|| sql_ec == EC_DEC || sql_ec == EC_BLOB)) {
+		allocator *ta = MT_thread_getallocator();
+		allocator_state ta_state = ma_open(ta);
+		char *err = sql_subtype_string(ta, &(mt->part.pexp->type));
+		if (!err) {
+			ma_close(&ta_state);
+			throw(SQL, "sql.partition", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+		} else {
+			msg = createException(SQL, "sql.partition",
+								  SQLSTATE(42000) "Column type %s not supported for the expression return value", err);
+		}
+		ma_close(&ta_state);
+	}
+
+	if (instantiate && !msg) {
+		r = rel_project(sql->sa, r, NULL);
+		sql_rel *base = r->l, *nr = r;
+		r->l = NULL; /* omit table from list of dependencies */
+		(void) rel_project_add_exp(sql, r, exp);
+
+		nr = sql_processrelation(sql, nr, 0, instantiate, 0, 0);
+		if (nr) {
+			list *blist = rel_dependencies(sql, nr);
+			if (mvc_create_dependencies(sql, blist, mt->base.id, FUNC_DEPENDENCY, SQL_PERSIST))
+				msg = createException(SQL, "sql.partition", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+		}
+		r->l = base;
+	}
+
+	return msg;
+}
+
+str
+parse_sql_parts(mvc *sql, sql_table *mt)
+{
+	str res = NULL;
+
+	if (isPartitionedByExpressionTable(mt) && (res = bootstrap_partition_expression(sql, mt, 0)) != NULL)
+		return res;
+	return res;
+}

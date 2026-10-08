@@ -1,0 +1,90 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+/*
+ * Martin Kersten
+ * Performance profiler
+ * A key issue in developing fast programs using the Monet database
+ * back-end requires a keen eye on where performance is lost.
+ * Although performance tracking and measurements are highly
+ * application dependent, a simple to use tool makes life
+ * a lot easier.
+ *
+ * Activation of the performance monitor has a global effect,
+ * i.e. all concurrent actions on the kernel are traced,
+ * but the events are only sent to the client initiated
+ * the profiler thread.
+ *
+ * The profiler event can be handled in several ways.
+ * The default strategy is to ship the event record immediately over a stream
+ * to a performance monitor.
+ * An alternative strategy is preparation of off-line performance analysis.
+ *
+ * To reduce the  interference of performance measurement with
+ * the experiments, the user can use an event cache, which is
+ * emptied explicitly upon need.
+ */
+/*
+ * Using the Monet Performance Profiler is constrained by the mal_profiler.
+ */
+#include "monetdb_config.h"
+#include "gdk.h"
+#include <time.h>
+#include "mal_stack.h"
+#include "mal_resolve.h"
+#include "mal_exception.h"
+#include "mal_client.h"
+#include "mal_profiler.h"
+#include "mal_interpreter.h"
+#include "mal_runtime.h"
+
+/*
+ * Tracing an active system.
+ */
+
+static str
+CMDcpustats(Client ctx, lng *user, lng *nice, lng *sys, lng *idle, lng *iowait)
+{
+	(void) ctx;
+	profilerGetCPUStat(user, nice, sys, idle, iowait);
+	return MAL_SUCCEED;
+}
+
+static str
+CMDcpuloadPercentage(Client ctx, int *cycles, int *io, const lng *user, const lng *nice,
+					 const lng *sys, const lng *idle, const lng *iowait)
+{
+	(void) ctx;
+	lng userN, niceN, sysN, idleN, iowaitN, N;
+	*cycles = 0;
+	*io = 0;
+	profilerGetCPUStat(&userN, &niceN, &sysN, &idleN, &iowaitN);
+	N = (userN - *user + niceN - *nice + sysN - *sys);
+	if (N) {
+		*cycles = (int) (((double) N) / (N + idleN - *idle + iowaitN - *iowait) * 100);
+		*io = (int) (((double) iowaitN - *iowait) / (N + idleN - *idle +
+													 iowaitN - *iowait) * 100);
+	}
+	return MAL_SUCCEED;
+}
+
+#include "mel.h"
+static mel_func profiler_init_funcs[] = {
+ command("profiler", "cpustats", CMDcpustats, false, "Extract cpu statistics from the kernel", args(5,5, arg("user",lng),arg("nice",lng),arg("sys",lng),arg("idle",lng),arg("iowait",lng))),
+ command("profiler", "cpuload", CMDcpuloadPercentage, false, "Calculate the average cpu load percentage and io waiting times", args(2,7, arg("cycles",int),arg("io",int),arg("user",lng),arg("nice",lng),arg("sys",lng),arg("idle",lng),arg("iowait",lng))),
+ { .imp=NULL }
+};
+#include "mal_import.h"
+#ifdef _MSC_VER
+#undef read
+#pragma section(".CRT$XCU",read)
+#endif
+LIB_STARTUP_FUNC(init_profiler_mal)
+{ mal_module("profiler", NULL, profiler_init_funcs); }

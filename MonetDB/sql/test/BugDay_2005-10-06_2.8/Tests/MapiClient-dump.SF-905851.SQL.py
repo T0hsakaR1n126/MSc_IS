@@ -1,0 +1,45 @@
+import os, sys, difflib
+try:
+    from MonetDBtesting import process
+except ImportError:
+    import process
+
+def client(cmd, infile = None):
+    if infile is not None:
+        f = open(infile)
+    else:
+        f = None
+    with process.client(cmd, stdin = f,
+                        stdout = process.PIPE, stderr = process.PIPE) as clt:
+        if f is not None:
+            f.close()
+        out, err = clt.communicate()
+        sys.stderr.write(err)
+        return out
+
+def main():
+    client('sql',
+           os.path.join(os.getenv('TSTSRCDIR'),
+                        'JdbcClient_create_tables.sql'))
+    client('sql',
+           os.path.join(os.getenv('TSTSRCDIR'),
+                        'JdbcClient_inserts_selects.sql'))
+    out = client('sqldump')
+    output = out.splitlines(keepends=True)
+    with open('MapiClient-dump.SF-905851.stable.out') as fil:
+        stable = fil.readlines()
+    for line in difflib.unified_diff(stable, output,
+                                     fromfile='expected', tofile='received'):
+        sys.stderr.write(line)
+    approve = os.getenv('MTEST_APPROVE')
+    if approve:
+        if approve == 'REPLACE':
+            fn = os.path.join(os.getenv('TSTSRCDIR'),
+                              'MapiClient-dump.SF-905851.stable.out')
+        else:
+            fn = os.path.join(os.getenv('TSTTRGDIR'),
+                              'MapiClient-dump.SF-905851.stable.out.new')
+        with open(fn, 'w') as f:
+            f.write(out)
+
+main()

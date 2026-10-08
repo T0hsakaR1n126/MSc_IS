@@ -1,0 +1,30 @@
+START TRANSACTION;
+SET SCHEMA "sys";
+CREATE TABLE "sys"."table_a" (
+	"table_a_id" INTEGER       NOT NULL,
+	"value_a"    INTEGER       NOT NULL,
+	CONSTRAINT "pk_table_a_id" PRIMARY KEY ("table_a_id")
+);
+CREATE TABLE "sys"."table_b" (
+	"table_b_id" INTEGER       NOT NULL,
+	"table_a_id" INTEGER       NOT NULL,
+	CONSTRAINT "pk_table_b_id" PRIMARY KEY ("table_b_id")
+);
+CREATE TABLE "sys"."table_d" (
+	"table_d_id" INTEGER       NOT NULL,
+	"table_a_id" INTEGER       NOT NULL,
+	CONSTRAINT "pk_table_d_id" PRIMARY KEY ("table_d_id")
+);
+CREATE TABLE "sys"."table_c" (
+	"table_c_id" INTEGER       NOT NULL,
+	"table_a_id" INTEGER       NOT NULL,
+	"table_b_id" INTEGER       NOT NULL,
+	"table_d_id" INTEGER       NOT NULL,
+	"value_c"    INTEGER       NOT NULL,
+	CONSTRAINT "pk_table_c_id" PRIMARY KEY ("table_c_id")
+);
+ALTER TABLE "sys"."table_b" ADD CONSTRAINT "fk_table_a_id" FOREIGN KEY ("table_a_id") REFERENCES "sys"."table_a" ("table_a_id");
+ALTER TABLE "sys"."table_c" ADD CONSTRAINT "fk_table_c_table_a_id" FOREIGN KEY ("table_a_id") REFERENCES "sys"."table_a" ("table_a_id");
+ALTER TABLE "sys"."table_c" ADD CONSTRAINT "fk_table_c_table_d_id" FOREIGN KEY ("table_d_id") REFERENCES "sys"."table_b" ("table_b_id");
+ALTER TABLE "sys"."table_d" ADD CONSTRAINT "fk_table_d_table_a_id" FOREIGN KEY ("table_a_id") REFERENCES "sys"."table_a" ("table_a_id");
+COMMIT;

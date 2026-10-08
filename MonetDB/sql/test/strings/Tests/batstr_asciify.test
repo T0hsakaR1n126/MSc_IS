@@ -1,0 +1,38 @@
+statement ok
+CREATE TABLE foo(x string)
+
+statement ok
+INSERT INTO foo VALUES ('johndoe'),('janedoe'),('robertdoe')
+
+query T nosort
+SELECT asciify(x) FROM foo
+----
+johndoe
+janedoe
+robertdoe
+
+statement ok
+TRUNCATE TABLE foo
+
+statement ok
+INSERT INTO foo VALUES ('Olá Mundo!'),('João'),('Parabéns Ri!'),('Müller')
+
+query T nosort
+SELECT asciify(x) FROM foo
+----
+Ola Mundo!
+Joao
+Parabens Ri!
+Muller
+
+statement ok
+DROP TABLE foo
+
+query TT nosort
+SELECT name, asciify(name) FROM columns WHERE name <> asciify(name)
+----
+
+query TT nosort
+SELECT name, asciify(name) FROM args WHERE name <> asciify(name)
+----
+

@@ -1,0 +1,15 @@
+START TRANSACTION;
+SET SCHEMA "sys";
+CREATE TABLE "sys"."myt" (
+	"c0" BINARY LARGE OBJECT,
+	"c1" INTEGER
+);
+COPY 7 RECORDS INTO "sys"."myt" FROM stdin USING DELIMITERS E'\t',E'\n','"';
+""	1
+""	1
+"AB"	1
+"A1EFD3"	1
+NULL	NULL
+NULL	1
+""	NULL
+COMMIT;

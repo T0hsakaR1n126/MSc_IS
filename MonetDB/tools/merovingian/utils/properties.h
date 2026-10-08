@@ -1,0 +1,26 @@
+/*
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0.  If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * For copyright information, see the file debian/copyright.
+ */
+
+#ifndef _SEEN_PROPERTIES_H
+#define _SEEN_PROPERTIES_H 1
+
+#include "utils.h"
+
+#define MEROPROPFILE ".merovingian_properties"
+
+confkeyval *getDefaultProps(void);
+int writeProps(const confkeyval *ckv, const char *path);
+char *writePropsBuf(const confkeyval *ckv);
+int readProps(confkeyval *ckv, const char *path);
+int readAllProps(confkeyval *ckv, const char *path);
+void readPropsBuf(confkeyval *ckv, char *buf);
+char *setProp(const char *path, const char *key, const char *val);
+
+#endif

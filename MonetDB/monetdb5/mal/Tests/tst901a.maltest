@@ -1,0 +1,14 @@
+statement ok
+function foo();
+b:= generator.series(0:lng, 1000000:lng);
+c:= algebra.copy(b);
+x:= batcalc.+(b,c,nil:bat,nil:bat);
+xc:= aggr.count(b);
+io.printf("#count %d\n", xc);
+end foo;
+
+query T rowsort
+user.foo();
+----
+#count 1000000
+

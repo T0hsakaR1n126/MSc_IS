@@ -1,0 +1,9 @@
+query R nosort
+select power(4.4054292 - 4.40572025343667,2) + power(52.0903881 - 52.091375762174, 2)
+----
+0.000
+
+query R nosort
+select cast(power(4.4054292 - 4.40572025343667,2) as double) + cast(power(52.0903881 - 52.091375762174,2) as double)
+----
+0.000
