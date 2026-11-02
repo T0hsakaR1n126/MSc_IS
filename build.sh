@@ -2,7 +2,7 @@
 set -e
 
 ROOT_DIR=$(pwd)
-SRC_DIR="$ROOT_DIR/MonetDB-11.53.15"
+SRC_DIR="$ROOT_DIR/MonetDB"
 BUILD_DIR="$SRC_DIR/build"
 INSTALL_DIR="$ROOT_DIR/install"
 

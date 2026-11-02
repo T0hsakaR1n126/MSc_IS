@@ -60,33 +60,13 @@ sleep 2
 
 echo "Initializing data..."
 
-"$CMD_MCLIENT" -d "$DB_NAME" -t performance <<EOF
+"$CMD_MCLIENT" -d "$DB_NAME" <<EOF
 DROP TABLE IF EXISTS model;
 DROP TABLE IF EXISTS uw;
 DROP TABLE IF EXISTS mw;
 
 CREATE TABLE uw (U VARCHAR(10), F CLOB);
 CREATE TABLE mw (M VARCHAR(10), G CLOB);
-
-COPY INTO uw FROM '$ROOT_DIR/ml-latest/uw.csv' USING DELIMITERS ',', '\n', '"';
-COPY INTO mw FROM '$ROOT_DIR/ml-latest/mw.csv' USING DELIMITERS ',', '\n', '"';
-
---Baseline
-DROP TABLE IF EXISTS mo; 
-SELECT M FROM uw, mw WHERE U='u2' ORDER BY dot(F,G) DESC LIMIT 10;
-
-CREATE TABLE mo(R CLOB);
-INSERT INTO mo SELECT pcatrain(F, CAST(64 AS INTEGER)) 
-FROM (SELECT F FROM uw ORDER BY rand() LIMIT 900) AS subq;
-
---Filter: Top-50
-DROP TABLE IF EXISTS candidates;
-CREATE TABLE candidates AS SELECT M FROM uw, mw WHERE U='u2' ORDER BY dot(F,G) DESC LIMIT 50;
-
---Refine: Tap-10
-DROP TABLE mo;
-SELECT c.M FROM candidates c, uw, mw WHERE uw.U='u2' AND mw.M = c.M ORDER BY dot(uw.F, mw.G) DESC LIMIT 10;
-
 
 EOF
 
