@@ -1,8 +1,6 @@
-# Project: Integrating Vector Similarity Join Computations into MonetDB
+# Project: CNN in MonetDB
 
 ## Authors
-
-Ziqi Yang
 
 Zheyuan Fu
 
