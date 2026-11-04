@@ -82,7 +82,7 @@ CREATE TABLE cnn.TrainingMetric (
         PRIMARY KEY (ModelId, Version, Epoch, Split),
     CONSTRAINT cnn_training_metric_model_fk
         FOREIGN KEY (ModelId, Version)
-        REFERENCES ml.Model (ModelId, Version)
+        REFERENCES cnn.Model (ModelId, Version)
 );
 
 -- 将 SQL 入口绑定到原生 MAL/C 实现。当前 C 入口仍为骨架，

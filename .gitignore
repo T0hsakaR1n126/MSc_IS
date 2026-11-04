@@ -2,3 +2,7 @@
 build/
 install/
 *.bundle
+
+# MonetDB 本地数据库文件和连接配置
+/monetdb_farm/
+/.monetdb_auth
