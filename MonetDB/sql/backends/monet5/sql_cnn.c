@@ -15,7 +15,7 @@
 #include <math.h>
 #include <string.h>
 
-/* 判断字符串是否为 NULL、空字符串或纯空白。 */
+//判断字符串是否为 NULL、空字符串或纯空白
 static bool
 sql_cnn_blank(const char *value)
 {
@@ -32,12 +32,11 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 	mvc *m = NULL;
 	str msg = MAL_SUCCEED;
 
-	/* 1. 取得当前 SQL 上下文。 */
 	msg = getSQLContext(cntxt, mb, &m, NULL);
 	if (msg != MAL_SUCCEED)
 		return msg;
 
-	/* 2. 从 MAL 指令对应的运行时变量中读取六个业务参数。 */
+	//读取参数
 	const char *model_id = *getArgReference_str(stk, pci, 1);
 	const char *data_query = *getArgReference_str(stk, pci, 2);
 	int epochs = *getArgReference_int(stk, pci, 3);
@@ -45,7 +44,7 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 	const char *optimizer = *getArgReference_str(stk, pci, 5);
 	dbl learning_rate = *getArgReference_dbl(stk, pci, 6);
 
-	/* 3. 检查输入参数。 */
+	//检查输入参数
 	if (sql_cnn_blank(model_id))
 		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "model_id must not be NULL or blank");
 
@@ -69,7 +68,7 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 	 * 加载模型 -> 执行数据查询 -> 构建 batch
 	 * -> 前向 -> 损失 -> 反向 -> 更新参数。
 	 *
-	 * 当前骨架不执行 data_query，也不修改模型。
+	 * ****当前骨架不执行 data_query，也不修改模型！！
 	 */
 	throw(SQL, "sql.cnn_train", SQLSTATE(0A000) "CNN training is not implemented yet");
 }

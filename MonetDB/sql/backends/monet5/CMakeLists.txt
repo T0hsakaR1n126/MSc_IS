@@ -118,6 +118,7 @@ set(include_sql_files
   77_storage
   80_statistics
   81_tracer
+  89_cnn
   91_information_schema)
 
 if(HAVE_HGE)
@@ -157,6 +158,7 @@ target_sources(sql
   sql_statement.c
   sql_pp_statement.c sql_pp_statement.h
   sql_statistics.c sql_statistics.h
+  sql_cnn.c sql_cnn.h
   sql_gencode.c sql_gencode.h
   sql_optimizer.c sql_optimizer.h
   sql_result.c sql_result.h
