@@ -5521,6 +5521,7 @@ SQLstr_stop_vacuum(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 #include "sql_orderidx.h"
 #include "sql_subquery.h"
 #include "sql_statistics.h"
+#include "sql_cnn.h"
 #include "sql_transaction.h"
 #include "for.h"
 #include "dict.h"
@@ -5849,6 +5850,7 @@ static mel_func sql_init_funcs[] = {
  pattern("sql", "dump_cache", dump_cache, false, "dump the content of the query cache", args(2,2, batarg("query",str),batarg("count",int))),
  pattern("sql", "dump_opt_stats", dump_opt_stats, false, "dump the optimizer rewrite statistics", args(2,2, batarg("rewrite",str),batarg("count",int))),
  pattern("sql", "dump_trace", dump_trace, false, "dump the trace statistics", args(3,3, batarg("ticks",lng),batarg("stmt",str),batarg("stmt",str))),
+ pattern("sql", "cnn_train", sql_cnn_train, true, "Train a CNN inside MonetDB (not implemented yet)", args(1,7, arg("",void),arg("model_id",str),arg("data_query",str),arg("epochs",int),arg("batch_size",int),arg("optimizer",str),arg("learning_rate",dbl))),
  pattern("sql", "analyze", sql_analyze, true, "Update statistics for every column in the database", args(1,1, arg("",void))),
  pattern("sql", "analyze", sql_analyze, true, "Update statistics for schema", args(1,2, arg("",void),arg("sch",str))),
  pattern("sql", "analyze", sql_analyze, true, "Update statistics for table", args(1,3, arg("",void),arg("sch",str),arg("tbl",str))),
