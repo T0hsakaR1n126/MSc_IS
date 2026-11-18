@@ -159,6 +159,8 @@ target_sources(sql
   sql_pp_statement.c sql_pp_statement.h
   sql_statistics.c sql_statistics.h
   sql_cnn.c sql_cnn.h
+  sql_cnn_model.c sql_cnn_model.h
+  sql_cnn_storage.c sql_cnn_storage.h
   sql_gencode.c sql_gencode.h
   sql_optimizer.c sql_optimizer.h
   sql_result.c sql_result.h
