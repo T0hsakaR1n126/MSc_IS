@@ -85,7 +85,17 @@ CREATE TABLE cnn.TrainingMetric (
         REFERENCES cnn.Model (ModelId, Version)
 );
 
--- 将 SQL 入口绑定到原生 MAL/C 实现。当前 C 入口仍为骨架，
+-- 创建并保存固定 CNN 的初始化版本；不执行训练。
+-- 同名模型已存在时返回错误，避免重新初始化覆盖已有参数。
+-- init_seed 使用 BIGINT；SEED 是保留词，因此参数使用此名称。
+CREATE PROCEDURE sys.cnn_create(
+    model_id STRING,
+    optimizer STRING,
+    init_seed BIGINT
+)
+EXTERNAL NAME sql.cnn_create;
+
+-- 将 SQL 入口绑定到原生 MAL/C 实现。当前训练 C 入口仍为骨架，
 -- 对合法训练请求返回 SQLSTATE 0A000，表示训练功能尚未实现。
 CREATE PROCEDURE sys.cnn_train(
     model_id STRING,
