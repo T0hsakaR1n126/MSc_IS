@@ -119,13 +119,28 @@ sql_cnn_initial_info(CnnInitialModelInfo *info, const char *model_id, bool use_a
 	};
 }
 
+str
+sql_cnn_create(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	mvc *m = NULL;
+	str msg = getSQLContext(cntxt, mb, &m, NULL);
+	if (msg != MAL_SUCCEED)
+		return msg;
+
+	// SQL 的三个输入对应位置 1、2、3。
+	const char *model_id = *getArgReference_str(stk, pci, 1);
+	const char *optimizer = *getArgReference_str(stk, pci, 2);
+	lng init_seed = *getArgReference_lng(stk, pci, 3);
+
+	return sql_cnn_create_initial(cntxt, m, model_id, optimizer, init_seed);
+}
+
 /*
  * 共用的内部创建逻辑。当前由 cnn_create 调用，未来 cnn_train 可复用。
  * 存储模块处理同名模型、权限和失败事务；外层 SQL 调用负责提交。
  */
 static str
-sql_cnn_create_initial(Client cntxt, mvc *m, const char *model_id,
-		       const char *optimizer, lng init_seed)
+sql_cnn_create_initial(Client cntxt, mvc *m, const char *model_id, const char *optimizer, lng init_seed)
 {
 	if (sql_cnn_blank(model_id))
 		throw(SQL, "sql.cnn_create", SQLSTATE(22023) "model_id must not be NULL or blank");
@@ -150,22 +165,6 @@ sql_cnn_create_initial(Client cntxt, mvc *m, const char *model_id,
 	}
 
 	return cnn_model_save_initial(cntxt, m, &info, &model, adam_state);
-}
-
-str
-sql_cnn_create(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
-{
-	mvc *m = NULL;
-	str msg = getSQLContext(cntxt, mb, &m, NULL);
-	if (msg != MAL_SUCCEED)
-		return msg;
-
-	/* 位置 0 是 void 返回位置；SQL 的三个输入对应位置 1、2、3。 */
-	const char *model_id = *getArgReference_str(stk, pci, 1);
-	const char *optimizer = *getArgReference_str(stk, pci, 2);
-	lng init_seed = *getArgReference_lng(stk, pci, 3);
-
-	return sql_cnn_create_initial(cntxt, m, model_id, optimizer, init_seed);
 }
 
 str
