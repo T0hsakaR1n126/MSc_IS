@@ -29,4 +29,19 @@
  */
 str cnn_batch_load_ids(Client cntxt, mvc *m, const int64_t *image_ids, size_t count, CnnBatch *out);
 
+/*
+ * 保存一张已经解码为 64×64 RGB uint8 三平面的图片。
+ * image 只借用输入数据，调用结束后仍由调用者管理这些通道内存。
+ * split 必须是 train / validation / test；本函数不自动划分数据集，
+ * 不解码 JPEG/PNG、不 resize，也不根据图片内容执行去重。
+ *
+ * 原用户需有两张图片表的 SELECT 和 INSERT 权限，并具有 cnn schema
+ * 的管理权限（当前 MonetDB 的序列取号要求；通常为管理员或 schema
+ * 所有者）。重复 ImageId 返回 23505，不覆盖已有图片。
+ * 三个通道和图片记录沿用同一外层事务；
+ * 失败标记事务失败，成功仍需外层提交，不自行 COMMIT / ROLLBACK。
+ * 通道引用来自持久化 BIGINT 序列；回滚可产生编号空洞，不影响引用。
+ */
+str cnn_image_store_rgb(Client cntxt, mvc *m, const CnnImageView *image, const char *split);
+
 #endif /* SQL_CNN_DATA_H */

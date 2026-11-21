@@ -45,7 +45,7 @@ cnn_data_result(mvc *m, str msg)
 
 /*
  * 内部 SQL 执行器会临时采用管理员身份，因此先检查原调用者权限。
- * 本文件只执行固定的图片表 SELECT，不接受用户提供的 SQL 文本。
+ * 本文件只执行固定的图片表 SQL 模板，不接受用户提供的 SQL 文本。
  */
 static str
 cnn_data_prepare(Client cntxt, mvc *m)
@@ -257,5 +257,186 @@ cleanup:
 	res_tables_destroy(result);
 	GDKfree(views);
 	GDKfree(query);
+	return cnn_data_result(m, msg);
+}
+
+/* 只接收已经解码并整理好的三个 uint8 平面，不负责图片文件解码。 */
+static str
+cnn_data_validate_rgb(const CnnImageView *image, const char *split)
+{
+	if (image == NULL || image->image_id < 0 ||
+	    image->height != CNN_IMAGE_HEIGHT || image->width != CNN_IMAGE_WIDTH ||
+	    image->channels != CNN_IMAGE_CHANNELS ||
+	    (image->label != 0 && image->label != 1))
+		throw(SQL, "cnn.data", SQLSTATE(22023) "Invalid RGB image metadata");
+	if (split == NULL || strNil(split) ||
+	    (strcmp(split, "train") != 0 && strcmp(split, "validation") != 0 &&
+	     strcmp(split, "test") != 0))
+		throw(SQL, "cnn.data", SQLSTATE(22023) "Image split must be 'train', 'validation' or 'test'");
+	for (size_t c = 0; c < CNN_IMAGE_CHANNELS; c++) {
+		if (image->plane[c] == NULL || image->plane_bytes[c] != CNN_PLANE_VALUES)
+			throw(SQL, "cnn.data", SQLSTATE(22023) "Each RGB channel must contain 4096 uint8 bytes");
+	}
+	return MAL_SUCCEED;
+}
+
+/* 写入前在原用户上下文检查两表的 INSERT 权限，避免内部 SQL 提权。 */
+static str
+cnn_data_prepare_write(Client cntxt, mvc *m)
+{
+	str msg = cnn_data_prepare(cntxt, m);
+	if (msg != MAL_SUCCEED)
+		return msg;
+	sql_schema *schema = mvc_bind_schema(m, "cnn");
+	const char *names[] = {"trainingimage", "imagechannel"};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		sql_table *table = schema ? mvc_bind_table(m, schema, names[i]) : NULL;
+		if (table == NULL)
+			throw(SQL, "cnn.data", SQLSTATE(42S02) "Required image table is missing: cnn.%s", names[i]);
+		if (!table_privs(m, table, PRIV_INSERT))
+			throw(SQL, "cnn.data", SQLSTATE(42501) "INSERT privilege required on cnn.%s", names[i]);
+	}
+	/* NEXT VALUE FOR 在本分支要求序列所属 schema 的所有者或管理员权限。 */
+	if (!mvc_schema_privs(m, schema))
+		throw(SQL, "cnn.data", SQLSTATE(42501) "Schema privilege required to use cnn.image_channel_ref_seq");
+	return MAL_SUCCEED;
+}
+
+/* COUNT 和 NEXT VALUE 查询都返回恰好一个非负 BIGINT。 */
+static str
+cnn_data_read_scalar(Client cntxt, const char *query, lng *value)
+{
+	res_table *result = NULL;
+	BAT *column = NULL;
+	str msg = SQLstatementIntern(cntxt, query, "cnn.image_integer", true, false, &result);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	if (result == NULL || result->next != NULL || result->nr_cols != 1 ||
+	    result->cols == NULL) {
+		msg = createException(SQL, "cnn.data", SQLSTATE(22000) "Unexpected image integer query result");
+		goto cleanup;
+	}
+	column = BATdescriptor(result->cols[0].b);
+	if (column == NULL) {
+		msg = createException(SQL, "cnn.data", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+		goto cleanup;
+	}
+	if (column->ttype != TYPE_lng || BATcount(column) != 1) {
+		msg = createException(SQL, "cnn.data", SQLSTATE(22000) "Invalid image integer query column");
+		goto cleanup;
+	}
+	BATiter iterator = bat_iterator(column);
+	lng found = *(const lng *) BUNtloc(&iterator, 0);
+	bat_iterator_end(&iterator);
+	if (is_lng_nil(found) || found < 0)
+		msg = createException(SQL, "cnn.data", SQLSTATE(22000) "Invalid image integer value");
+	else
+		*value = found;
+cleanup:
+	if (column != NULL)
+		BBPunfix(column->batCacheid);
+	res_tables_destroy(result);
+	return msg;
+}
+
+/* 原始字节直接转成 BLOB 字面量；这里不做 float32 编码或除以 255。 */
+static str
+cnn_data_write_channel(Client cntxt, lng reference, const uint8_t *values)
+{
+	static const char digits[] = "0123456789abcdef";
+	static const char suffix[] = "');";
+	const size_t capacity = CNN_PLANE_VALUES * 2 + 192;
+	str query = GDKmalloc(capacity);
+	if (query == NULL)
+		throw(SQL, "cnn.data", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+	int length = snprintf(query, capacity,
+		"INSERT INTO cnn.ImageChannel (ChannelRef, ChannelValue) VALUES (%" PRId64 ", X'",
+		reference);
+	if (length < 0 || (size_t) length > capacity - CNN_PLANE_VALUES * 2 - sizeof(suffix)) {
+		GDKfree(query);
+		throw(SQL, "cnn.data", SQLSTATE(22003) "Cannot format image channel SQL");
+	}
+	size_t offset = (size_t) length;
+	for (size_t k = 0; k < CNN_PLANE_VALUES; k++) {
+		query[offset + 2 * k] = digits[values[k] >> 4];
+		query[offset + 2 * k + 1] = digits[values[k] & 15];
+	}
+	memcpy(query + offset + CNN_PLANE_VALUES * 2, suffix, sizeof(suffix));
+	str msg = SQLstatementIntern(cntxt, query, "cnn.write_channel", true, false, NULL);
+	GDKfree(query);
+	return msg;
+}
+
+/* split 已通过固定白名单，其他值均为校验后的整数。 */
+static str
+cnn_data_write_image(Client cntxt, const CnnImageView *image,
+		     const char *split, const lng *references)
+{
+	char query[512];
+	int length = snprintf(query, sizeof(query),
+		"INSERT INTO cnn.TrainingImage "
+		"(ImageId, Split, Label, Height, Width, Channels, RRef, GRef, BRef) "
+		"VALUES (%" PRId64 ", '%s', %" PRId32 ", 64, 64, 3, %" PRId64 ", %" PRId64 ", %" PRId64 ");",
+		image->image_id, split, image->label, references[0], references[1], references[2]);
+	if (length < 0 || (size_t) length >= sizeof(query))
+		throw(SQL, "cnn.data", SQLSTATE(22003) "Cannot format image metadata SQL");
+	return SQLstatementIntern(cntxt, query, "cnn.write_image", true, false, NULL);
+}
+
+str
+cnn_image_store_rgb(Client cntxt, mvc *m, const CnnImageView *image,
+		    const char *split)
+{
+	str msg = cnn_data_validate_rgb(image, split);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	msg = cnn_data_prepare_write(cntxt, m);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+
+	/* 拒绝同名图片，不能覆盖后再留下原通道或新生成的孤立通道。 */
+	char query[256];
+	int length = snprintf(query, sizeof(query),
+		"SELECT CAST(COUNT(*) AS BIGINT) FROM cnn.TrainingImage WHERE ImageId = %" PRId64 ";",
+		image->image_id);
+	if (length < 0 || (size_t) length >= sizeof(query)) {
+		msg = createException(SQL, "cnn.data", SQLSTATE(22003) "Cannot format image lookup SQL");
+		goto cleanup;
+	}
+	lng existing = 0;
+	msg = cnn_data_read_scalar(cntxt, query, &existing);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	if (existing != 0) {
+		msg = createException(SQL, "cnn.data", SQLSTATE(23505) "ImageId already exists; RGB image is not overwritten");
+		goto cleanup;
+	}
+
+	/* 序列可在回滚后留空洞；引用不能用 MAX(id) 或进程地址推算。 */
+	lng references[CNN_IMAGE_CHANNELS] = {0};
+	for (size_t c = 0; c < CNN_IMAGE_CHANNELS; c++) {
+		msg = cnn_data_read_scalar(cntxt,
+			"SELECT NEXT VALUE FOR cnn.image_channel_ref_seq;", &references[c]);
+		if (msg != MAL_SUCCEED)
+			goto cleanup;
+		if (references[c] <= 0) {
+			msg = createException(SQL, "cnn.data", SQLSTATE(22000) "Image channel sequence must produce positive values");
+			goto cleanup;
+		}
+		for (size_t previous = 0; previous < c; previous++) {
+			if (references[c] == references[previous]) {
+				msg = createException(SQL, "cnn.data", SQLSTATE(22000) "Image channel references must be distinct");
+				goto cleanup;
+			}
+		}
+	}
+	/* 三个通道与图片行共用外层事务；任何失败都让整次写入回滚。 */
+	for (size_t c = 0; c < CNN_IMAGE_CHANNELS; c++) {
+		msg = cnn_data_write_channel(cntxt, references[c], image->plane[c]);
+		if (msg != MAL_SUCCEED)
+			goto cleanup;
+	}
+	msg = cnn_data_write_image(cntxt, image, split, references);
+cleanup:
 	return cnn_data_result(m, msg);
 }
