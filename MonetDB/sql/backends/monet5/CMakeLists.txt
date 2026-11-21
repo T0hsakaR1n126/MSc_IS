@@ -161,6 +161,8 @@ target_sources(sql
   sql_cnn.c sql_cnn.h
   sql_cnn_model.c sql_cnn_model.h
   sql_cnn_storage.c sql_cnn_storage.h
+  sql_cnn_batch.c sql_cnn_batch.h
+  sql_cnn_data.c sql_cnn_data.h
   sql_gencode.c sql_gencode.h
   sql_optimizer.c sql_optimizer.h
   sql_result.c sql_result.h
