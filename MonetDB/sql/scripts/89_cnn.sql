@@ -10,6 +10,42 @@
 -- 只创建空的存储表，不会初始化具体模型记录、参数张量或优化器状态张量。
 CREATE SCHEMA cnn;
 
+-- 每行保存一个 64×64 通道的原始 uint8 字节，引用使用持久化主键。
+-- 显式使用 BIGINT 序列；编号可以有空洞，不依赖内存地址或 BAT 标识。
+CREATE SEQUENCE cnn.image_channel_ref_seq
+    AS BIGINT START WITH 1;
+
+CREATE TABLE cnn.ImageChannel (
+    ChannelRef BIGINT NOT NULL
+        DEFAULT NEXT VALUE FOR cnn.image_channel_ref_seq,
+    ChannelValue BLOB NOT NULL,
+    CONSTRAINT cnn_image_channel_pk PRIMARY KEY (ChannelRef),
+    CONSTRAINT cnn_image_channel_length_ck
+        CHECK (OCTET_LENGTH(ChannelValue) = 4096)
+);
+
+-- 当前原型固定使用 64×64 RGB 图片。三个引用分别指向 R、G、B 通道。
+-- 图片导入需要保证通道语义正确，并在同一事务内保存通道和图片记录。
+CREATE TABLE cnn.TrainingImage (
+    ImageId BIGINT NOT NULL CHECK (ImageId >= 0),
+    Split VARCHAR(16) NOT NULL
+        CHECK (Split IN ('train', 'validation', 'test')),
+    Label INTEGER NOT NULL CHECK (Label IN (0, 1)),
+    Height INTEGER NOT NULL CHECK (Height = 64),
+    Width INTEGER NOT NULL CHECK (Width = 64),
+    Channels INTEGER NOT NULL CHECK (Channels = 3),
+    RRef BIGINT NOT NULL,
+    GRef BIGINT NOT NULL,
+    BRef BIGINT NOT NULL,
+    CONSTRAINT cnn_training_image_pk PRIMARY KEY (ImageId),
+    CONSTRAINT cnn_training_image_r_fk
+        FOREIGN KEY (RRef) REFERENCES cnn.ImageChannel (ChannelRef),
+    CONSTRAINT cnn_training_image_g_fk
+        FOREIGN KEY (GRef) REFERENCES cnn.ImageChannel (ChannelRef),
+    CONSTRAINT cnn_training_image_b_fk
+        FOREIGN KEY (BRef) REFERENCES cnn.ImageChannel (ChannelRef)
+);
+
 -- Version 标识一次保存的模型状态。SEED 是 SQL 保留词，因此该列使用带双引号的小写名称。
 -- TrainingSpec 记录批次配置、优化器及其超参数、初始化与洗牌算法、
 -- 数据集及划分标识，以及复现训练所需的执行设置。
