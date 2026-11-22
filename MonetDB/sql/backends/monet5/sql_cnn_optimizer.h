@@ -30,4 +30,14 @@
  */
 CnnOpsResult cnn_model_sgd_step(CnnModel *model, CnnForwardWorkspace *forward, CnnBackwardWorkspace *backward, double learning_rate);
 
+/*
+ * 以模型配置的默认 beta1=0.9、beta2=0.999、epsilon=1e-8 执行一次 Adam。
+ * adam 必须是同一模型在 model->step 对应的状态。新模型从零矩开始，
+ * 恢复时必须一起加载参数、矩和 step。调用者按训练配置选择优化器。
+ * 前后向缓存要求与 SGD 相同。成功时参数和矩一起更新，step 加一，
+ * 三个 ready 失效。失败时模型、矩及 ready 保持原样。
+ * 更新作用于内存中的模型和状态，由上层负责持久化。
+ */
+CnnOpsResult cnn_model_adam_step(CnnModel *model, CnnAdamState *adam, CnnForwardWorkspace *forward, CnnBackwardWorkspace *backward, double learning_rate);
+
 #endif /* SQL_CNN_OPTIMIZER_H */

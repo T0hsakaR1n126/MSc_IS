@@ -26,4 +26,16 @@
  */
 gdk_export CnnOpsResult cnn_sgd_step(float *parameters, size_t parameter_count, const float *gradients, size_t gradient_count, double learning_rate);
 
+/*
+ * Adam 的参数、梯度、一阶矩 m 和二阶矩 v 都是连续 float32 数组。
+ * 四个数组互不重叠，元素数相等且大于零。调用期间参数和状态由调用者
+ * 独占，梯度保持不变。step 是即将执行的更新编号，第一次为 1。
+ * beta1、beta2 取 [0,1)，学习率和 epsilon 为正有限值。
+ *
+ * 使用 double 计算矩、偏差修正及参数候选值，epsilon 加在平方根外。
+ * v 必须非负。只有全部候选值都在 float32 有限范围内，才写入参数和矩。
+ * 失败时三个数组保持原样。本函数不分配内存，直接使用已平均的梯度。
+ */
+gdk_export CnnOpsResult cnn_adam_step(float *parameters, size_t parameter_count, const float *gradients, size_t gradient_count, float *first_moment, size_t first_count, float *second_moment, size_t second_count, uint64_t step, double learning_rate, double beta1, double beta2, double epsilon);
+
 #endif /* GDK_CNN_OPTIMIZER_H */
