@@ -11,8 +11,10 @@
 set(gdk_public_headers
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/gdk.h>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/gdk_time.h>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/gdk_cnn.h>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/monetdb/gdk.h>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/monetdb/gdk_time.h>)
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/monetdb/gdk_time.h>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/monetdb/gdk_cnn.h>)
 
 if(MONETDB_STATIC)
   add_library(bat STATIC)
@@ -29,6 +31,7 @@ target_sources(bat
   gdk_calc_compare_le.c gdk_calc_compare_ge.c
   gdk_calc_compare_generic.c
   gdk_calc.c
+  gdk_cnn.c
   gdk_ssort.c gdk_ssort_impl.h
   gdk_aggr.c
   gdk_batop.c

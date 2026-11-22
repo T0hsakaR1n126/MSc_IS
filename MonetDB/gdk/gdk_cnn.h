@@ -8,10 +8,10 @@
  * For copyright information, see the file debian/copyright.
  */
 
-#ifndef SQL_CNN_OPS_H
-#define SQL_CNN_OPS_H
+#ifndef GDK_CNN_H
+#define GDK_CNN_H
 
-#include <stddef.h>
+#include "gdk.h"
 
 /* 固定 3×3、stride=1、padding=1，因此输出 H、W 与输入相同。 */
 typedef struct {
@@ -44,6 +44,6 @@ typedef enum {
  * 维度、长度、整数溢出检查全部通过后才读写数组；检查失败时输出不变。
  * 本函数不分配内存、不执行 SQL、不修改输入、参数或模型状态。
  */
-CnnOpsResult cnn_conv2d_forward(const CnnConv2dShape *shape, const float *input, size_t input_count, const float *weight, size_t weight_count, const float *bias, size_t bias_count, float *output, size_t output_count);
+gdk_export CnnOpsResult cnn_conv2d_forward(const CnnConv2dShape *shape, const float *input, size_t input_count, const float *weight, size_t weight_count, const float *bias, size_t bias_count, float *output, size_t output_count);
 
-#endif /* SQL_CNN_OPS_H */
+#endif /* GDK_CNN_H */

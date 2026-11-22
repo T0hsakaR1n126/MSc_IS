@@ -9,7 +9,7 @@
  */
 
 #include "monetdb_config.h"
-#include "sql_cnn_ops.h"
+#include "gdk_cnn.h"
 
 #include <stdbool.h>
 #include <stdint.h>
