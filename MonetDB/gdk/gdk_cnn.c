@@ -25,6 +25,16 @@ cnn_ops_multiply(size_t left, size_t right, size_t *result)
 	return true;
 }
 
+static bool
+cnn_ops_finite(const float *values, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		if (!isfinite(values[i]))
+			return false;
+	}
+	return true;
+}
+
 CnnOpsResult
 cnn_conv2d_forward(const CnnConv2dShape *shape, const float *input, size_t input_count, const float *weight, size_t weight_count, const float *bias, size_t bias_count, float *output, size_t output_count)
 {
@@ -293,5 +303,132 @@ cnn_softmax_cross_entropy(const float *logits, size_t logits_count,
 		}
 	}
 	*mean_loss = total_loss / (double) batch;
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_softmax_cross_entropy_backward(const float *logits, size_t logits_count,
+	const int32_t *labels, size_t label_count, size_t batch, size_t classes,
+	float *d_logits, size_t d_logits_count)
+{
+	if (logits == NULL || labels == NULL || d_logits == NULL || batch == 0 || classes == 0)
+		return CNN_OPS_INVALID_INPUT;
+	size_t expected;
+	if (!cnn_ops_multiply(batch, classes, &expected) ||
+	    expected > SIZE_MAX / sizeof(float) || batch > SIZE_MAX / sizeof(*labels))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (logits_count != expected || label_count != batch || d_logits_count != expected)
+		return CNN_OPS_INVALID_INPUT;
+	for (size_t n = 0; n < batch; n++) {
+		if (labels[n] < 0 || (size_t) labels[n] >= classes)
+			return CNN_OPS_INVALID_INPUT;
+	}
+	if (!cnn_ops_finite(logits, expected))
+		return CNN_OPS_INVALID_INPUT;
+
+	for (size_t n = 0; n < batch; n++) {
+		size_t base = n * classes;
+		size_t target = (size_t) labels[n];
+		double maximum = (double) logits[base];
+		for (size_t c = 1; c < classes; c++) {
+			if ((double) logits[base + c] > maximum)
+				maximum = (double) logits[base + c];
+		}
+		double sum_exp = 0.0, other_exp = 0.0;
+		for (size_t c = 0; c < classes; c++) {
+			double value = exp((double) logits[base + c] - maximum);
+			sum_exp += value;
+			if (c != target)
+				other_exp += value;
+		}
+		for (size_t c = 0; c < classes; c++) {
+			double gradient = c == target ? -other_exp / sum_exp :
+				exp((double) logits[base + c] - maximum) / sum_exp;
+			d_logits[base + c] = (float) (gradient / (double) batch);
+		}
+	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_linear_backward(const CnnLinearShape *shape,
+	const float *input, size_t input_count, const float *weight, size_t weight_count,
+	const float *d_output, size_t d_output_count,
+	float *d_input, size_t d_input_count, float *d_weight, size_t d_weight_count,
+	float *d_bias, size_t d_bias_count)
+{
+	if (shape == NULL || input == NULL || weight == NULL || d_output == NULL ||
+	    d_input == NULL || d_weight == NULL || d_bias == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->in_features == 0 || shape->out_features == 0)
+		return CNN_OPS_INVALID_INPUT;
+	size_t expected_input, expected_output, expected_weight;
+	if (!cnn_ops_multiply(shape->batch, shape->in_features, &expected_input) ||
+	    !cnn_ops_multiply(shape->batch, shape->out_features, &expected_output) ||
+	    !cnn_ops_multiply(shape->out_features, shape->in_features, &expected_weight))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(float) ||
+	    expected_weight > SIZE_MAX / sizeof(float) ||
+	    shape->out_features > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (input_count != expected_input || weight_count != expected_weight ||
+	    d_output_count != expected_output || d_input_count != expected_input ||
+	    d_weight_count != expected_weight || d_bias_count != shape->out_features)
+		return CNN_OPS_INVALID_INPUT;
+	if (!cnn_ops_finite(input, input_count) || !cnn_ops_finite(weight, weight_count) ||
+	    !cnn_ops_finite(d_output, d_output_count))
+		return CNN_OPS_INVALID_INPUT;
+
+	for (size_t n = 0; n < shape->batch; n++) {
+		for (size_t i = 0; i < shape->in_features; i++) {
+			float sum = 0.0f;
+			for (size_t o = 0; o < shape->out_features; o++)
+				sum += d_output[n * shape->out_features + o] *
+				       weight[o * shape->in_features + i];
+			d_input[n * shape->in_features + i] = sum;
+		}
+	}
+	for (size_t o = 0; o < shape->out_features; o++) {
+		float bias_sum = 0.0f;
+		for (size_t n = 0; n < shape->batch; n++)
+			bias_sum += d_output[n * shape->out_features + o];
+		d_bias[o] = bias_sum;
+		for (size_t i = 0; i < shape->in_features; i++) {
+			float sum = 0.0f;
+			for (size_t n = 0; n < shape->batch; n++)
+				sum += d_output[n * shape->out_features + o] *
+				       input[n * shape->in_features + i];
+			d_weight[o * shape->in_features + i] = sum;
+		}
+	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_global_average_pool_backward(const CnnGapShape *shape,
+	const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count)
+{
+	if (shape == NULL || d_output == NULL || d_input == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->channels == 0 || shape->height == 0 || shape->width == 0)
+		return CNN_OPS_INVALID_INPUT;
+	size_t plane, planes, expected_input;
+	if (!cnn_ops_multiply(shape->height, shape->width, &plane) ||
+	    !cnn_ops_multiply(shape->batch, shape->channels, &planes) ||
+	    !cnn_ops_multiply(planes, plane, &expected_input))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) || planes > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (d_output_count != planes || d_input_count != expected_input)
+		return CNN_OPS_INVALID_INPUT;
+	if (!cnn_ops_finite(d_output, d_output_count))
+		return CNN_OPS_INVALID_INPUT;
+
+	for (size_t p = 0; p < planes; p++) {
+		float gradient = (float) ((double) d_output[p] / (double) plane);
+		for (size_t k = 0; k < plane; k++)
+			d_input[p * plane + k] = gradient;
+	}
 	return CNN_OPS_OK;
 }
