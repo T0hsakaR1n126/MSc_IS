@@ -11,6 +11,7 @@
 #include "monetdb_config.h"
 #include "gdk_cnn.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -171,5 +172,126 @@ cnn_maxpool2d_forward(const CnnPool2dShape *shape,
 			}
 		}
 	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_global_average_pool_forward(const CnnGapShape *shape,
+				const float *input, size_t input_count,
+				float *output, size_t output_count)
+{
+	if (shape == NULL || input == NULL || output == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->channels == 0 ||
+	    shape->height == 0 || shape->width == 0)
+		return CNN_OPS_INVALID_INPUT;
+
+	size_t plane, planes, expected_input;
+	if (!cnn_ops_multiply(shape->height, shape->width, &plane) ||
+	    !cnn_ops_multiply(shape->batch, shape->channels, &planes) ||
+	    !cnn_ops_multiply(planes, plane, &expected_input))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) || planes > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (input_count != expected_input || output_count != planes)
+		return CNN_OPS_INVALID_INPUT;
+
+	for (size_t p = 0; p < planes; p++) {
+		double sum = 0.0;
+		for (size_t k = 0; k < plane; k++)
+			sum += (double) input[p * plane + k];
+		output[p] = (float) (sum / (double) plane);
+	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_linear_forward(const CnnLinearShape *shape,
+		   const float *input, size_t input_count,
+		   const float *weight, size_t weight_count,
+		   const float *bias, size_t bias_count,
+		   float *output, size_t output_count)
+{
+	if (shape == NULL || input == NULL || weight == NULL || bias == NULL || output == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->in_features == 0 || shape->out_features == 0)
+		return CNN_OPS_INVALID_INPUT;
+
+	size_t expected_input, expected_output, expected_weight;
+	if (!cnn_ops_multiply(shape->batch, shape->in_features, &expected_input) ||
+	    !cnn_ops_multiply(shape->batch, shape->out_features, &expected_output) ||
+	    !cnn_ops_multiply(shape->out_features, shape->in_features, &expected_weight))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(float) ||
+	    expected_weight > SIZE_MAX / sizeof(float) ||
+	    shape->out_features > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (input_count != expected_input || weight_count != expected_weight ||
+	    bias_count != shape->out_features || output_count != expected_output)
+		return CNN_OPS_INVALID_INPUT;
+
+	for (size_t n = 0; n < shape->batch; n++) {
+		for (size_t o = 0; o < shape->out_features; o++) {
+			float sum = 0.0f;
+			for (size_t i = 0; i < shape->in_features; i++)
+				sum += input[n * shape->in_features + i] *
+				       weight[o * shape->in_features + i];
+			output[n * shape->out_features + o] = sum + bias[o];
+		}
+	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_softmax_cross_entropy(const float *logits, size_t logits_count,
+			 const int32_t *labels, size_t label_count,
+			 size_t batch, size_t classes,
+			 float *probabilities, size_t probability_count,
+			 double *mean_loss)
+{
+	if (logits == NULL || labels == NULL || mean_loss == NULL || batch == 0 || classes == 0 ||
+	    (probabilities == NULL && probability_count != 0))
+		return CNN_OPS_INVALID_INPUT;
+
+	size_t expected;
+	if (!cnn_ops_multiply(batch, classes, &expected) ||
+	    expected > SIZE_MAX / sizeof(float) || batch > SIZE_MAX / sizeof(*labels))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (logits_count != expected || label_count != batch ||
+	    (probabilities != NULL && probability_count != expected))
+		return CNN_OPS_INVALID_INPUT;
+
+	/* 检查整个 batch 后才写概率，后部的坏标签也不会留下部分输出。 */
+	for (size_t n = 0; n < batch; n++) {
+		if (labels[n] < 0 || (size_t) labels[n] >= classes)
+			return CNN_OPS_INVALID_INPUT;
+	}
+	for (size_t i = 0; i < expected; i++) {
+		if (!isfinite(logits[i]))
+			return CNN_OPS_INVALID_INPUT;
+	}
+
+	double total_loss = 0.0;
+	for (size_t n = 0; n < batch; n++) {
+		size_t base = n * classes;
+		double maximum = (double) logits[base];
+		for (size_t c = 1; c < classes; c++) {
+			if ((double) logits[base + c] > maximum)
+				maximum = (double) logits[base + c];
+		}
+		double sum_exp = 0.0;
+		for (size_t c = 0; c < classes; c++)
+			sum_exp += exp((double) logits[base + c] - maximum);
+
+		/* 先做差，避免 (maximum + log(sum_exp)) - target 的巨大数相消。 */
+		total_loss += log(sum_exp) + (maximum - (double) logits[base + (size_t) labels[n]]);
+		if (probabilities != NULL) {
+			for (size_t c = 0; c < classes; c++)
+				probabilities[base + c] =
+					(float) (exp((double) logits[base + c] - maximum) / sum_exp);
+		}
+	}
+	*mean_loss = total_loss / (double) batch;
 	return CNN_OPS_OK;
 }
