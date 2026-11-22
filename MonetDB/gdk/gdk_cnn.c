@@ -94,3 +94,82 @@ cnn_conv2d_forward(const CnnConv2dShape *shape, const float *input, size_t input
 	}
 	return CNN_OPS_OK;
 }
+
+CnnOpsResult
+cnn_relu_forward(const float *input, size_t input_count,
+		 float *output, size_t output_count)
+{
+	if (input == NULL || output == NULL || input_count == 0)
+		return CNN_OPS_INVALID_INPUT;
+	if (input_count > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (output_count != input_count)
+		return CNN_OPS_INVALID_INPUT;
+
+	/* 每次先读取当前值，允许输入和输出为完全相同的数组。 */
+	for (size_t i = 0; i < input_count; i++)
+		output[i] = input[i] > 0.0f ? input[i] : 0.0f;
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_maxpool2d_forward(const CnnPool2dShape *shape,
+		     const float *input, size_t input_count,
+		     float *output, size_t output_count,
+		     size_t *argmax, size_t argmax_count)
+{
+	if (shape == NULL || input == NULL || output == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->channels == 0 ||
+	    shape->height < 2 || shape->width < 2 ||
+	    (argmax == NULL && argmax_count != 0))
+		return CNN_OPS_INVALID_INPUT;
+
+	size_t output_height = shape->height / 2;
+	size_t output_width = shape->width / 2;
+	size_t plane, planes, output_plane, expected_input, expected_output;
+	if (!cnn_ops_multiply(shape->height, shape->width, &plane) ||
+	    !cnn_ops_multiply(shape->batch, shape->channels, &planes) ||
+	    !cnn_ops_multiply(planes, plane, &expected_input) ||
+	    !cnn_ops_multiply(output_height, output_width, &output_plane) ||
+	    !cnn_ops_multiply(planes, output_plane, &expected_output))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(float) ||
+	    (argmax != NULL && expected_output > SIZE_MAX / sizeof(*argmax)))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (input_count != expected_input || output_count != expected_output ||
+	    (argmax != NULL && argmax_count != expected_output))
+		return CNN_OPS_INVALID_INPUT;
+
+	/* 各 batch/channel 是独立平面，池化不混合图片或通道。 */
+	for (size_t p = 0; p < planes; p++) {
+		size_t input_base = p * plane;
+		size_t output_base = p * output_plane;
+		for (size_t h = 0; h < output_height; h++) {
+			for (size_t w = 0; w < output_width; w++) {
+				size_t ih = h * 2;
+				size_t iw = w * 2;
+				size_t winner = ih * shape->width + iw;
+				/* 不能从零开始：窗口中的数值可能全部为负。 */
+				float maximum = input[input_base + winner];
+				for (size_t kh = 0; kh < 2; kh++) {
+					for (size_t kw = 0; kw < 2; kw++) {
+						size_t index = (ih + kh) * shape->width + iw + kw;
+						float value = input[input_base + index];
+						/* 相同最大值保留按行遍历遇到的第一个位置。 */
+						if (value > maximum) {
+							maximum = value;
+							winner = index;
+						}
+					}
+				}
+				size_t index = output_base + h * output_width + w;
+				output[index] = maximum;
+				if (argmax != NULL)
+					argmax[index] = winner;
+			}
+		}
+	}
+	return CNN_OPS_OK;
+}
