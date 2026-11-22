@@ -432,3 +432,164 @@ cnn_global_average_pool_backward(const CnnGapShape *shape,
 	}
 	return CNN_OPS_OK;
 }
+
+CnnOpsResult
+cnn_relu_backward(const float *activation, size_t activation_count,
+	const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count)
+{
+	if (activation == NULL || d_output == NULL || d_input == NULL || activation_count == 0)
+		return CNN_OPS_INVALID_INPUT;
+	if (activation_count > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (d_output_count != activation_count || d_input_count != activation_count)
+		return CNN_OPS_INVALID_INPUT;
+	for (size_t i = 0; i < activation_count; i++) {
+		if (!isfinite(activation[i]) || activation[i] < 0.0f || !isfinite(d_output[i]))
+			return CNN_OPS_INVALID_INPUT;
+	}
+	for (size_t i = 0; i < activation_count; i++)
+		d_input[i] = activation[i] > 0.0f ? d_output[i] : 0.0f;
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_maxpool2d_backward(const CnnPool2dShape *shape,
+	const float *d_output, size_t d_output_count, const size_t *argmax, size_t argmax_count,
+	float *d_input, size_t d_input_count)
+{
+	if (shape == NULL || d_output == NULL || argmax == NULL || d_input == NULL)
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->channels == 0 || shape->height < 2 || shape->width < 2)
+		return CNN_OPS_INVALID_INPUT;
+	size_t output_height = shape->height / 2;
+	size_t output_width = shape->width / 2;
+	size_t plane, planes, output_plane, expected_input, expected_output;
+	if (!cnn_ops_multiply(shape->height, shape->width, &plane) ||
+	    !cnn_ops_multiply(shape->batch, shape->channels, &planes) ||
+	    !cnn_ops_multiply(planes, plane, &expected_input) ||
+	    !cnn_ops_multiply(output_height, output_width, &output_plane) ||
+	    !cnn_ops_multiply(planes, output_plane, &expected_output))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(*argmax))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (d_output_count != expected_output || argmax_count != expected_output ||
+	    d_input_count != expected_input)
+		return CNN_OPS_INVALID_INPUT;
+	if (!cnn_ops_finite(d_output, expected_output))
+		return CNN_OPS_INVALID_INPUT;
+
+	/* 全部索引都检查后才清零，损坏的后部缓存不会留下部分梯度。 */
+	for (size_t p = 0; p < planes; p++) {
+		for (size_t h = 0; h < output_height; h++) {
+			for (size_t w = 0; w < output_width; w++) {
+				size_t index = argmax[p * output_plane + h * output_width + w];
+				if (index >= plane)
+					return CNN_OPS_INVALID_INPUT;
+				size_t row = index / shape->width;
+				size_t column = index % shape->width;
+				if (row < h * 2 || row > h * 2 + 1 ||
+				    column < w * 2 || column > w * 2 + 1)
+					return CNN_OPS_INVALID_INPUT;
+			}
+		}
+	}
+	for (size_t i = 0; i < expected_input; i++)
+		d_input[i] = 0.0f;
+	for (size_t p = 0; p < planes; p++) {
+		for (size_t k = 0; k < output_plane; k++)
+			d_input[p * plane + argmax[p * output_plane + k]] += d_output[p * output_plane + k];
+	}
+	return CNN_OPS_OK;
+}
+
+CnnOpsResult
+cnn_conv2d_backward(const CnnConv2dShape *shape,
+	const float *input, size_t input_count, const float *weight, size_t weight_count,
+	const float *d_output, size_t d_output_count,
+	float *d_input, size_t d_input_count, float *d_weight, size_t d_weight_count,
+	float *d_bias, size_t d_bias_count)
+{
+	if (shape == NULL || input == NULL || weight == NULL || d_output == NULL ||
+	    d_weight == NULL || d_bias == NULL || (d_input == NULL && d_input_count != 0))
+		return CNN_OPS_INVALID_INPUT;
+	if (shape->batch == 0 || shape->in_channels == 0 ||
+	    shape->out_channels == 0 || shape->height == 0 || shape->width == 0)
+		return CNN_OPS_INVALID_INPUT;
+	size_t plane, input_planes, output_planes, kernel_planes;
+	size_t expected_input, expected_output, expected_weight;
+	if (!cnn_ops_multiply(shape->height, shape->width, &plane) ||
+	    !cnn_ops_multiply(shape->batch, shape->in_channels, &input_planes) ||
+	    !cnn_ops_multiply(input_planes, plane, &expected_input) ||
+	    !cnn_ops_multiply(shape->batch, shape->out_channels, &output_planes) ||
+	    !cnn_ops_multiply(output_planes, plane, &expected_output) ||
+	    !cnn_ops_multiply(shape->out_channels, shape->in_channels, &kernel_planes) ||
+	    !cnn_ops_multiply(kernel_planes, 9, &expected_weight))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (expected_input > SIZE_MAX / sizeof(float) ||
+	    expected_output > SIZE_MAX / sizeof(float) ||
+	    expected_weight > SIZE_MAX / sizeof(float) ||
+	    shape->out_channels > SIZE_MAX / sizeof(float))
+		return CNN_OPS_SIZE_OVERFLOW;
+	if (input_count != expected_input || weight_count != expected_weight ||
+	    d_output_count != expected_output || d_weight_count != expected_weight ||
+	    d_bias_count != shape->out_channels || (d_input != NULL && d_input_count != expected_input))
+		return CNN_OPS_INVALID_INPUT;
+	if (!cnn_ops_finite(input, input_count) || !cnn_ops_finite(weight, weight_count) ||
+	    !cnn_ops_finite(d_output, d_output_count))
+		return CNN_OPS_INVALID_INPUT;
+
+	if (d_input != NULL) {
+		for (size_t i = 0; i < expected_input; i++)
+			d_input[i] = 0.0f;
+	}
+	for (size_t i = 0; i < expected_weight; i++)
+		d_weight[i] = 0.0f;
+	for (size_t o = 0; o < shape->out_channels; o++)
+		d_bias[o] = 0.0f;
+
+	for (size_t n = 0; n < shape->batch; n++) {
+		for (size_t oc = 0; oc < shape->out_channels; oc++) {
+			size_t output_base = (n * shape->out_channels + oc) * plane;
+			for (size_t h = 0; h < shape->height; h++) {
+				for (size_t w = 0; w < shape->width; w++) {
+					float gradient = d_output[output_base + h * shape->width + w];
+					d_bias[oc] += gradient;
+					if (gradient == 0.0f)
+						continue;
+					for (size_t ic = 0; ic < shape->in_channels; ic++) {
+						size_t input_base = (n * shape->in_channels + ic) * plane;
+						for (size_t kh = 0; kh < 3; kh++) {
+							if ((kh == 0 && h == 0) ||
+							    (kh == 2 && h == shape->height - 1))
+								continue;
+							size_t ih = h;
+							if (kh == 0)
+								ih--;
+							else if (kh == 2)
+								ih++;
+							size_t weight_row = ((oc * shape->in_channels + ic) * 3 + kh) * 3;
+							for (size_t kw = 0; kw < 3; kw++) {
+								if ((kw == 0 && w == 0) ||
+								    (kw == 2 && w == shape->width - 1))
+									continue;
+								size_t iw = w;
+								if (kw == 0)
+									iw--;
+								else if (kw == 2)
+									iw++;
+								size_t x = input_base + ih * shape->width + iw;
+								size_t k = weight_row + kw;
+								d_weight[k] += input[x] * gradient;
+								if (d_input != NULL)
+									d_input[x] += weight[k] * gradient;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return CNN_OPS_OK;
+}

@@ -150,10 +150,7 @@ gdk_export CnnOpsResult cnn_softmax_cross_entropy(const float *logits, size_t lo
  * 全部标签、有限性、长度及整数溢出检查在写入前完成；失败时输出不变。
  * 调用者提供有效且不与输入重叠的输出数组，不分配内存。
  */
-gdk_export CnnOpsResult cnn_softmax_cross_entropy_backward(
-	const float *logits, size_t logits_count,
-	const int32_t *labels, size_t label_count, size_t batch, size_t classes,
-	float *d_logits, size_t d_logits_count);
+gdk_export CnnOpsResult cnn_softmax_cross_entropy_backward(const float *logits, size_t logits_count, const int32_t *labels, size_t label_count, size_t batch, size_t classes, float *d_logits, size_t d_logits_count);
 
 /*
  * 全连接反向：input [B,I]、weight [O,I]、d_output [B,O]。
@@ -163,11 +160,7 @@ gdk_export CnnOpsResult cnn_softmax_cross_entropy_backward(
  * 输出数组互不重叠，也不能与任一输入重叠；本函数不分配内存。
  * 参数/整数溢出检查失败时三个输出不变；不检测计算中的浮点溢出。
  */
-gdk_export CnnOpsResult cnn_linear_backward(const CnnLinearShape *shape,
-	const float *input, size_t input_count, const float *weight, size_t weight_count,
-	const float *d_output, size_t d_output_count,
-	float *d_input, size_t d_input_count, float *d_weight, size_t d_weight_count,
-	float *d_bias, size_t d_bias_count);
+gdk_export CnnOpsResult cnn_linear_backward(const CnnLinearShape *shape, const float *input, size_t input_count, const float *weight, size_t weight_count, const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count, float *d_weight, size_t d_weight_count, float *d_bias, size_t d_bias_count);
 
 /*
  * GAP 反向：[B,C] 上游梯度均分到 [B,C,H,W] 的各空间位置。
@@ -175,7 +168,36 @@ gdk_export CnnOpsResult cnn_linear_backward(const CnnLinearShape *shape,
  * 输出由调用者提供且不与输入重叠；覆写全部输出，不分配内存。
  * 全部参数、有限性及整数溢出检查先于写入，失败时输出不变。
  */
-gdk_export CnnOpsResult cnn_global_average_pool_backward(const CnnGapShape *shape,
-	const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count);
+gdk_export CnnOpsResult cnn_global_average_pool_backward(const CnnGapShape *shape, const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count);
+
+/*
+ * 根据前向 ReLU 输出 activation 计算梯度；activation 须为有限非负值。
+ * 正激活位置传递 d_output，零位置（含 -0）梯度为零。
+ * count 必须大于零且三组长度相等，输入及上游梯度均须为有限值。
+ * 允许 d_input == d_output 原地计算；不得部分重叠或覆盖 activation。
+ * 所有检查先于写入，失败时输出不变；不分配内存。
+ */
+gdk_export CnnOpsResult cnn_relu_backward(const float *activation, size_t activation_count, const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count);
+
+/*
+ * 固定 2×2、stride=2、padding=0 的 MaxPool 反向，形状与前向一致。
+ * d_output、argmax 为 [B,C,H/2,W/2]，d_input 为 [B,C,H,W]。
+ * argmax 使用前向的输入通道平面内索引；每个索引必须落在对应 2×2 窗口。
+ * 先验证全部尺寸、有限梯度和索引，再清零 d_input 并分发梯度。
+ * 奇数末行/末列以及未选中的位置梯度为零。count 均为精确元素数。
+ * 三数组不得重叠；检查失败输出不变；不分配内存。
+ */
+gdk_export CnnOpsResult cnn_maxpool2d_backward(const CnnPool2dShape *shape, const float *d_output, size_t d_output_count, const size_t *argmax, size_t argmax_count, float *d_input, size_t d_input_count);
+
+/*
+ * 固定 3×3、stride=1、padding=1 的 Conv2D 反向，布局同前向 NCHW/OIHW。
+ * d_output 为 [B,O,H,W]，d_weight 为 [O,I,3,3]，d_bias 为 [O]。
+ * d_input 可传 NULL、0 跳过；启用时为 [B,I,H,W]，由调用者提供。
+ * 全部输出覆写；对 batch 和空间位置求和，不额外做 batch 平均。
+ * 所有维度正数、count 精确匹配；检查全部输入有限性后才清零输出。
+ * 各输出互不重叠，也不与任一输入重叠；不分配内存。
+ * 参数/整数溢出检查失败时输出不变，不检测乘加中的浮点溢出。
+ */
+gdk_export CnnOpsResult cnn_conv2d_backward(const CnnConv2dShape *shape, const float *input, size_t input_count, const float *weight, size_t weight_count, const float *d_output, size_t d_output_count, float *d_input, size_t d_input_count, float *d_weight, size_t d_weight_count, float *d_bias, size_t d_bias_count);
 
 #endif /* GDK_CNN_H */
