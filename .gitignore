@@ -6,3 +6,6 @@ install/
 # MonetDB 本地数据库文件和连接配置
 /monetdb_farm/
 /.monetdb_auth
+
+# 本地 CNN 数据集和预处理结果
+/datasets/

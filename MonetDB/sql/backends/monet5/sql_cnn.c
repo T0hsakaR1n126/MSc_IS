@@ -11,8 +11,10 @@
 #include "monetdb_config.h"
 #include "sql_cnn.h"
 #include "sql_cnn_storage.h"
+#include "sql_cnn_train.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 
@@ -194,6 +196,8 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 
 	if (is_int_nil(epochs) || epochs <= 0)
 		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "epochs must be a positive integer");
+	if (epochs == INT_MAX)
+		throw(SQL, "sql.cnn_train", SQLSTATE(22003) "epochs exceeds model version range");
 
 	if (is_int_nil(batch_size) || batch_size <= 0)
 		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "batch_size must be a positive integer");
@@ -204,12 +208,19 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 	if (is_dbl_nil(learning_rate) || !isfinite(learning_rate) || learning_rate <= 0)
 		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "learning_rate must be finite and positive");
 
-	/*
-	 * 后续在这里接入：
-	 * 加载模型 -> 执行数据查询 -> 构建 batch
-	 * -> 前向 -> 损失 -> 反向 -> 更新参数。
-	 *
-	 * ****当前骨架不执行 data_query，也不修改模型！！
-	 */
-	throw(SQL, "sql.cnn_train", SQLSTATE(0A000) "CNN training is not implemented yet");
+	/* The internal SQL executor elevates privileges. Use data_query only to
+	 * select the supported fixed query, never as executable SQL text. */
+	while (isspace((unsigned char) *data_query))
+		data_query++;
+	size_t query_length = strlen(data_query);
+	while (query_length && isspace((unsigned char) data_query[query_length - 1]))
+		query_length--;
+	if (query_length && data_query[query_length - 1] == ';')
+		query_length--;
+	if (query_length != sizeof(CNN_TRAIN_DATA_QUERY) - 1 ||
+	    memcmp(data_query, CNN_TRAIN_DATA_QUERY, query_length) != 0)
+		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "Supported data_query: " CNN_TRAIN_DATA_QUERY);
+	CnnInitialModelInfo info;
+	sql_cnn_initial_info(&info, model_id, strcmp(optimizer, "adam") == 0);
+	return cnn_train_initialized_model(cntxt, m, &info, epochs, (size_t) batch_size, learning_rate);
 }

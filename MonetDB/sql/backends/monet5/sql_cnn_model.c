@@ -33,8 +33,8 @@ const CnnTensorSpec cnn_tensor_specs[CNN_TENSOR_COUNT] = {
 };
 
 /* SplitMix64：状态仅属于当前初始化过程，不使用全局 rand() 状态。 */
-static uint64_t
-cnn_random_u64(uint64_t *state)
+uint64_t
+cnn_splitmix64_next(uint64_t *state)
 {
 	uint64_t z;
 
@@ -49,7 +49,7 @@ cnn_random_u64(uint64_t *state)
 static float
 cnn_random_unit(uint64_t *state)
 {
-	uint32_t value = (uint32_t) (cnn_random_u64(state) >> 40);
+	uint32_t value = (uint32_t) (cnn_splitmix64_next(state) >> 40);
 
 	return (float) value * (1.0f / 16777216.0f);
 }

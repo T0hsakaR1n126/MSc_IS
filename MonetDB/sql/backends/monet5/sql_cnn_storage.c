@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -31,7 +32,7 @@ enum {
 	CNN_QUOTED_COUNT
 };
 
-//本模块只保存初始化版本，不执行训练查询，也不提交调用者事务
+// 本模块只执行固定存储操作，由调用者提交事务。
 static str
 cnn_storage_result(mvc *m, str msg)
 {
@@ -124,13 +125,13 @@ cnn_quote_info(const CnnInitialModelInfo *info, str *quoted)
 }
 
 static str
-cnn_validate_info(const CnnInitialModelInfo *info)
+cnn_validate_info(const CnnInitialModelInfo *info, bool initial)
 {
 	if (info == NULL || cnn_blank(info->model_id) ||
 	    cnn_blank(info->architecture) || cnn_blank(info->preprocess_spec) ||
 	    cnn_blank(info->class_labels) || cnn_blank(info->training_spec))
 		throw(SQL, "cnn.storage", SQLSTATE(22023) "Model metadata must not be NULL or blank");
-	if (info->version != 1)
+	if (initial && info->version != 1)
 		throw(SQL, "cnn.storage", SQLSTATE(22023) "Initial model version must be 1");
 	for (size_t i = 0; i < CNN_TENSOR_COUNT; i++) {
 		const CnnTensorSpec *spec = &cnn_tensor_specs[i];
@@ -146,7 +147,7 @@ cnn_validate_info(const CnnInitialModelInfo *info)
  * 在原用户上下文里检查权限；所有 SQL 都是本模块固定的表访问模板。
  */
 static str
-cnn_prepare(Client cntxt, mvc *m, bool writing, bool use_adam)
+cnn_prepare(Client cntxt, mvc *m, bool writing, bool use_adam, bool write_metrics)
 {
 	if (cntxt == NULL || cntxt->sqlcontext == NULL || m == NULL ||
 	    m->session == NULL || ((backend *) cntxt->sqlcontext)->mvc != m)
@@ -164,7 +165,7 @@ cnn_prepare(Client cntxt, mvc *m, bool writing, bool use_adam)
 			throw(SQL, "cnn.storage", SQLSTATE(42S02) "Required CNN table is missing: %s", names[i]);
 		if (!table_privs(m, table, PRIV_SELECT))
 			throw(SQL, "cnn.storage", SQLSTATE(42501) "SELECT privilege required on cnn.%s", names[i]);
-		if (writing && (i < 2 || (i == 2 && use_adam)) &&
+		if (writing && (i < 2 || (i == 2 && use_adam) || (i == 3 && write_metrics)) &&
 		    !table_privs(m, table, PRIV_INSERT))
 			throw(SQL, "cnn.storage", SQLSTATE(42501) "INSERT privilege required on cnn.%s", names[i]);
 	}
@@ -227,10 +228,10 @@ cnn_count(Client cntxt, const char *table, const str id, int version, lng *value
 }
 
 static str
-cnn_check_counts(Client cntxt, const str id, int version, bool use_adam)
+cnn_check_counts(Client cntxt, const str id, int version, bool use_adam, size_t metric_count)
 {
 	const char *tables[] = {"ModelTensor", "OptimizerTensor", "TrainingMetric"};
-	lng expected[] = {CNN_TENSOR_COUNT, use_adam ? 2 * CNN_TENSOR_COUNT : 0, 0};
+	lng expected[] = {CNN_TENSOR_COUNT, use_adam ? 2 * CNN_TENSOR_COUNT : 0, (lng) metric_count};
 	for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
 		lng found = 0;
 		str msg = cnn_count(cntxt, tables[i], id, version, &found);
@@ -243,18 +244,19 @@ cnn_check_counts(Client cntxt, const str id, int version, bool use_adam)
 }
 
 static str
-cnn_write_model(Client cntxt, const CnnInitialModelInfo *info,
+cnn_write_model(Client cntxt, const CnnInitialModelInfo *info, int epoch,
 		const CnnModel *model, const str *quoted)
 {
 	str query = NULL;
 	str msg = cnn_queryf(&query,
 		"INSERT INTO cnn.Model (ModelId, Version, Architecture, Status, "
 		"InputShape, InputLayout, DType, PreprocessSpec, ClassLabels, TrainingSpec, "
-		"Epoch, Step, \"seed\") VALUES (%s, %d, %s, 'initialized', "
-		"'[B,3,64,64]', 'NCHW', 'float32', %s, %s, %s, 0, 0, %" PRIu64 ");",
+		"Epoch, Step, \"seed\") VALUES (%s, %d, %s, '%s', "
+		"'[B,3,64,64]', 'NCHW', 'float32', %s, %s, %s, %d, %" PRIu64 ", %" PRIu64 ");",
 		quoted[CNN_QUOTED_ID], info->version, quoted[CNN_QUOTED_ARCHITECTURE],
+		epoch == 0 ? "initialized" : "trained",
 		quoted[CNN_QUOTED_PREPROCESS], quoted[CNN_QUOTED_LABELS],
-		quoted[CNN_QUOTED_TRAINING], model->seed);
+		quoted[CNN_QUOTED_TRAINING], epoch, model->step, model->seed);
 	if (msg == MAL_SUCCEED)
 		msg = SQLstatementIntern(cntxt, query, "cnn.write_model", true, false, NULL);
 	GDKfree(query);
@@ -397,56 +399,35 @@ cnn_read_tensor(Client cntxt, const str id, int version,
 	return msg;
 }
 
-// 初始化快照中的 Adam 尚无历史梯度，m、v 必须全零。
 static str
-cnn_validate_adam(const CnnAdamState *adam)
+cnn_validate_adam(const CnnAdamState *adam, bool initial)
 {
 	for (size_t i = 0; i < CNN_PARAMETER_COUNT; i++) {
-		if (!isfinite(adam->m[i]) || !isfinite(adam->v[i]) ||
-		    adam->m[i] != 0.0f || adam->v[i] != 0.0f)
-			throw(SQL, "cnn.storage", SQLSTATE(22000) "Initial Adam states must be finite and zero");
+		if (initial) {
+			if (adam->m[i] != 0.0f || adam->v[i] != 0.0f)
+				throw(SQL, "cnn.storage", SQLSTATE(22000) "Initial Adam states must be finite and zero");
+		} else if (!isfinite(adam->m[i]) || !isfinite(adam->v[i]) || adam->v[i] < 0.0f) {
+			throw(SQL, "cnn.storage", SQLSTATE(22000) "Adam states must be finite and second moments non-negative");
+		}
 	}
 	return MAL_SUCCEED;
 }
 
-str
-cnn_model_save_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
-		       const CnnModel *model, const CnnAdamState *adam)
+static str
+cnn_validate_parameters(const CnnModel *model)
 {
-	str quoted[CNN_QUOTED_COUNT] = {NULL};
-	str msg = cnn_validate_info(info);
-	if (msg != MAL_SUCCEED)
-		goto cleanup;
-	if (model == NULL || (info->use_adam ? adam == NULL : adam != NULL)) {
-		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Invalid model or optimizer state argument");
-		goto cleanup;
-	}
-	if (model->step != 0 || model->seed > (uint64_t) GDK_lng_max) {
-		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Initial step must be zero and seed must fit SQL BIGINT");
-		goto cleanup;
-	}
 	for (size_t i = 0; i < CNN_PARAMETER_COUNT; i++) {
-		if (!isfinite(model->parameter[i])) {
-			msg = createException(SQL, "cnn.storage", SQLSTATE(22000) "Model parameters must be finite");
-			goto cleanup;
-		}
+		if (!isfinite(model->parameter[i]))
+			throw(SQL, "cnn.storage", SQLSTATE(22000) "Model parameters must be finite");
 	}
-	if (info->use_adam && (msg = cnn_validate_adam(adam)) != MAL_SUCCEED)
-		goto cleanup;
-	msg = cnn_prepare(cntxt, m, true, info->use_adam);
-	if (msg == MAL_SUCCEED)
-		msg = cnn_quote_info(info, quoted);
-	if (msg != MAL_SUCCEED)
-		goto cleanup;
-	lng existing = 0;
-	msg = cnn_count(cntxt, "Model", quoted[CNN_QUOTED_ID], 0, &existing);
-	if (msg != MAL_SUCCEED)
-		goto cleanup;
-	if (existing != 0) {
-		msg = createException(SQL, "cnn.storage", SQLSTATE(23505) "ModelId already exists; initial state is not overwritten");
-		goto cleanup;
-	}
-	msg = cnn_write_model(cntxt, info, model, quoted);
+	return MAL_SUCCEED;
+}
+
+static str
+cnn_write_snapshot(Client cntxt, const CnnInitialModelInfo *info, int epoch,
+			const CnnModel *model, const CnnAdamState *adam, const str *quoted)
+{
+	str msg = cnn_write_model(cntxt, info, epoch, model, quoted);
 	// 外键要求先有父模型，再有参数，最后才有对应优化器状态。
 	for (size_t i = 0; msg == MAL_SUCCEED && i < CNN_TENSOR_COUNT; i++) {
 		const CnnTensorSpec *spec = &cnn_tensor_specs[i];
@@ -459,8 +440,46 @@ cnn_model_save_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
 			msg = cnn_write_tensor(cntxt, quoted[CNN_QUOTED_ID], info->version,
 					       spec, "v", adam->v + spec->offset);
 	}
+	return msg;
+}
+
+str
+cnn_model_save_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
+		       const CnnModel *model, const CnnAdamState *adam)
+{
+	str quoted[CNN_QUOTED_COUNT] = {NULL};
+	str msg = cnn_validate_info(info, true);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	if (model == NULL || (info->use_adam ? adam == NULL : adam != NULL)) {
+		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Invalid model or optimizer state argument");
+		goto cleanup;
+	}
+	if (model->step != 0 || model->seed > (uint64_t) GDK_lng_max) {
+		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Initial step must be zero and seed must fit SQL BIGINT");
+		goto cleanup;
+	}
+	msg = cnn_validate_parameters(model);
+	if (msg == MAL_SUCCEED && info->use_adam)
+		msg = cnn_validate_adam(adam, true);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	msg = cnn_prepare(cntxt, m, true, info->use_adam, false);
 	if (msg == MAL_SUCCEED)
-		msg = cnn_check_counts(cntxt, quoted[CNN_QUOTED_ID], info->version, info->use_adam);
+		msg = cnn_quote_info(info, quoted);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	lng existing = 0;
+	msg = cnn_count(cntxt, "Model", quoted[CNN_QUOTED_ID], 0, &existing);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	if (existing != 0) {
+		msg = createException(SQL, "cnn.storage", SQLSTATE(23505) "ModelId already exists; initial state is not overwritten");
+		goto cleanup;
+	}
+	msg = cnn_write_snapshot(cntxt, info, 0, model, adam, quoted);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_check_counts(cntxt, quoted[CNN_QUOTED_ID], info->version, info->use_adam, 0);
 cleanup:
 	cnn_free_strings(quoted, CNN_QUOTED_COUNT);
 	return cnn_storage_result(m, msg);
@@ -473,20 +492,20 @@ cnn_model_load_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
 	str quoted[CNN_QUOTED_COUNT] = {NULL};
 	CnnModel temporary = {0};
 	CnnAdamState temporary_adam = {0};
-	str msg = cnn_validate_info(info);
+	str msg = cnn_validate_info(info, true);
 	if (msg != MAL_SUCCEED)
 		goto cleanup;
 	if (model == NULL || (info->use_adam ? adam == NULL : adam != NULL)) {
 		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Invalid model or optimizer output argument");
 		goto cleanup;
 	}
-	msg = cnn_prepare(cntxt, m, false, info->use_adam);
+	msg = cnn_prepare(cntxt, m, false, info->use_adam, false);
 	if (msg == MAL_SUCCEED)
 		msg = cnn_quote_info(info, quoted);
 	if (msg == MAL_SUCCEED)
 		msg = cnn_read_model(cntxt, info, quoted, &temporary.seed);
 	if (msg == MAL_SUCCEED)
-		msg = cnn_check_counts(cntxt, quoted[CNN_QUOTED_ID], info->version, info->use_adam);
+		msg = cnn_check_counts(cntxt, quoted[CNN_QUOTED_ID], info->version, info->use_adam, 0);
 	for (size_t i = 0; msg == MAL_SUCCEED && i < CNN_TENSOR_COUNT; i++) {
 		const CnnTensorSpec *spec = &cnn_tensor_specs[i];
 		msg = cnn_read_tensor(cntxt, quoted[CNN_QUOTED_ID], info->version,
@@ -499,13 +518,131 @@ cnn_model_load_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
 					      spec, "v", temporary_adam.v + spec->offset);
 	}
 	if (msg == MAL_SUCCEED && info->use_adam)
-		msg = cnn_validate_adam(&temporary_adam);
+		msg = cnn_validate_adam(&temporary_adam, true);
 	// 完整恢复成功后才发布；失败不会污染调用者现有的工作参数。
 	if (msg == MAL_SUCCEED) {
 		*model = temporary;
 		if (info->use_adam)
 			*adam = temporary_adam;
 	}
+cleanup:
+	cnn_free_strings(quoted, CNN_QUOTED_COUNT);
+	return cnn_storage_result(m, msg);
+}
+
+str
+cnn_model_check_trainable(Client cntxt, mvc *m, const CnnInitialModelInfo *info)
+{
+	str id = NULL;
+	lng versions = 0;
+	str msg = cnn_validate_info(info, true);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_prepare(cntxt, m, true, info->use_adam, true);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_quote(&id, info->model_id);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_count(cntxt, "Model", id, 0, &versions);
+	if (msg == MAL_SUCCEED && versions > 1)
+		msg = createException(SQL, "cnn.storage", SQLSTATE(23505) "ModelId already has trained versions");
+	GDKfree(id);
+	return cnn_storage_result(m, msg);
+}
+
+static str
+cnn_validate_metrics(const CnnEpochMetric *metrics, size_t count)
+{
+	if (metrics == NULL || count == 0 || count > 3)
+		throw(SQL, "cnn.storage", SQLSTATE(22023) "Expected one to three epoch metrics");
+	for (size_t i = 0; i < count; i++) {
+		const CnnEpochMetric *metric = &metrics[i];
+		if (metric->split == NULL || (strcmp(metric->split, "train") != 0 &&
+		    strcmp(metric->split, "validation") != 0 && strcmp(metric->split, "test") != 0))
+			throw(SQL, "cnn.storage", SQLSTATE(22023) "Invalid epoch metric split");
+		for (size_t j = 0; j < i; j++) {
+			if (strcmp(metric->split, metrics[j].split) == 0)
+				throw(SQL, "cnn.storage", SQLSTATE(22023) "Duplicate epoch metric split");
+		}
+		if (!isfinite(metric->loss) || metric->loss < 0.0 ||
+		    !isfinite(metric->accuracy) || metric->accuracy < 0.0 || metric->accuracy > 1.0 ||
+		    !isfinite(metric->f1) || metric->f1 < 0.0 || metric->f1 > 1.0 ||
+		    !isfinite(metric->runtime) || metric->runtime < 0.0)
+			throw(SQL, "cnn.storage", SQLSTATE(22023) "Invalid epoch metric values");
+	}
+	return MAL_SUCCEED;
+}
+
+enum { CNN_METRIC_NUMBER_SIZE = 32 };
+
+/* 用整数尾数和指数构造 DOUBLE 字面量，省略本地小数分隔符。 */
+static bool
+cnn_format_metric_double(char out[CNN_METRIC_NUMBER_SIZE], double value)
+{
+	char scientific[64];
+	int length = snprintf(scientific, sizeof(scientific), "%.16e", value == 0.0 ? 0.0 : value);
+	if (length < 0 || (size_t) length >= sizeof(scientific))
+		return false;
+	char *exponent = strrchr(scientific, 'e');
+	if (exponent == NULL || exponent - scientific < 18)
+		return false;
+	length = snprintf(out, CNN_METRIC_NUMBER_SIZE, "%c%.16se%d",
+			  scientific[0], exponent - 16, atoi(exponent + 1) - 16);
+	return length > 0 && length < CNN_METRIC_NUMBER_SIZE;
+}
+
+static str
+cnn_write_metric(Client cntxt, const str id, int version, int epoch, const CnnEpochMetric *metric)
+{
+	char loss[CNN_METRIC_NUMBER_SIZE], accuracy[CNN_METRIC_NUMBER_SIZE];
+	char f1[CNN_METRIC_NUMBER_SIZE], runtime[CNN_METRIC_NUMBER_SIZE];
+	if (!cnn_format_metric_double(loss, metric->loss) ||
+	    !cnn_format_metric_double(accuracy, metric->accuracy) ||
+	    !cnn_format_metric_double(f1, metric->f1) ||
+	    !cnn_format_metric_double(runtime, metric->runtime))
+		throw(SQL, "cnn.storage", SQLSTATE(22000) "Cannot format epoch metric");
+
+	str query = NULL;
+	/* split 已在 cnn_validate_metrics 中按固定名称验证。 */
+	str msg = cnn_queryf(&query,
+		"INSERT INTO cnn.TrainingMetric (ModelId, Version, Epoch, Split, Loss, Accuracy, F1, Runtime) "
+		"VALUES (%s, %d, %d, '%s', %s, %s, %s, %s);",
+		id, version, epoch, metric->split, loss, accuracy, f1, runtime);
+	if (msg == MAL_SUCCEED)
+		msg = SQLstatementIntern(cntxt, query, "cnn.write_metric", true, false, NULL);
+	GDKfree(query);
+	return msg;
+}
+
+str
+cnn_model_save_epoch(Client cntxt, mvc *m, const CnnInitialModelInfo *info, int epoch,
+		     const CnnModel *model, const CnnAdamState *adam, const CnnEpochMetric *metrics, size_t metric_count)
+{
+	str quoted[CNN_QUOTED_COUNT] = {NULL};
+	str msg = cnn_validate_info(info, false);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+	if (epoch < 1 || epoch >= GDK_int_max || info->version != epoch + 1 ||
+	    model == NULL || model->step < (uint64_t) epoch ||
+	    model->step > (uint64_t) GDK_lng_max || model->seed > (uint64_t) GDK_lng_max ||
+	    (info->use_adam ? adam == NULL : adam != NULL)) {
+		msg = createException(SQL, "cnn.storage", SQLSTATE(22023) "Invalid trained snapshot metadata or state");
+		goto cleanup;
+	}
+	msg = cnn_validate_metrics(metrics, metric_count);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_validate_parameters(model);
+	if (msg == MAL_SUCCEED && info->use_adam)
+		msg = cnn_validate_adam(adam, false);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_prepare(cntxt, m, true, info->use_adam, true);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_quote_info(info, quoted);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_write_snapshot(cntxt, info, epoch, model, adam, quoted);
+	for (size_t i = 0; msg == MAL_SUCCEED && i < metric_count; i++)
+		msg = cnn_write_metric(cntxt, quoted[CNN_QUOTED_ID], info->version, epoch, &metrics[i]);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_check_counts(cntxt, quoted[CNN_QUOTED_ID], info->version, info->use_adam, metric_count);
+
 cleanup:
 	cnn_free_strings(quoted, CNN_QUOTED_COUNT);
 	return cnn_storage_result(m, msg);

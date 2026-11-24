@@ -131,8 +131,8 @@ CREATE PROCEDURE sys.cnn_create(
 )
 EXTERNAL NAME sql.cnn_create;
 
--- 将 SQL 入口绑定到原生 MAL/C 实现。当前训练 C 入口仍为骨架，
--- 对合法训练请求返回 SQLSTATE 0A000，表示训练功能尚未实现。
+-- 从初始化模型开始训练。data_query 支持固定的训练集 ImageId 查询。
+-- 每轮保存参数、优化器状态与指标，最终使用测试集评估。
 CREATE PROCEDURE sys.cnn_train(
     model_id STRING,
     data_query STRING,

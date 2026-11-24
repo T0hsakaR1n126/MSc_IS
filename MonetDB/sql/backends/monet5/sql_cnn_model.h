@@ -49,6 +49,7 @@ extern const CnnTensorSpec cnn_tensor_specs[CNN_TENSOR_COUNT];
 
 void cnn_model_init(CnnModel *model, uint64_t seed);
 void cnn_adam_state_init(CnnAdamState *state);
+uint64_t cnn_splitmix64_next(uint64_t *state);
 
 /*
  * 编码约定：IEEE-754 binary32、小端字节序，每个值占 4 字节。

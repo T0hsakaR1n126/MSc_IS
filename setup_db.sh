@@ -1,155 +1,131 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-ROOT_DIR=$(pwd)
-INSTALL_DIR="$ROOT_DIR/install"
-BIN_DIR="$INSTALL_DIR/bin"
-LIB_DIR="$INSTALL_DIR/lib"
-CMD_MONETDBD="$BIN_DIR/monetdbd"
-CMD_MONETDB="$BIN_DIR/monetdb"
-CMD_MCLIENT="$BIN_DIR/mclient"
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${CNN_INSTALL_DIR:-$ROOT_DIR/install}"
+DATASET_DIR="${CNN_DATASET_DIR:-$ROOT_DIR/datasets/oxford-pets-64}"
+DB_FARM_PATH="${CNN_DB_FARM:-$ROOT_DIR/monetdb_farm}"
+DB_NAME="${CNN_DB_NAME:-cnn_train_db}"
+CMD_MCLIENT="${CNN_MCLIENT:-$INSTALL_DIR/bin/mclient}"
+MODEL_ID="${CNN_MODEL_ID:-cat_dog_oxford_cnn}"
+OPTIMIZER="${CNN_OPTIMIZER:-adam}"
+EPOCHS="${CNN_EPOCHS:-20}"
+BATCH_SIZE="${CNN_BATCH_SIZE:-64}"
+LEARNING_RATE="${CNN_LEARNING_RATE:-0.001}"
+SEED="${CNN_SEED:-42}"
 
-DB_FARM_PATH="$ROOT_DIR/monetdb_farm"
-DB_NAME="test_db"
-
-AUTH_FILE="$ROOT_DIR/.monetdb_auth"
-
-if [ ! -f "$CMD_MONETDBD" ]; then
-    echo "Error: $CMD_MONETDBD not found, please run build.sh first..."
+fail() {
+    printf '%s\n' "$*" >&2
     exit 1
-fi
-
-export LD_LIBRARY_PATH="$LIB_DIR:$LD_LIBRARY_PATH"
-export DYLD_LIBRARY_PATH="$LIB_DIR:$DYLD_LIBRARY_PATH"
-
-cat > "$AUTH_FILE" <<EOF
-user=monetdb
-password=monetdb
-language=sql
-save_history=true
-EOF
-
-export DOTMONETDBFILE="$AUTH_FILE"
-
-echo "Cleaning old daemons..."
-if [ -d "$DB_FARM_PATH" ]; then
-    "$CMD_MONETDBD" stop "$DB_FARM_PATH" || true
-    sleep 1
-fi
-
-echo "Starting MonetDB daemon process..."
-rm -rf "$DB_FARM_PATH"
-if [ ! -d "$DB_FARM_PATH" ]; then
-    "$CMD_MONETDBD" create "$DB_FARM_PATH" || { echo "failed to create farm"; exit 1; }
-fi
-
-"$CMD_MONETDBD" start "$DB_FARM_PATH"
-
-echo "Initializing database..."
-
-if "$CMD_MONETDB" status | grep -q "$DB_NAME"; then
-    echo "   '$DB_NAME' exists"
-else
-    echo "   creating '$DB_NAME'..."
-    "$CMD_MONETDB" create "$DB_NAME" || { echo "failed to create"; exit 1; }
-fi
-
-# "$CMD_MONETDB" set gdk_nr_threads=1 "$DB_NAME"
-"$CMD_MONETDB" release "$DB_NAME"
-sleep 2
-
-echo "Initializing data..."
-
-"$CMD_MCLIENT" -d "$DB_NAME" <<EOF
--- 1. 查看自动初始化的 CNN 存储表，预期四张。
-SELECT s.name AS schema_name, t.name AS table_name
-FROM sys.tables t JOIN sys.schemas s ON s.id = t.schema_id
-WHERE s.name = 'cnn'
-ORDER BY t.name;
-
--- 2. 查看过程的模块、实现语言和副作用标记；language_id = 1 表示 MAL。
--- sys.functions.func 对此类过程保存完整 SQL 定义，不是单独的 MAL 函数名。
-SELECT s.name AS schema_name, f.name, f.mod, f.language AS language_id, f.side_effect
-FROM sys.functions f JOIN sys.schemas s ON s.id = f.schema_id
-WHERE s.name = 'sys' AND f.name = 'cnn_train' AND f.type = 2;
-
--- 3. 查看六个输入参数的顺序、名称和 SQL 类型。
-SELECT a.number, a.name, a.type
-FROM sys.args a JOIN sys.functions f ON f.id = a.func_id
-JOIN sys.schemas s ON s.id = f.schema_id
-WHERE s.name = 'sys' AND f.name = 'cnn_train' AND f.type = 2 AND a.inout = 1
-ORDER BY a.number;
-
--- 4. 当前只定义了存储结构，初始行数应为零。
-SELECT 'Model' AS table_name, COUNT(*) AS row_count FROM cnn.Model
-UNION ALL SELECT 'ModelTensor', COUNT(*) FROM cnn.ModelTensor
-UNION ALL SELECT 'OptimizerTensor', COUNT(*) FROM cnn.OptimizerTensor
-UNION ALL SELECT 'TrainingMetric', COUNT(*) FROM cnn.TrainingMetric
-ORDER BY 1;
-EOF
-
-# 自动核对四张表、MAL 过程元数据及六个预期输入参数是否存在。
-# 后面的 CALL 及其精确错误消息进一步验证是否进入了预期的 C 实现。
-cnn_metadata="$("$CMD_MCLIENT" -d "$DB_NAME" -f csv-noquote -s "
-SELECT
-    (SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.id = t.schema_id
-     WHERE s.name = 'cnn' AND t.type = 0
-       AND t.name IN ('model', 'modeltensor', 'optimizertensor', 'trainingmetric')),
-    (SELECT COUNT(*) FROM sys.functions f JOIN sys.schemas s ON s.id = f.schema_id
-     WHERE s.name = 'sys' AND f.name = 'cnn_train' AND f.type = 2
-       AND f.mod = 'sql' AND f.language = 1 AND f.side_effect = true),
-    (SELECT COUNT(*) FROM sys.args a JOIN sys.functions f ON f.id = a.func_id
-     JOIN sys.schemas s ON s.id = f.schema_id
-     WHERE s.name = 'sys' AND f.name = 'cnn_train' AND f.type = 2 AND a.inout = 1
-       AND a.name IN ('model_id', 'data_query', 'epochs', 'batch_size', 'optimizer', 'learning_rate'));")"
-if [[ "$cnn_metadata" != '4,1,6' ]]; then
-    echo "failed: need 4,1,6, but is $cnn_metadata" >&2
-    exit 1
-fi
-echo "passed: four tables, MAL procedure metadata and six input parameters are registered."
-
-# 每条预期报错的 CALL 单独执行，在 if 中捕获，避免 set -e 提前结束。
-# csv-noquote 格式会保留错误输出中的 CODE = SQLSTATE。
-expect_cnn_error() {
-    local state="$1" message="$2" query="$3"
-    local output line state_seen=false
-    if output="$("$CMD_MCLIENT" -d "$DB_NAME" -f csv-noquote -s "$query" 2>&1)"; then
-        echo "failed: call succeeded unexpectedly, expected SQLSTATE $state." >&2
-        exit 1
-    fi
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^CODE[[:space:]]*=[[:space:]]*${state}[[:space:]]*$ ]]; then
-            state_seen=true
-        fi
-    done <<< "$output"
-    if [[ "$state_seen" != true || "$output" != *"$message"* ]]; then
-        printf 'failed: SQLSTATE %s, %s\n' "$state" "$message" >&2
-        exit 1
-    fi
-    printf 'passed: SQLSTATE %s, %s\n' "$state" "$message"
 }
 
-expect_cnn_error '22023' 'epochs must be a positive integer' \
-    "CALL sys.cnn_train('cnn_smoke', 'SELECT 1', 0, 2, 'sgd', CAST(0.01 AS DOUBLE));"
-expect_cnn_error '0A000' 'CNN training is not implemented yet' \
-    "CALL cnn_train('cnn_smoke', 'SELECT 1', 1, 2, 'sgd', CAST(0.01 AS DOUBLE));"
-expect_cnn_error '0A000' 'CNN training is not implemented yet' \
-    "CALL sys.cnn_train('cnn_smoke', 'SELECT 1', 1, 2, 'adam', CAST(0.01 AS DOUBLE));"
+[[ -x "$CMD_MCLIENT" ]] || fail 'mclient is missing. Build and install the current MonetDB source with bash build.sh.'
+command -v python3 >/dev/null || fail 'Python 3 is required to load the prepared images.'
+[[ -r "$DATASET_DIR/manifest.csv" && -d "$DATASET_DIR/pixels" ]] ||
+    fail "Prepared images are missing in $DATASET_DIR. Run scripts/prepare_oxford_pets.py first."
+[[ "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]] || fail 'CNN_DB_NAME must contain only letters, digits or underscores.'
+[[ "$MODEL_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || fail 'CNN_MODEL_ID must contain 1–128 letters, digits, underscores or hyphens.'
+[[ "$OPTIMIZER" == adam || "$OPTIMIZER" == sgd ]] || fail 'CNN_OPTIMIZER must be adam or sgd.'
+[[ "$EPOCHS" =~ ^[1-9][0-9]{0,9}$ && "$BATCH_SIZE" =~ ^[1-9][0-9]{0,9}$ ]] ||
+    fail 'CNN_EPOCHS and CNN_BATCH_SIZE must be positive integers.'
+[[ "$SEED" =~ ^(0|[1-9][0-9]{0,18})$ ]] || fail 'CNN_SEED must be a non-negative BIGINT.'
+[[ "$LEARNING_RATE" =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] ||
+    fail 'CNN_LEARNING_RATE must be a positive number.'
+python3 - "$EPOCHS" "$BATCH_SIZE" "$SEED" "$LEARNING_RATE" <<'PY'
+import math
+import sys
 
-# 原前段创建全新的数据库，当前骨架验收后四张表应仍然为空。
-cnn_counts="$("$CMD_MCLIENT" -d "$DB_NAME" -f csv-noquote -s "
-SELECT COUNT(*) FROM cnn.Model
-UNION ALL SELECT COUNT(*) FROM cnn.ModelTensor
-UNION ALL SELECT COUNT(*) FROM cnn.OptimizerTensor
-UNION ALL SELECT COUNT(*) FROM cnn.TrainingMetric;")"
-if [[ "$cnn_counts" != $'0\n0\n0\n0' ]]; then
-    printf 'failed: expected all tables to be empty, but got counts:\n%s\n' "$cnn_counts" >&2
-    exit 1
+epochs, batch_size, seed = map(int, sys.argv[1:4])
+rate = float(sys.argv[4])
+if epochs > 2**31 - 2:
+    sys.exit('CNN_EPOCHS exceeds the model version range.')
+if batch_size > 2**31 - 1:
+    sys.exit('CNN_BATCH_SIZE exceeds the SQL INTEGER range.')
+if seed > 2**63 - 1:
+    sys.exit('CNN_SEED exceeds the SQL BIGINT range.')
+if not (math.isfinite(rate) and rate > 0):
+    sys.exit('CNN_LEARNING_RATE must be finite and positive.')
+PY
+
+export DOTMONETDBFILE="${DOTMONETDBFILE:-$ROOT_DIR/.monetdb_auth}"
+if [[ ! -e "$DOTMONETDBFILE" ]]; then
+    (umask 077; printf 'user=monetdb\npassword=monetdb\nlanguage=sql\n' > "$DOTMONETDBFILE")
 fi
-echo "passed: all four tables are empty after test calls."
 
-echo "Done!"
-echo "Please execute the following command to test your changes:"
-echo "    export DOTMONETDBFILE=\"$AUTH_FILE\""
-echo "    export PATH=\"$BIN_DIR:\$PATH\""
-echo "    mclient -d $DB_NAME"
+if [[ -n "${CNN_MAPI_URI:-}" ]]; then
+    # Connect to an already-running database, for example an isolated test server.
+    SQL_CONNECTION=(-d "$CNN_MAPI_URI")
+else
+    CMD_MONETDBD="$INSTALL_DIR/bin/monetdbd"
+    CMD_MONETDB="$INSTALL_DIR/bin/monetdb"
+    [[ -x "$CMD_MONETDBD" && -x "$CMD_MONETDB" ]] || fail 'MonetDB daemon tools are missing. Run bash build.sh.'
+    export LD_LIBRARY_PATH="$INSTALL_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export DYLD_LIBRARY_PATH="$INSTALL_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
+    if [[ ! -d "$DB_FARM_PATH" ]]; then
+        "$CMD_MONETDBD" create "$DB_FARM_PATH"
+    fi
+    farm_info="$("$CMD_MONETDBD" get status,port,sockdir "$DB_FARM_PATH")"
+    if [[ "$farm_info" == *'no monetdbd is serving this dbfarm'* ]]; then
+        "$CMD_MONETDBD" start "$DB_FARM_PATH"
+    fi
+    port="$(awk '$1 == "port" {print $2}' <<< "$farm_info")"
+    sockdir="$(awk '$1 == "sockdir" {sub(/^[[:space:]]*sockdir[[:space:]]+/, ""); print}' <<< "$farm_info")"
+    [[ "$port" =~ ^[0-9]+$ && "$sockdir" == /* ]] || fail 'Could not determine the MonetDB farm socket.'
+    CONTROL_CONNECTION=(-h "$sockdir" -p "$port")
+    if [[ ! -d "$DB_FARM_PATH/$DB_NAME" ]]; then
+        "$CMD_MONETDB" "${CONTROL_CONNECTION[@]}" create "$DB_NAME"
+        "$CMD_MONETDB" "${CONTROL_CONNECTION[@]}" release "$DB_NAME"
+    fi
+    SQL_CONNECTION=(-h "$sockdir" -p "$port" -d "$DB_NAME")
+fi
+
+cnn_sql() {
+    "$CMD_MCLIENT" "${SQL_CONNECTION[@]}" -E UTF-8 "$@"
+}
+
+cnn_tables="$(cnn_sql -f csv-noquote -s "
+SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.id = t.schema_id
+WHERE s.name = 'cnn' AND t.type = 0 AND t.name IN (
+    'model', 'modeltensor', 'optimizertensor', 'trainingmetric', 'trainingimage', 'imagechannel'
+);")"
+[[ "$cnn_tables" == 6 ]] || fail 'This database does not have the CNN schema. Install the current build and initialize a new training database.'
+
+# The previous build has the same six tables. Probe the query validation without
+# creating model state or importing data, so using a stale server fails early.
+if diagnostic="$(cnn_sql -f csv-noquote -s "CALL sys.cnn_train('cnn_script_preflight', 'SELECT 1', 1, 1, 'sgd', CAST(0.01 AS DOUBLE));" 2>&1)"; then
+    fail 'Unexpected result from CNN preflight. Install the current MonetDB build before training.'
+fi
+[[ "$diagnostic" == *'Supported data_query'* ]] ||
+    fail "The server did not recognize the current CNN training entry. Install the current build before training.
+$diagnostic"
+
+model_exists="$(cnn_sql -f csv-noquote -s "SELECT COUNT(*) FROM cnn.Model WHERE ModelId = '$MODEL_ID';")"
+[[ "$model_exists" == 0 ]] || fail "Model '$MODEL_ID' already exists. Choose a new CNN_MODEL_ID to start a fresh training run."
+
+# COPY, writes and the full comparison all share one transaction.
+python3 "$ROOT_DIR/scripts/import_cnn_images.py" "$DATASET_DIR" | cnn_sql
+
+printf 'Training %s with %s for %s epoch(s), batch size %s, learning rate %s, seed %s.\n' \
+    "$MODEL_ID" "$OPTIMIZER" "$EPOCHS" "$BATCH_SIZE" "$LEARNING_RATE" "$SEED"
+cnn_sql <<SQL
+START TRANSACTION;
+CALL sys.cnn_create('$MODEL_ID', '$OPTIMIZER', CAST($SEED AS BIGINT));
+CALL sys.cnn_train(
+    '$MODEL_ID',
+    'SELECT ImageId FROM cnn.TrainingImage WHERE Split = ''train'' ORDER BY ImageId',
+    CAST($EPOCHS AS INTEGER), CAST($BATCH_SIZE AS INTEGER),
+    '$OPTIMIZER', CAST($LEARNING_RATE AS DOUBLE)
+);
+COMMIT;
+
+SELECT ModelId, Version, Status, Epoch, Step
+FROM cnn.Model
+WHERE ModelId = '$MODEL_ID'
+ORDER BY Version DESC LIMIT 1;
+
+SELECT Epoch, Split, Loss, Accuracy, F1, Runtime AS Seconds
+FROM cnn.TrainingMetric
+WHERE ModelId = '$MODEL_ID'
+ORDER BY Epoch, CASE Split WHEN 'train' THEN 1 WHEN 'validation' THEN 2 ELSE 3 END;
+SQL
