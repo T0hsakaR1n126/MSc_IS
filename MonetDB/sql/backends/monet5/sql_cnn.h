@@ -15,5 +15,6 @@
 
 extern str sql_cnn_create(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci);
 extern str sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci);
+extern str sql_cnn_predict(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci);
 
 #endif /* SQL_CNN_H */

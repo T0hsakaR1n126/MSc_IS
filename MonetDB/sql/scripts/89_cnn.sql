@@ -103,7 +103,7 @@ CREATE TABLE cnn.OptimizerTensor (
         REFERENCES cnn.ModelTensor (ModelId, Version, LayerId, TensorName)
 );
 
--- 每个 epoch、每个数据集划分保存一条聚合指标记录。
+-- 当前 cnn_train 每个 epoch 保存一条 train 指标。Split 仍用于查询历史指标。
 -- Runtime 的单位为秒，Accuracy 和 F1 的取值范围为 [0, 1]。
 CREATE TABLE cnn.TrainingMetric (
     ModelId VARCHAR(128) NOT NULL,
@@ -132,7 +132,7 @@ CREATE PROCEDURE sys.cnn_create(
 EXTERNAL NAME sql.cnn_create;
 
 -- 从初始化模型开始训练。data_query 支持固定的训练集 ImageId 查询。
--- 每轮保存参数、优化器状态与指标，最终使用测试集评估。
+-- 每轮保存参数、优化器状态与训练指标。验证集和测试集由 sys.cnn_predict 读取。
 CREATE PROCEDURE sys.cnn_train(
     model_id STRING,
     data_query STRING,

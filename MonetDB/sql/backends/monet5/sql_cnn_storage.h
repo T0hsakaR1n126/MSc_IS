@@ -18,7 +18,7 @@
  * 初始化模型使用 Version=1；训练快照使用 Version=Epoch+1。
  * 四个描述字符串由调用者按约定生成；存储层保存原文，不解析 JSON。
  * 读取时使用同一结构描述预期配置，逐项检查数据库记录是否兼容。
- * 当前训练从初始化版本加载，训练快照提供保存接口。
+ * 训练从初始化版本加载，推理读取最新训练快照。
  */
 typedef struct {
 	const char *model_id;
@@ -31,7 +31,6 @@ typedef struct {
 } CnnInitialModelInfo;
 
 typedef struct {
-	const char *split;
 	double loss;
 	double accuracy;
 	double f1;
@@ -53,15 +52,21 @@ str cnn_model_save_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *info
 /* 全部读取和校验成功后才写入输出对象；失败时输出内容保持原样。 */
 str cnn_model_load_initial(Client cntxt, mvc *m, const CnnInitialModelInfo *expected, CnnModel *model, CnnAdamState *adam);
 
+/*
+ * Read the latest trained version for the expected model in the caller's transaction.
+ * Only the fixed model description and parameter tensors are required. Both outputs
+ * are assigned on success, with seed and step left at zero for inference.
+ */
+str cnn_model_load_trained(Client cntxt, mvc *m, const CnnInitialModelInfo *expected, CnnModel *model, int *version);
+
 /* 检查训练所需的写权限并拒绝已有训练版本的模型。 */
 str cnn_model_check_trainable(Client cntxt, mvc *m, const CnnInitialModelInfo *info);
 
 /*
- * 保存一个训练快照和对应的指标。version=epoch+1，epoch 从 1 开始。
- * 指标可以包含 train、validation、test 中一至三个互不相同的划分；
+ * 保存一个训练快照和该轮的训练集指标。version=epoch+1，epoch 从 1 开始。
  * runtime 以秒为单位。沿用调用者事务，写入失败时由调用者回滚。
  */
 str cnn_model_save_epoch(Client cntxt, mvc *m, const CnnInitialModelInfo *info, int epoch,
-			const CnnModel *model, const CnnAdamState *adam, const CnnEpochMetric *metrics, size_t metric_count);
+				const CnnModel *model, const CnnAdamState *adam, const CnnEpochMetric *metric);
 
 #endif /* SQL_CNN_STORAGE_H */

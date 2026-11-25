@@ -25,12 +25,11 @@ typedef struct {
 	int64_t *ids;
 	size_t count;
 	uint64_t id_hash;
-} CnnSplit;
+} CnnTrainingSet;
 
-/* The query is always a fixed literal. SQLstatementIntern runs as administrator,
- * so check the original caller's table rights before asking for any IDs. */
+/* SQLstatementIntern runs as administrator, so check the caller's SELECT privilege first. */
 static str
-cnn_load_split(Client cntxt, mvc *m, const char *query, CnnSplit *split)
+cnn_load_training_set(Client cntxt, mvc *m, CnnTrainingSet *training_set)
 {
 	sql_schema *schema = mvc_bind_schema(m, "cnn");
 	sql_table *table = schema ? mvc_bind_table(m, schema, "trainingimage") : NULL;
@@ -42,7 +41,7 @@ cnn_load_split(Client cntxt, mvc *m, const char *query, CnnSplit *split)
 	res_table *result = NULL;
 	BAT *column = NULL;
 	int64_t *ids = NULL;
-	str msg = SQLstatementIntern(cntxt, query, "cnn.select_images", true, false, &result);
+	str msg = SQLstatementIntern(cntxt, CNN_TRAIN_DATA_QUERY ";", "cnn.select_training_images", true, false, &result);
 	if (msg != MAL_SUCCEED)
 		goto cleanup;
 	if (result == NULL || result->next != NULL || result->nr_cols != 1 ||
@@ -53,7 +52,7 @@ cnn_load_split(Client cntxt, mvc *m, const char *query, CnnSplit *split)
 	}
 	const size_t count = BATcount(column);
 	if (count == 0) {
-		msg = createException(SQL, "cnn.train", SQLSTATE(22023) "Train, validation and test splits must all contain images");
+		msg = createException(SQL, "cnn.train", SQLSTATE(22023) "The training split must contain images");
 		goto cleanup;
 	}
 	if (count > SIZE_MAX / sizeof(*ids)) {
@@ -83,7 +82,7 @@ cnn_load_split(Client cntxt, mvc *m, const char *query, CnnSplit *split)
 	}
 	bat_iterator_end(&it);
 	if (msg == MAL_SUCCEED) {
-		*split = (CnnSplit) {ids, count, id_hash};
+		*training_set = (CnnTrainingSet) {ids, count, id_hash};
 		ids = NULL;
 	}
 cleanup:
@@ -112,9 +111,9 @@ cnn_shuffle(int64_t *ids, size_t count, uint64_t *rng)
 }
 
 static str
-cnn_run_split(Client cntxt, mvc *m, const int64_t *ids, size_t count,
+cnn_train_epoch(Client cntxt, mvc *m, const int64_t *ids, size_t count,
 	size_t batch_size, CnnModel *model, CnnAdamState *adam, double learning_rate,
-	bool training, CnnEpochMetric *metric)
+	CnnEpochMetric *metric)
 {
 	const lng started = GDKusec();
 	CnnForwardWorkspace forward = {0};
@@ -134,7 +133,7 @@ cnn_run_split(Client cntxt, mvc *m, const int64_t *ids, size_t count,
 			cnn_forward_workspace_destroy(&forward);
 			cnn_backward_workspace_destroy(&backward);
 			CnnOpsResult rc = cnn_forward_workspace_init(&forward, actual_batch);
-			if (training && rc == CNN_OPS_OK)
+			if (rc == CNN_OPS_OK)
 				rc = cnn_backward_workspace_init(&backward, actual_batch);
 			if (rc != CNN_OPS_OK) {
 				msg = createException(SQL, "cnn.train", SQLSTATE(HY000) "Cannot allocate CNN workspace (status %d)", (int) rc);
@@ -163,20 +162,14 @@ cnn_run_split(Client cntxt, mvc *m, const int64_t *ids, size_t count,
 			}
 		}
 		double loss = 0;
-		if (training) {
-			rc = cnn_model_backward(model, &batch, &forward, &backward);
-			if (rc == CNN_OPS_OK) {
-				loss = backward.head.mean_loss;
-				rc = adam ? cnn_model_adam_step(model, adam, &forward, &backward, learning_rate)
-					  : cnn_model_sgd_step(model, &forward, &backward, learning_rate);
-			}
-		} else {
-			rc = cnn_softmax_cross_entropy(forward.logits, 2 * actual_batch, batch.labels,
-				actual_batch, actual_batch, 2, NULL, 0, &loss);
+		rc = cnn_model_backward(model, &batch, &forward, &backward);
+		if (rc == CNN_OPS_OK) {
+			loss = backward.head.mean_loss;
+			rc = adam ? cnn_model_adam_step(model, adam, &forward, &backward, learning_rate)
+				  : cnn_model_sgd_step(model, &forward, &backward, learning_rate);
 		}
 		if (rc != CNN_OPS_OK) {
-			msg = createException(SQL, "cnn.train", SQLSTATE(22000) "CNN %s failed (status %d)",
-				training ? "backward or update" : "evaluation", (int) rc);
+			msg = createException(SQL, "cnn.train", SQLSTATE(22000) "CNN backward or update failed (status %d)", (int) rc);
 			goto cleanup;
 		}
 		sum_loss += loss * (double) actual_batch;
@@ -202,12 +195,7 @@ str
 cnn_train_initialized_model(Client cntxt, mvc *m, const CnnInitialModelInfo *info,
 	int epochs, size_t batch_size, double learning_rate)
 {
-	static const char *const queries[] = {
-		CNN_TRAIN_DATA_QUERY ";",
-		"SELECT ImageId FROM cnn.TrainingImage WHERE Split = 'validation' ORDER BY ImageId;",
-		"SELECT ImageId FROM cnn.TrainingImage WHERE Split = 'test' ORDER BY ImageId;"
-	};
-	CnnSplit splits[3] = {0};
+	CnnTrainingSet training_set = {0};
 	CnnModel model;
 	CnnAdamState adam_state;
 	CnnAdamState *adam = info->use_adam ? &adam_state : NULL;
@@ -215,17 +203,17 @@ cnn_train_initialized_model(Client cntxt, mvc *m, const CnnInitialModelInfo *inf
 	str msg = cnn_model_check_trainable(cntxt, m, info);
 	if (msg == MAL_SUCCEED)
 		msg = cnn_model_load_initial(cntxt, m, info, &model, adam);
-	for (size_t i = 0; i < 3 && msg == MAL_SUCCEED; i++)
-		msg = cnn_load_split(cntxt, m, queries[i], &splits[i]);
+	if (msg == MAL_SUCCEED)
+		msg = cnn_load_training_set(cntxt, m, &training_set);
 	if (msg != MAL_SUCCEED)
 		goto cleanup;
 
-	const size_t steps_per_epoch = 1 + (splits[0].count - 1) / batch_size;
+	const size_t steps_per_epoch = 1 + (training_set.count - 1) / batch_size;
 	if ((uint64_t) steps_per_epoch > (uint64_t) GDK_lng_max / (uint64_t) epochs) {
 		msg = createException(SQL, "cnn.train", SQLSTATE(22003) "Requested number of updates exceeds BIGINT");
 		goto cleanup;
 	}
-	shuffled = GDKmalloc(splits[0].count * sizeof(*shuffled));
+	shuffled = GDKmalloc(training_set.count * sizeof(*shuffled));
 	if (shuffled == NULL) {
 		msg = createException(SQL, "cnn.train", SQLSTATE(HY013) MAL_MALLOC_FAIL);
 		goto cleanup;
@@ -248,11 +236,8 @@ cnn_train_initialized_model(Client cntxt, mvc *m, const CnnInitialModelInfo *inf
 		"{\"format_version\":1,\"stage\":\"training\",\"epochs\":%d,\"batch_size\":%zu,"
 		"\"optimizer\":{%s,\"learning_rate\":%s},\"shuffle\":\"splitmix64-fisher-yates-v1\","
 		"\"metric_f1\":\"macro\",\"dataset_ids\":{\"algorithm\":\"fnv1a64-le\","
-		"\"train\":{\"count\":%zu,\"hash\":\"%016" PRIx64 "\"},"
-		"\"validation\":{\"count\":%zu,\"hash\":\"%016" PRIx64 "\"},"
-		"\"test\":{\"count\":%zu,\"hash\":\"%016" PRIx64 "\"}}}",
-		epochs, batch_size, optimizer, rate, splits[0].count, splits[0].id_hash,
-		splits[1].count, splits[1].id_hash, splits[2].count, splits[2].id_hash);
+		"\"train\":{\"count\":%zu,\"hash\":\"%016" PRIx64 "\"}}}",
+		epochs, batch_size, optimizer, rate, training_set.count, training_set.id_hash);
 	if (n < 0 || (size_t) n >= sizeof(training_spec)) {
 		msg = createException(SQL, "cnn.train", SQLSTATE(22000) "Cannot encode training specification");
 		goto cleanup;
@@ -262,25 +247,20 @@ cnn_train_initialized_model(Client cntxt, mvc *m, const CnnInitialModelInfo *inf
 	snapshot.training_spec = training_spec;
 	uint64_t rng = model.seed;
 	for (int epoch = 1; epoch <= epochs; epoch++) {
-		memcpy(shuffled, splits[0].ids, splits[0].count * sizeof(*shuffled));
-		cnn_shuffle(shuffled, splits[0].count, &rng);
-		CnnEpochMetric metrics[] = {{.split = "train"}, {.split = "validation"}, {.split = "test"}};
-		msg = cnn_run_split(cntxt, m, shuffled, splits[0].count, batch_size, &model, adam, learning_rate, true, &metrics[0]);
-		if (msg == MAL_SUCCEED)
-			msg = cnn_run_split(cntxt, m, splits[1].ids, splits[1].count, batch_size, &model, NULL, 0, false, &metrics[1]);
-		if (msg == MAL_SUCCEED && epoch == epochs)
-			msg = cnn_run_split(cntxt, m, splits[2].ids, splits[2].count, batch_size, &model, NULL, 0, false, &metrics[2]);
+		memcpy(shuffled, training_set.ids, training_set.count * sizeof(*shuffled));
+		cnn_shuffle(shuffled, training_set.count, &rng);
+		CnnEpochMetric metric;
+		msg = cnn_train_epoch(cntxt, m, shuffled, training_set.count, batch_size, &model, adam, learning_rate, &metric);
 		if (msg != MAL_SUCCEED)
 			goto cleanup;
 		snapshot.version = epoch + 1;
-		msg = cnn_model_save_epoch(cntxt, m, &snapshot, epoch, &model, adam, metrics, epoch == epochs ? 3 : 2);
+		msg = cnn_model_save_epoch(cntxt, m, &snapshot, epoch, &model, adam, &metric);
 		if (msg != MAL_SUCCEED)
 			goto cleanup;
 	}
 cleanup:
 	GDKfree(shuffled);
-	for (size_t i = 0; i < 3; i++)
-		GDKfree(splits[i].ids);
+	GDKfree(training_set.ids);
 	if (msg != MAL_SUCCEED && m->session->tr != NULL && m->session->tr->active && m->session->status == 0)
 		m->session->status = -1;
 	return msg;

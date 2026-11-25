@@ -39,8 +39,8 @@ def read_manifest(root: Path) -> list[tuple[int, str, str, Path]]:
             images.append((image_id, split, label, path))
             seen_ids.add(image_id)
             found_splits.add(split)
-    if found_splits != SPLITS:
-        raise ValueError(f"{manifest}: missing data for {', '.join(sorted(SPLITS - found_splits))}")
+    if "train" not in found_splits:
+        raise ValueError(f"{manifest}: missing data for train")
     return images
 
 

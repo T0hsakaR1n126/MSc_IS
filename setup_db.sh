@@ -91,19 +91,18 @@ WHERE s.name = 'cnn' AND t.type = 0 AND t.name IN (
 );")"
 [[ "$cnn_tables" == 6 ]] || fail 'This database does not have the CNN schema. Install the current build and initialize a new training database.'
 
-# The previous build has the same six tables. Probe the query validation without
-# creating model state or importing data, so using a stale server fails early.
+# Check the training entry before importing images or creating model state.
 if diagnostic="$(cnn_sql -f csv-noquote -s "CALL sys.cnn_train('cnn_script_preflight', 'SELECT 1', 1, 1, 'sgd', CAST(0.01 AS DOUBLE));" 2>&1)"; then
-    fail 'Unexpected result from CNN preflight. Install the current MonetDB build before training.'
+    fail 'The CNN training preflight unexpectedly succeeded. Build and install the current MonetDB source on the server with bash build.sh, then restart its MonetDB service.'
 fi
-[[ "$diagnostic" == *'Supported data_query'* ]] ||
-    fail "The server did not recognize the current CNN training entry. Install the current build before training.
+[[ "$diagnostic" == *'Supported data_query for training:'* ]] ||
+    fail "The server did not recognize the current CNN training entry. Build and install the current MonetDB source on the server with bash build.sh, then restart its MonetDB service.
 $diagnostic"
 
 model_exists="$(cnn_sql -f csv-noquote -s "SELECT COUNT(*) FROM cnn.Model WHERE ModelId = '$MODEL_ID';")"
 [[ "$model_exists" == 0 ]] || fail "Model '$MODEL_ID' already exists. Choose a new CNN_MODEL_ID to start a fresh training run."
 
-# COPY, writes and the full comparison all share one transaction.
+## COPY, writes and the full comparison all share one transaction.
 python3 "$ROOT_DIR/scripts/import_cnn_images.py" "$DATASET_DIR" | cnn_sql
 
 printf 'Training %s with %s for %s epoch(s), batch size %s, learning rate %s, seed %s.\n' \
@@ -118,7 +117,9 @@ CALL sys.cnn_train(
     '$OPTIMIZER', CAST($LEARNING_RATE AS DOUBLE)
 );
 COMMIT;
+SQL
 
+cnn_sql <<SQL
 SELECT ModelId, Version, Status, Epoch, Step
 FROM cnn.Model
 WHERE ModelId = '$MODEL_ID'
@@ -126,6 +127,6 @@ ORDER BY Version DESC LIMIT 1;
 
 SELECT Epoch, Split, Loss, Accuracy, F1, Runtime AS Seconds
 FROM cnn.TrainingMetric
-WHERE ModelId = '$MODEL_ID'
-ORDER BY Epoch, CASE Split WHEN 'train' THEN 1 WHEN 'validation' THEN 2 ELSE 3 END;
+WHERE ModelId = '$MODEL_ID' AND Split = 'train'
+ORDER BY Epoch;
 SQL

@@ -119,6 +119,7 @@ set(include_sql_files
   80_statistics
   81_tracer
   89_cnn
+  90_cnn_predict
   91_information_schema)
 
 if(HAVE_HGE)

@@ -10,8 +10,11 @@
 
 #include "monetdb_config.h"
 #include "sql_cnn.h"
+#include "sql_cnn_data.h"
+#include "sql_cnn_forward.h"
 #include "sql_cnn_storage.h"
 #include "sql_cnn_train.h"
+#include "sql_execute.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -30,9 +33,7 @@ sql_cnn_blank(const char *value)
 }
 
 /*
- * 固定网络的初始化描述。未来加载初始化模型时应复用同一生成函数，
- * 因为当前存储接口按原始描述文本检查兼容性，不解析 JSON。
- * 这里记录输入约定，实际图片预处理和训练仍待实现。
+ * 固定网络的模型描述。创建、训练和推理使用相同描述校验已保存模型。
  */
 static void
 sql_cnn_initial_info(CnnInitialModelInfo *info, const char *model_id, bool use_adam)
@@ -219,8 +220,165 @@ sql_cnn_train(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
 		query_length--;
 	if (query_length != sizeof(CNN_TRAIN_DATA_QUERY) - 1 ||
 	    memcmp(data_query, CNN_TRAIN_DATA_QUERY, query_length) != 0)
-		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "Supported data_query: " CNN_TRAIN_DATA_QUERY);
+		throw(SQL, "sql.cnn_train", SQLSTATE(22023) "Supported data_query for training: " CNN_TRAIN_DATA_QUERY);
 	CnnInitialModelInfo info;
 	sql_cnn_initial_info(&info, model_id, strcmp(optimizer, "adam") == 0);
 	return cnn_train_initialized_model(cntxt, m, &info, epochs, (size_t) batch_size, learning_rate);
+}
+
+/* split 已校验为三个固定划分之一，查询只读取排序后的图片 ID。 */
+static str
+cnn_prediction_ids(Client cntxt, mvc *m, const char *split, int limit, BAT **ids)
+{
+	sql_schema *schema = mvc_bind_schema(m, "cnn");
+	sql_table *table = schema ? mvc_bind_table(m, schema, "trainingimage") : NULL;
+	if (table == NULL)
+		throw(SQL, "cnn.predict", SQLSTATE(42S02) "cnn.TrainingImage is missing");
+	if (!table_privs(m, table, PRIV_SELECT))
+		throw(SQL, "cnn.predict", SQLSTATE(42501) "SELECT privilege required on cnn.TrainingImage");
+
+	char query[192];
+	int length = snprintf(query, sizeof(query),
+		"SELECT ImageId FROM cnn.TrainingImage WHERE Split = '%s' ORDER BY ImageId LIMIT %d;",
+		split, limit);
+	if (length < 0 || (size_t) length >= sizeof(query))
+		throw(SQL, "cnn.predict", SQLSTATE(22000) "Cannot format image selection");
+
+	res_table *result = NULL;
+	BAT *column = NULL;
+	str msg = SQLstatementIntern(cntxt, query, "cnn.select_prediction_images", true, false, &result);
+	if (msg == MAL_SUCCEED &&
+	    (result == NULL || result->next != NULL || result->nr_cols != 1 ||
+	     result->cols == NULL || (column = BATdescriptor(result->cols[0].b)) == NULL ||
+	     column->ttype != TYPE_lng))
+		msg = createException(SQL, "cnn.predict", SQLSTATE(22000) "Expected one BIGINT ImageId column");
+	res_tables_destroy(result);
+	if (msg == MAL_SUCCEED)
+		*ids = column;
+	else if (column != NULL)
+		BBPunfix(column->batCacheid);
+	return msg;
+}
+
+enum {
+	CNN_PREDICTION_COLUMNS = 6,
+	CNN_PREDICTION_BATCH_SIZE = 64
+};
+
+static str
+cnn_predict_batch(Client cntxt, mvc *m, const CnnModel *model, int version,
+		  const int64_t *ids, size_t count, BAT **columns)
+{
+	CnnBatch batch = {0};
+	CnnForwardWorkspace workspace = {0};
+	str msg = cnn_batch_load_ids(cntxt, m, ids, count, &batch);
+	if (msg != MAL_SUCCEED)
+		goto cleanup;
+
+	CnnOpsResult rc = cnn_forward_workspace_init(&workspace, batch.count);
+	if (rc != CNN_OPS_OK) {
+		msg = createException(SQL, "cnn.predict", SQLSTATE(HY000) "Cannot allocate CNN workspace (status %d)", (int) rc);
+		goto cleanup;
+	}
+	rc = cnn_model_forward(model, &batch, &workspace);
+	if (rc != CNN_OPS_OK) {
+		msg = createException(SQL, "cnn.predict", SQLSTATE(22000) "CNN forward failed (status %d)", (int) rc);
+		goto cleanup;
+	}
+
+	for (size_t row = 0; row < batch.count && msg == MAL_SUCCEED; row++) {
+		const lng id = batch.image_ids[row];
+		const int label = batch.labels[row];
+		const double cat_logit = workspace.logits[2 * row];
+		const double dog_logit = workspace.logits[2 * row + 1];
+		const int prediction = dog_logit > cat_logit;
+		const double max_logit = fmax(cat_logit, dog_logit);
+		const double cat_exp = exp(cat_logit - max_logit);
+		const double dog_exp = exp(dog_logit - max_logit);
+		const double total = cat_exp + dog_exp;
+		const double cat_probability = cat_exp / total;
+		const double dog_probability = dog_exp / total;
+		const void *values[] = {&version, &id, &label, &prediction, &cat_probability, &dog_probability};
+		for (size_t c = 0; c < CNN_PREDICTION_COLUMNS; c++) {
+			if (BUNappend(columns[c], values[c], false) != GDK_SUCCEED) {
+				msg = createException(SQL, "cnn.predict", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+				break;
+			}
+		}
+	}
+
+cleanup:
+	cnn_forward_workspace_destroy(&workspace);
+	cnn_batch_destroy(&batch);
+	return msg;
+}
+
+str
+sql_cnn_predict(Client cntxt, MalBlkPtr mb, MalStkPtr stk, InstrPtr pci)
+{
+	mvc *m = NULL;
+	str msg = getSQLContext(cntxt, mb, &m, NULL);
+	if (msg != MAL_SUCCEED)
+		return msg;
+
+	const char *model_id = *getArgReference_str(stk, pci, CNN_PREDICTION_COLUMNS);
+	const char *split = *getArgReference_str(stk, pci, CNN_PREDICTION_COLUMNS + 1);
+	int limit = *getArgReference_int(stk, pci, CNN_PREDICTION_COLUMNS + 2);
+	if (sql_cnn_blank(model_id))
+		throw(SQL, "cnn.predict", SQLSTATE(22023) "model_id must not be NULL or blank");
+	if (sql_cnn_blank(split) ||
+	    (strcmp(split, "train") != 0 && strcmp(split, "validation") != 0 && strcmp(split, "test") != 0))
+		throw(SQL, "cnn.predict", SQLSTATE(22023) "image_split must be 'train', 'validation' or 'test'");
+	if (limit <= 0)
+		throw(SQL, "cnn.predict", SQLSTATE(22023) "max_images must be a positive integer");
+
+	CnnInitialModelInfo info;
+	CnnModel model;
+	int version;
+	sql_cnn_initial_info(&info, model_id, false);
+	msg = cnn_model_load_trained(cntxt, m, &info, &model, &version);
+	if (msg != MAL_SUCCEED)
+		return msg;
+
+	BAT *ids = NULL;
+	msg = cnn_prediction_ids(cntxt, m, split, limit, &ids);
+	if (msg != MAL_SUCCEED)
+		return msg;
+	BAT *columns[CNN_PREDICTION_COLUMNS] = {0};
+	const int types[CNN_PREDICTION_COLUMNS] = {TYPE_int, TYPE_lng, TYPE_int, TYPE_int, TYPE_dbl, TYPE_dbl};
+	const BUN count = BATcount(ids);
+	for (size_t c = 0; c < CNN_PREDICTION_COLUMNS; c++) {
+		columns[c] = COLnew(0, types[c], count, TRANSIENT);
+		if (columns[c] == NULL) {
+			msg = createException(SQL, "cnn.predict", SQLSTATE(HY013) MAL_MALLOC_FAIL);
+			goto cleanup;
+		}
+	}
+	for (BUN offset = 0; offset < count;) {
+		if (GDKexiting() || TIMEOUT_TEST(&cntxt->qryctx)) {
+			msg = createException(SQL, "cnn.predict", SQLSTATE(57014) "CNN prediction cancelled");
+			goto cleanup;
+		}
+		int64_t batch_ids[CNN_PREDICTION_BATCH_SIZE];
+		const size_t batch_count = MIN(count - offset, CNN_PREDICTION_BATCH_SIZE);
+		BATiter it = bat_iterator(ids);
+		for (size_t row = 0; row < batch_count; row++)
+			batch_ids[row] = *(const lng *) BUNtloc(&it, offset + row);
+		bat_iterator_end(&it);
+
+		msg = cnn_predict_batch(cntxt, m, &model, version, batch_ids, batch_count, columns);
+		if (msg != MAL_SUCCEED)
+			goto cleanup;
+		offset += batch_count;
+	}
+	for (size_t c = 0; c < CNN_PREDICTION_COLUMNS; c++) {
+		*getArgReference_bat(stk, pci, c) = columns[c]->batCacheid;
+		BBPkeepref(columns[c]);
+		columns[c] = NULL;
+	}
+cleanup:
+	BBPunfix(ids->batCacheid);
+	for (size_t c = 0; c < CNN_PREDICTION_COLUMNS; c++)
+		BBPreclaim(columns[c]);
+	return msg;
 }
